@@ -299,6 +299,8 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 - **报告固定章节**：测试概述 → 授权范围 → 方法论 → 发现汇总表（按严重级）→ 详细发现（每条附证据与复现步骤）→ **已排除误报及原因附录**（提升报告可信度）→ 修复建议。
 - 按条件分桶呈现："可直接利用" / "需特定条件（已注明）" / "疑似未验证（附录）"。
 
+> **M4 落地注记**（2026-08-07）：报告引擎落地为 `proofhound/report/`——① `data.py`：findings.jsonl + 证据包 manifest → `ReportContext`（confirmed / conditional（Reproduced 未 Confirmed）/ hypothesis / rejected 四桶，桶内 severity→id 排序；每条携带结构化字段 + 证据包索引（pack_dir + 含 sha256 的 entries 清单）+ narrative 槽位；engagement 元信息走可选 `engagement.json`，缺字段派生——target 取资产最高频 host、时间窗取 audit.jsonl 首/末条 ts）；② `narrative.py`：T1 档叙述生成，输入仅结构化摘要（红线 3），输出 Pydantic 强校验 `{finding_id 或 overview/remediation: 段落}`——未知键（无锚文字）/坏 JSON/空段落全量拒收零落盘；finding 段落只写 `Finding.narrative`（不回写事实字段），固定章节段落写 `narrative_sections.json`，逐段记审计 `narrative_generated{finding_id|section, model, tokens}`，BudgetExceededError 上抛；③ `render.py`：docxtpl + Jinja2 StrictUndefined（变量未定义清晰报错）+ autoescape（替换值 XML 转义，防 `&` 伪实体被 docx recover 解析静默吞字）；④ CLI `python -m proofhound.report build --dir <evidence_dir> --out <docx> [--template] [--no-llm]`；⑤ `scripts/make_default_template.py` 生成 `templates/default_template.docx`（全标签参考模板，尾部附变量契约说明页；docxtpl 布局纪律：`{%tr %}/{%p %}` 标签须独占表格行/段落）。确定性：context 不含报告生成时刻 wall-clock，narrative 固定后同输入渲染出相同 `word/document.xml`（docx zip 字节级时间戳不保证）。偏差：PDF 管线未做（留后续）；Rejected 附录直接用结构化 rejection_reason 不经 LLM；证据包索引字段名用 `entries`（dict 的 `.items` 方法会遮蔽 Jinja 属性解析）。验收 `scripts/demo_report.py`：DVWA 产物（Confirmed sqli + Rejected version-cve + Hypothesis web-exposure）出真实报告，汇总分桶/证据索引 sha256/误报附录/叙述回溯/no-llm 对照逐项读回自检通过。
+
 ### 5.8 安全与合规（L0 横切）
 
 | 机制 | 说明 |

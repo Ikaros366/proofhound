@@ -5,17 +5,19 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "proofhound"
 version = "0.1.0"
-description = "自动化渗透测试 Agent 系统（M3b：工具底座 + Skill 系统 + 编排器 + 模型路由 + Finding 生命周期 + 验证层：证据门/Verifier/verify-sqli）"
+description = "自动化渗透测试 Agent 系统（M4：工具底座 + Skill 系统 + 编排器 + 模型路由 + Finding 生命周期 + 验证层 + 报告引擎）"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.5",
     "PyYAML>=6.0",
     "docker>=7.0",
+    "docxtpl>=0.16",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "python-docx>=1.1",
 ]
 
 [tool.setuptools.packages.find]

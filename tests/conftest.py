@@ -123,3 +123,69 @@ def make_skill_dir(tmp_path):
         return tmp_path / "skills"
 
     return _make
+
+
+@pytest.fixture
+def report_evidence_dir(tmp_path):
+    """M4 报告测试用证据目录：四态 findings + 证据包 + audit（时间窗派生源）。
+
+    桶分布：confirmed ×2（critical/high，供 severity 排序断言）、
+    reproduced ×1、hypothesis ×1、rejected ×1（带 rejection_reason）。
+    """
+    from proofhound.compliance.audit import AuditLog
+    from proofhound.findings.evidence import assemble_evidence_pack
+    from proofhound.findings.finding import Finding, FindingStore, Verification
+
+    directory = tmp_path / "evidence"
+    directory.mkdir()
+    log = directory / "run1.stdout.log"
+    log.write_text("line1\nline2 inject point\nline3\n", encoding="utf-8")
+
+    store = FindingStore(directory / "findings.jsonl")
+
+    def _finding(fid, state, vuln_type, severity, **overrides):
+        defaults = dict(
+            id=fid,
+            state=state,
+            vuln_type=vuln_type,
+            severity=severity,
+            asset=f"http://127.0.0.1:9/app?q={fid[-4:]}",
+            title=f"{vuln_type} 标题",
+            dedup_key=f"sha256:{fid}",
+            evidence_kinds=["status-code"],
+            created_at="2026-08-07T00:00:00.000+00:00",
+            updated_at="2026-08-07T00:00:00.000+00:00",
+        )
+        defaults.update(overrides)
+        return Finding(**defaults)
+
+    confirmed_high = _finding(
+        "F-2026-0001", "confirmed", "sqli", "high",
+        evidence_kinds=["status-code", "behavioral"],
+        verification=Verification(
+            method="sqlmap-confirmed",
+            evidence_refs=[f"{log}#L2"],
+            baseline_diff="真条件 1,203B / 假条件 217B",
+            reproduction_steps=["步骤一", "步骤二"],
+            verified_by="verify-sqli@1.0.0",
+            verified_at="2026-08-07T01:00:00.000+00:00",
+        ),
+    )
+    confirmed_critical = _finding("F-2026-0005", "confirmed", "rce", "critical")
+    reproduced = _finding("F-2026-0002", "reproduced", "sqli", "medium")
+    hypothesis = _finding("F-2026-0003", "hypothesis", "web-exposure", "info")
+    rejected = _finding(
+        "F-2026-0004", "rejected", "version-cve", "low",
+        rejection_reason="版本匹配型 CVE 无行为验证，铁律禁止直接 Confirmed",
+    )
+    for finding in (
+        confirmed_high, confirmed_critical, reproduced, hypothesis, rejected,
+    ):
+        store.append(finding)
+    # 只有 confirmed_high 组装证据包（其余验证 assembled=False 路径）
+    assemble_evidence_pack(confirmed_high, evidence_base=directory)
+
+    audit = AuditLog(directory / "audit.jsonl")
+    audit.record("demo_start", note="开始")
+    audit.record("demo_end", note="结束")
+    return directory
