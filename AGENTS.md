@@ -178,7 +178,12 @@ engagement 元信息：可选 `<evidence_dir>/engagement.json`（`{"target","sco
 
 ## 报告模板变量契约（M4/M4.5，§5.7）
 
-docx 模板用 docxtpl（Jinja2 语法），渲染环境 **StrictUndefined**（引用契约外变量即报错）且替换值做 XML 转义（`autoescape=True`）。docxtpl 布局纪律：`{%tr ... %}/{%p ... %}` 标签必须**独占表格行/段落**（整行/整段被替换为标签），行内 `{{ }}` 与 `{% if %}` 不受限。可用变量：
+docx 模板用 docxtpl（Jinja2 语法），渲染环境 **StrictUndefined**（引用契约外变量即报错）且替换值做 XML 转义（`autoescape=True`）。docxtpl 布局纪律：
+
+- **表格/附录循环标签独占行**：`{%tr ... %}/{%p ... %}` 标签必须**独占表格行/段落**（整行/整段被替换为标签），行内 `{{ }}` 与 `{% if %}` 不受限；
+- **`{{r }}` 必须配 RichText**：docxtpl 会把 `{{r }}` 的值插到 run 之外，**纯字符串整段丢失**（0.20.2 实测）——渲染器自动扫描模板 `{{r }}` 标签、按点路径末段键名把 context 的字符串值包装成 RichText（`\n` → 换行，`& < >` 内部转义），模板直接用 `{{r f.repro_text }}` 即可。
+
+可用变量：
 
 - `engagement.target` / `engagement.scope` / `engagement.started_at` / `engagement.finished_at`（可为 null）；**M4.5 extras**：engagement.json 任意额外键原样透传（如 `engagement.company_name` / `engagement.system_name` / `engagement.report_date`，缺键即 StrictUndefined 报错）
 - `summary.confirmed` / `summary.conditional` / `summary.hypothesis` / `summary.rejected` / `summary.severity_counts`（dict，confirmed 按严重级计数）
@@ -192,7 +197,6 @@ docx 模板用 docxtpl（Jinja2 语法），渲染环境 **StrictUndefined**（�
 - `sections.overview` / `sections.remediation`（固定章节叙述，键恒在、值可为 null）
 - `evidence_index[]`（M4.5 扁平证据索引：confirmed+conditional 全部条目，稳定排序），每项 `{finding_id, file, sha256, source_ref, line_anchor}`
 - 过滤器 `cn_date`（M4.5：ISO 时间 → 「2026年8月7日」，空值 → 空串，非 ISO 原样返回），用法 `{{ engagement.started_at | cn_date }}`
-- **`{{r }}` 富文本适配**（M4.5）：docxtpl 会把 `{{r }}` 的值插到 run 之外，纯字符串会被丢弃；渲染器自动扫描模板 `{{r }}` 标签并把 context 对应键的字符串值包装成 RichText（`\n` → 换行，`& < >` 内部转义），模板作者直接用 `{{r f.repro_text }}` 即可
 
 参考实现即 `templates/default_template.docx`（尾部附同样契约说明页），由 `scripts/make_default_template.py` 生成、可入库重现。
 

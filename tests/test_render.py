@@ -345,7 +345,8 @@ def test_enterprise_template_renders(report_evidence_dir, tmp_path):
     assert row[0] == entry["finding_id"] == "F-2026-0001"
     assert row[1] == entry["file"]
     assert row[2] == entry["sha256"]
-    assert row[3] == f"{entry['source_ref']}#L{entry['line_anchor']}"
+    assert row[3] == entry["source_ref"]  # source_ref 自带 #L 锚点，模板不重复拼接
+    assert entry["source_ref"].endswith(f"#L{entry['line_anchor']}")
 
     # 附录 B：version-cve + 排除原因
     appendix_b = next(

@@ -234,7 +234,7 @@ def main() -> int:
             row[0] == e["finding_id"]
             and row[1] == (e["file"] or "")
             and row[2] == (e["sha256"] or "")
-            and row[3] == f"{e['source_ref']}#L{e['line_anchor']}"
+            and row[3] == e["source_ref"]  # source_ref 自带 #L 锚点，不重复拼接
             for row in ([c.text for c in r.cells] for r in appendix_a.rows[1:])
         )
         for e in index
