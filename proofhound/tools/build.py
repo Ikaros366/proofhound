@@ -52,6 +52,10 @@ _BUILDERS = {
     "httpx": _build_httpx,
 }
 
+_PARAMS_MODELS = {
+    "httpx": HttpxParams,
+}
+
 
 def build_command(
     tool: str, params: dict, *, egress_proxy_url: str | None = None
@@ -66,3 +70,9 @@ def build_command(
 def known_tools() -> list[str]:
     """已有命令构造器的工具清单。"""
     return sorted(_BUILDERS)
+
+
+def params_schema(tool: str) -> dict | None:
+    """工具的 params JSON Schema（供规划器注入 prompt，防 LLM 瞎猜字段名）。"""
+    model = _PARAMS_MODELS.get(tool)
+    return model.model_json_schema() if model is not None else None

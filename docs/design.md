@@ -282,6 +282,8 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 
 **成本可观测**：每次 LLM 调用记录 tokens/费用/耗时，按 engagement 出成本仪表盘；超预算自动降级或挂起。
 
+> **M2c 落地注记**（2026-08-07）：模型路由落地为 `proofhound/llm/router.py`——Tier 枚举 + TierConfig，三档独立环境变量 `PROOFHOUND_T0/T1/T2_{BASE_URL,API_KEY,MODEL[,TEMPERATURE,MAX_TOKENS]}`，HTTP 复用 `llm/client.py`，router 只做选路与计量；T1==T2 同模型启动即警告（红线 4）。用量计量与预算硬闸落地为 `proofhound/llm/usage.py`：每次调用记 tier/model/prompt_tokens/completion_tokens/耗时（响应无 usage 时按 4 字符≈1 token 估算并标 `estimated`），追加审计 `llm_call`；`PROOFHOUND_MAX_TOKENS_PER_RUN`（及可选分档 `..._T0/T1/T2`）为 Run 级硬闸，调用前检查，超限即停止规划循环、节点 blocked 并记 `llm_budget_exceeded`——与 scope 同级，任何自治模式不可绕过。上下文治理落地为 `proofhound/core/context.py`：Signal 摘要超 `PROOFHOUND_CONTEXT_MAX_SIGNALS`（默认 20）条按 kind 聚合、每类留最新 `PROOFHOUND_CONTEXT_KEEP_LATEST`（默认 5）条并保留 total_counts；prompt 字符硬上限 `PROOFHOUND_CONTEXT_MAX_CHARS`（默认 32000），超限先压缩、仍超则任务 failed 并记 `context_overflow`，禁止静默截断。未做：成本仪表盘（现仅有 `llm_call` 审计事件）、"超额自动降级模型或挂起请示"（当前策略为超限即 blocked 升级）。
+
 ### 5.7 报告引擎（L5）
 
 - **数据与表现分离**：模板渲染只读 Finding 库的结构化字段；LLM 仅生成叙述性段落（概述、风险分析、修复建议），且每段必须关联 Finding ID，可回溯、可审计。
@@ -366,6 +368,8 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 | 报告 | docxtpl + Jinja2 | 用户 Word 模板直接可用 |
 | 接口 | FastAPI（本机 Web 控制台）+ MCP Server（可选） | 控制台只是本地引擎的壳；Kimi Code 可直调 |
 | 测试 | pytest + 公开漏洞靶场（DVWA、Vulhub、XBEN） | 回归与指标测量 |
+
+> M2c 注记（2026-08-07）："模型路由只需切换 endpoint" 已落地——三档 TierConfig 各自指向独立 base_url/api_key/model（`PROOFHOUND_T0/T1/T2_*`），路由层 `llm/router.py` 不绑定具体厂商，本地 Ollama 与商用 API 可混用。
 
 ## 7. 项目目录结构
 

@@ -1,9 +1,11 @@
-"""最小 LLM 客户端（M2b，§5.3）：OpenAI 兼容协议的单模型封装。
+"""最小 LLM 客户端（M2b，§5.3）：OpenAI 兼容协议的单端点封装。
 
-- 仅供规划器调用；模型路由、预算帽、上下文治理属 M2c，本模块不含；
+- 模型路由（T0/T1/T2 选路）、用量计量与预算帽见 M2c 的 llm/router.py、
+  llm/usage.py；本模块只做单端点 HTTP，不含选路逻辑；
 - 零第三方依赖：用 stdlib ``urllib`` POST ``{base_url}/chat/completions``；
 - 配置来自环境变量（``PROOFHOUND_LLM_BASE_URL`` / ``PROOFHOUND_LLM_API_KEY`` /
-  ``PROOFHOUND_LLM_MODEL``），缺省从 ``.env`` 读取；已有环境变量优先于 .env；
+  ``PROOFHOUND_LLM_MODEL``），缺省从 ``.env`` 读取；已有环境变量优先于 .env
+  （M2c 起分档配置走 ``PROOFHOUND_T0/T1/T2_*``，见 llm/router.py）；
 - 不做内置重试：失败分类与重试预算归编排器（core/failures.py）。
 """
 
@@ -11,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -57,6 +60,8 @@ class LLMConfig:
     api_key: str
     model: str
     timeout: float = 60.0
+    temperature: float | None = None  # 非 None 才进请求 payload
+    max_tokens: int | None = None  # 同上
 
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "LLMConfig":
@@ -82,6 +87,15 @@ class LLMConfig:
         )
 
 
+@dataclass
+class CompletionResult:
+    """一次补全的完整结果：文本 + 服务商 usage（可能缺失）+ 耗时。"""
+
+    content: str
+    usage: dict | None  # 响应中的 usage 字段；无则为 None（调用方按字符估算）
+    latency_ms: float
+
+
 class LLMClient:
     """OpenAI 兼容 chat/completions 的最小封装。"""
 
@@ -90,9 +104,16 @@ class LLMClient:
 
     def complete(self, messages: list[dict]) -> str:
         """发起一次对话补全，返回 assistant 消息文本。失败抛 :class:`LLMError`。"""
-        payload = json.dumps(
-            {"model": self.config.model, "messages": messages}
-        ).encode("utf-8")
+        return self.complete_with_usage(messages).content
+
+    def complete_with_usage(self, messages: list[dict]) -> CompletionResult:
+        """同 :meth:`complete`，但返回 content + usage + 耗时（供路由层计量）。"""
+        payload_dict = {"model": self.config.model, "messages": messages}
+        if self.config.temperature is not None:
+            payload_dict["temperature"] = self.config.temperature
+        if self.config.max_tokens is not None:
+            payload_dict["max_tokens"] = self.config.max_tokens
+        payload = json.dumps(payload_dict).encode("utf-8")
         request = urllib.request.Request(
             f"{self.config.base_url}/chat/completions",
             data=payload,
@@ -102,6 +123,7 @@ class LLMClient:
             },
             method="POST",
         )
+        started = time.monotonic()
         try:
             with urllib.request.urlopen(request, timeout=self.config.timeout) as resp:
                 body = resp.read()
@@ -112,6 +134,7 @@ class LLMClient:
             raise LLMError(f"LLM 连接失败: {exc.reason}") from exc
         except OSError as exc:  # timeout 等
             raise LLMError(f"LLM 请求异常: {exc}") from exc
+        latency_ms = (time.monotonic() - started) * 1000
         try:
             data = json.loads(body)
             content = data["choices"][0]["message"]["content"]
@@ -119,4 +142,9 @@ class LLMClient:
             raise LLMError(f"LLM 响应格式异常: {exc}") from exc
         if not isinstance(content, str):
             raise LLMError("LLM 响应 content 非文本")
-        return content
+        usage = data.get("usage")
+        return CompletionResult(
+            content=content,
+            usage=usage if isinstance(usage, dict) else None,
+            latency_ms=latency_ms,
+        )

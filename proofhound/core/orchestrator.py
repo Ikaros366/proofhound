@@ -1,4 +1,4 @@
-"""最小编排器（M2b，§5.3）：scan 阶段链路的驱动者。
+"""最小编排器（M2b+M2c，§5.3）：scan 阶段链路的驱动者。
 
 链路：registry 命中 skill → 规划器产计划（结构化 JSON，强校验）→
 tools/build.py 拼装 argv（红线 1：LLM 不碰命令）→ SandboxRunner 执行
@@ -9,7 +9,11 @@ tools/build.py 拼装 argv（红线 1：LLM 不碰命令）→ SandboxRunner 执
   验证码/锁定一次即硬阻塞；scope 拒绝与命令构造失败视为规划缺陷，
   直接 failed、不重试；
 - LLM 上下文只进结构化 state（目标/次数/Signal 摘要），原始输出只给
-  evidence 引用路径（红线 3）。
+  evidence 引用路径（红线 3）；
+- M2c：LLM 调用经 ModelRouter（T1 档）；token 预算为硬闸——调用前检查，
+  超限即停止规划循环、节点 blocked 并记审计 llm_budget_exceeded
+  （与 scope 同级，任何自治模式不可绕过，无关闭开关）；上下文超硬上限
+  （压缩后仍超）节点 failed 并记 context_overflow，禁止静默截断。
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from proofhound.compliance.audit import AuditLog
+from proofhound.core.context import ContextOverflowError, ContextPolicy
 from proofhound.core.failures import FailureBudget, classify
 from proofhound.core.plan import PlanAction, PlanValidationError
 from proofhound.core.planner import Planner
@@ -29,7 +34,8 @@ from proofhound.core.tasks import (
     aggregate_phase,
     run_dag,
 )
-from proofhound.llm.client import LLMClient, LLMError
+from proofhound.llm.client import LLMError
+from proofhound.llm.usage import BudgetExceededError
 from proofhound.skills.registry import SkillRegistry
 from proofhound.tools.build import UnknownToolError, build_command, known_tools
 from proofhound.tools.manifest import load_manifest
@@ -58,7 +64,7 @@ class Orchestrator:
         self,
         registry: SkillRegistry,
         runner: SandboxRunner,
-        llm: LLMClient,
+        llm,
         audit: AuditLog,
         evidence_dir: str | Path,
         *,
@@ -66,7 +72,10 @@ class Orchestrator:
         tools: set[str] | None = None,
         parsers: dict | None = None,
         max_workers: int = 4,
+        context_policy: ContextPolicy | None = None,
     ):
+        # llm 接受 ModelRouter（M2c 推荐：选路/计量/预算硬闸在路由层）；
+        # 旧式单模型客户端由 Planner 自动包装适配（不计量）。
         self.registry = registry
         self.runner = runner
         self.audit = audit
@@ -75,7 +84,9 @@ class Orchestrator:
         self.tools = set(tools) if tools is not None else set(known_tools())
         self.parsers = parsers if parsers is not None else _default_tool_parsers()
         self.max_workers = max_workers
-        self.planner = Planner(llm, registry, self.tools, audit)
+        self.planner = Planner(
+            llm, registry, self.tools, audit, context_policy=context_policy
+        )
 
     def run_scan_phase(self, targets: list[str], *, skill_name: str = "web-scan") -> TaskNode:
         """跑 scan 阶段：每目标一个子任务并行，返回阶段节点（含整棵树）。"""
@@ -117,6 +128,30 @@ class Orchestrator:
             }
             try:
                 plan = self.planner.plan(state, skill)
+            except BudgetExceededError as exc:
+                # token 预算硬闸：停止规划循环、节点 blocked（与 scope 同级不可绕过）
+                self.audit.record(
+                    "llm_budget_exceeded",
+                    node_id=node.id,
+                    name=node.name,
+                    tier=exc.tier,
+                    used=exc.used,
+                    limit=exc.limit,
+                    scope=exc.scope,
+                )
+                node.transition(TaskStatus.BLOCKED, reason=f"LLM 预算硬闸: {exc}")
+                return
+            except ContextOverflowError as exc:
+                # 上下文超硬上限（压缩后仍超）：failed，禁止静默截断
+                self.audit.record(
+                    "context_overflow",
+                    node_id=node.id,
+                    name=node.name,
+                    chars=exc.chars,
+                    limit=exc.limit,
+                )
+                node.transition(TaskStatus.FAILED, reason=f"上下文超限: {exc}")
+                return
             except (PlanValidationError, LLMError) as exc:
                 node.transition(TaskStatus.FAILED, reason=f"规划失败: {exc}")
                 return
@@ -223,6 +258,7 @@ class Orchestrator:
             {
                 "asset": s.asset,
                 "status_code": s.status_code,
+                "kind": s.kind,
                 "evidence_ref": s.evidence_ref,
             }
             for s in signals

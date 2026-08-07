@@ -5,7 +5,11 @@
 - 输出 = :class:`~proofhound.core.plan.Plan`，先过 schema 强校验
   （core/plan.py），再过语义校验：skill 已注册且启用、tool 有命令
   构造器且在 skill 的 required_tools 内；
-- 任何校验失败抛 :class:`PlanValidationError` 并记审计 plan_rejected。
+- 任何校验失败抛 :class:`PlanValidationError` 并记审计 plan_rejected；
+- M2c：LLM 调用经 :class:`~proofhound.llm.router.ModelRouter` 走 T1 档
+  （计量 + 预算硬闸在路由层）；规划前先做上下文治理（core/context.py）：
+  Signal 摘要超限确定性压缩（记 context_compressed），prompt 超字符硬
+  上限抛 :class:`ContextOverflowError`（记 context_overflow，禁静默截断）。
 """
 
 from __future__ import annotations
@@ -13,9 +17,16 @@ from __future__ import annotations
 import json
 
 from proofhound.compliance.audit import AuditLog
+from proofhound.core.context import (
+    ContextOverflowError,
+    ContextPolicy,
+    compress_state,
+    messages_chars,
+)
 from proofhound.core.plan import Plan, PlanValidationError, parse_plan
-from proofhound.llm.client import LLMClient
+from proofhound.llm.router import Tier, ensure_router
 from proofhound.skills.registry import Skill, SkillRegistry
+from proofhound.tools.build import params_schema
 
 SYSTEM_PROMPT = """\
 你是渗透测试编排器的规划器。根据当前结构化状态和 skill 的 SOP，输出下一步计划。
@@ -25,26 +36,31 @@ SYSTEM_PROMPT = """\
 2. 每个 action 字段：action（run_tool/finish/escalate 之一）、skill、tool、
    params、expected_output（预期产出）、rationale。
 3. 严禁生成 shell 命令：你只能声明 tool 与结构化 params，命令由工具管理器拼装。
-4. 只能使用给定可用工具清单中的工具，且工具须在 skill 的 required_tools 内。
+4. 只能使用给定可用工具清单中的工具，且工具须在 skill 的 required_tools 内；
+   params 必须严格符合该工具的 params_schema（字段名与类型以 schema 为准）。
 5. run_tool 必须给 tool 和 params；finish（任务完成）与 escalate（升级人工）
    不得携带 tool/params。
 """
 
 
 class Planner:
-    """一轮一答的规划器（M2b：单模型、无路由/预算，属 M2c）。"""
+    """一轮一答的规划器（M2c：经 ModelRouter 走 T1 档，带上下文治理）。"""
 
     def __init__(
         self,
-        llm: LLMClient,
+        llm,
         registry: SkillRegistry,
         tools: set[str],
         audit: AuditLog | None = None,
+        *,
+        context_policy: ContextPolicy | None = None,
     ):
-        self.llm = llm
+        # llm 接受 ModelRouter（推荐）；旧式单模型客户端自动包装适配（不计量）
+        self.router = ensure_router(llm)
         self.registry = registry
         self.tools = set(tools)
         self.audit = audit
+        self.context_policy = context_policy or ContextPolicy()
 
     def make_prompt(self, state: dict, skill: Skill) -> list[dict]:
         """组装 system + user 消息（user = 结构化状态 + skill SOP + 工具清单）。"""
@@ -53,7 +69,12 @@ class Planner:
                 "state": state,
                 "skill": skill.summary(),
                 "skill_sop": skill.read_body(),
-                "available_tools": sorted(self.tools),
+                # 附带 params_schema：LLM 不需要猜字段名（真实模型曾把
+                # target 猜成 targets 被构造器拒收）
+                "available_tools": [
+                    {"name": name, "params_schema": params_schema(name)}
+                    for name in sorted(self.tools)
+                ],
             },
             ensure_ascii=False,
             indent=2,
@@ -64,8 +85,26 @@ class Planner:
         ]
 
     def plan(self, state: dict, skill: Skill) -> Plan:
-        """调 LLM 生成计划并做 schema + 语义校验；失败抛 PlanValidationError。"""
-        raw = self.llm.complete(self.make_prompt(state, skill))
+        """调 LLM 生成计划并做 schema + 语义校验；失败抛 PlanValidationError。
+
+        预算超限抛 :class:`BudgetExceededError`、上下文超硬上限抛
+        :class:`ContextOverflowError`（均不在此捕获，由编排器分级处理）。
+        """
+        state, compressed = compress_state(state, self.context_policy)
+        if compressed is not None:
+            self._audit(
+                "context_compressed",
+                skill=skill.name,
+                total=compressed["total"],
+                kept=compressed["kept"],
+                by_kind=compressed["by_kind"],
+            )
+        messages = self.make_prompt(state, skill)
+        chars = messages_chars(messages)
+        if chars > self.context_policy.max_chars:
+            # 审计由编排器捕获后统一记录（带 node_id），此处不重复记
+            raise ContextOverflowError(chars=chars, limit=self.context_policy.max_chars)
+        raw = self.router.complete(Tier.T1, messages)
         try:
             plan = parse_plan(raw)
             self._validate_semantics(plan)

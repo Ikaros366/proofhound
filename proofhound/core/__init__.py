@@ -1,8 +1,15 @@
-"""L3 编排器（§5.3）：任务树/DAG、规划器、失败预算（M2b）。
+"""L3 编排器（§5.3）：任务树/DAG、规划器、失败预算（M2b）+ 上下文治理（M2c）。
 
-模型路由、预算帽、上下文治理属 M2c；本包当前仅含编排器核心。
+模型路由与 token 预算硬闸在 llm/（router.py / usage.py）；本包含编排器
+核心与上下文治理（context.py：确定性压缩 + prompt 字符硬上限）。
 """
 
+from proofhound.core.context import (
+    ContextOverflowError,
+    ContextPolicy,
+    compress_state,
+    messages_chars,
+)
 from proofhound.core.failures import (
     FailureBudget,
     FailureCategory,
@@ -26,6 +33,8 @@ from proofhound.core.tasks import (
 )
 
 __all__ = [
+    "ContextOverflowError",
+    "ContextPolicy",
     "FailureBudget",
     "FailureCategory",
     "FailureRule",
@@ -39,6 +48,8 @@ __all__ = [
     "TaskStatus",
     "aggregate_phase",
     "classify",
+    "compress_state",
+    "messages_chars",
     "parse_plan",
     "run_dag",
 ]

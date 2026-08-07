@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "proofhound"
 version = "0.1.0"
-description = "自动化渗透测试 Agent 系统（M2b：工具底座 + Skill 系统 + 编排器核心）"
+description = "自动化渗透测试 Agent 系统（M2c：工具底座 + Skill 系统 + 编排器核心 + 模型路由与成本治理）"
 requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.5",
