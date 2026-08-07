@@ -215,3 +215,4 @@ docx 模板用 docxtpl（Jinja2 语法），渲染环境 **StrictUndefined**（�
 16. **报告仅 docx**：§5.7 PDF 管线（Jinja2 → HTML → Paged.js/weasyprint）未做；模板只覆盖固定章节骨架，自定义模板须遵循契约（StrictUndefined 下契约外变量即报错）。
 17. **叙述生成为单遍全量校验**：一次 T1 调用产出全部段落，任一段落非法（无锚键/空段/坏 JSON）即全量拒收零落盘，无部分落盘与自动重试；Rejected 附录直接用结构化 `rejection_reason`（不经 LLM）。
 18. **报告不含生成时刻 wall-clock**：为保证"同输入同输出"（内容级确定性），context 只含 engagement 时间窗；docx zip 字节级时间戳不保证一致（两次渲染 `word/document.xml` 一致、zip 容器字节未必）。engagement 元信息靠可选 `engagement.json`，缺省派生（资产高频 host + audit 首末条）。
+19. **报告时间窗派生会被叙述延后**：时间窗取 audit.jsonl 首/末条，叙述生成的 `narrative_generated` 审计事件会使窗口末尾延后（晚于实际测试结束时刻）；后续切片改为 engagement.json 显式时间或叙述前定型。
