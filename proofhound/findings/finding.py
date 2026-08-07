@@ -123,6 +123,8 @@ class Finding(BaseModel):
         old = self.state
         self.state = to
         self.updated_at = _utc_now()
+        if to is FindingState.CONFIRMED:
+            self.confidence = "confirmed"  # §5.5：确认即提升置信度
         if to is FindingState.REJECTED and reason:
             self.rejection_reason = reason
         if self.audit is not None:

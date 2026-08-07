@@ -216,6 +216,8 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 | 越权/IDOR | 双角色对照：A 凭证访问 B 资源，响应对比证明越权 |
 | 暴露面板/敏感路径 | baseline 对照后仍存在可归因内容差异 |
 
+> **M3b 落地注记**（2026-08-07）：证据门实现于 `proofhound/verify/gate.py`——每 `vuln_type` 在 `GATE_MATRIX` 声明 `verification.method` 白名单与行为类 `evidence_kinds` 标签要求（当前仅落 sqli：method ∈ {sqlmap-confirmed, boolean-diff, time-blind-diff} 且含 `behavioral` 标签）；`check(finding) -> GateResult{passed, missing}` 产出缺项清单，未知 `vuln_type` fail-closed。编排层（`run_verify_phase`）在 `transition(CONFIRMED)` 前必过本门，与 M3a 状态机铁律构成**双层防守**；门不过记审计 `verify_gate_failed`，Finding 停于 Reproduced。XSS/LFI 等其余类型随对应 verify-* skill 扩展矩阵项。
+
 #### 5.4.3 Baseline 对照
 
 任何判定前先探测目标默认行为：请求随机不存在路径、发送无效参数值，建立 baseline 档案（通配路由、自定义 404、全 200 站点等）。payload 响应与 baseline 存在可归因差异才计为信号。
@@ -225,6 +227,8 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 - 独立 Agent，唯一职责是**攻击结论**：证据是否支持？是否存在更平凡的解释？前置条件当前是否满足？
 - 与发现端使用不同模型，避免同源偏见。
 - 输出结构化裁定：`confirm / downgrade / reject + 理由`。
+
+> **M3b 落地注记**（2026-08-07）：实现于 `proofhound/verify/verifier.py`，走 **T2 档**（红线 4：与发现端 T1 异模型，同模型启动警告沿用 M2c 机制）。输入严守红线 3：Finding 结构化摘要 + 证据包索引（文件名/sha256/行号锚点）+ baseline diff 摘要，**不喂原始输出**；prompt 超字符硬上限抛 `ContextOverflowError`。输出 Pydantic 强校验 `{"verdict": confirm|reject, "reason"}`（本刀不收 downgrade），任何非法输出抛 `VerifierError`——**非法 verdict 拒收**，编排层 fail-closed 停于 Reproduced 并记 `verify_blocked`。裁定落 `Finding.verifier`，记审计 `verifier_verdict{finding_id, model, verdict, reason}`。Confirmed 迁移条件 = 行为证据存在 ∧ 证据门通过 ∧ Verifier confirm，三者缺一不得确认；reject → `REJECTED(actor=verifier)`。
 
 #### 5.4.5 去重与误报库
 
@@ -404,7 +408,7 @@ proofhound/
 | M0 流程验证（1~2 周） | 不写平台代码：把 recon/scan/verify/report 5 个 skill 装进 Kimi Code，手工编排跑通一个靶场 | 全流程 SOP 跑通，skill 划分定型 |
 | M1 工具底座（2 周）——已完成（2026-08-06） | L0 + L1：manifest、安装器、Docker 沙箱、scope 校验、审计日志；打通 httpx 一条工具链（nuclei 链并入 M2 一并验收） | 离线镜像可用；越界命令被拒且有日志 |
 | M2 编排器（2~3 周） | skill registry、任务 DAG、模型路由、预算帽、上下文治理；补齐 M1 遗留：① 从文件读取目标（如 `httpx -l targets.txt`）的 scope 解析与校验，消除 no_targets 放行口子；② 沙箱网络出口白名单 | 单目标 recon+扫描全自动；上下文体积有上限；成本仪表盘可见 |
-| M3 验证层（3 周） | 状态机、baseline 对照、3 个 verify skill（sqli/xss/lfi）、Verifier Agent、去重、误报库 | XBEN/DVWA 上 Confirmed 发现 100% 带证据；误报率达标 |
+| M3 验证层（3 周） | 状态机、baseline 对照、3 个 verify skill（sqli/xss/lfi）、Verifier Agent、去重、误报库——**M3a 已完成（2026-08-07）**：状态机（铁律硬编码）+ 证据包/离线 show + 去重 + 确定性 triage；**M3b 已完成（2026-08-07）**：证据门 + 预置会话（凭据脱敏）+ sqlmap 接入 + Verifier（T2）+ verify-sqli 垂直切片，DVWA 实靶 Confirmed | XBEN/DVWA 上 Confirmed 发现 100% 带证据；误报率达标 |
 | M4 报告引擎（1~2 周） | docxtpl 管线、叙述润色、误报附录 | 给定模板一键出报告，事实字段零手写 |
 | M5 产品化（按需） | 本机 Web 控制台（自治模式切换、确认队列、证据浏览）、MCP 暴露、持续监测、增量复测 | — |
 

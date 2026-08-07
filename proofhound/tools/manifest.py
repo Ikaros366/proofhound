@@ -21,7 +21,7 @@ class InstallRecipe(BaseModel):
     type: Literal["local", "binary", "go", "apt", "pip"]
     path: str | None = None  # local：用户预置目录或文件（离线场景）
     url: str | None = None  # binary：官方 release 地址（须白名单源）
-    sha256: str | None = None  # binary：强制校验
+    sha256: str | None = None  # binary：强制校验；pip（M3b）：可选，提供即强制
     package: str | None = None  # go/apt/pip：包管理器兜底
 
     @model_validator(mode="after")
@@ -35,6 +35,8 @@ class InstallRecipe(BaseModel):
                 raise ValueError("binary 配方必须提供 sha256（强制校验）")
         if self.type in ("go", "apt", "pip") and not self.package:
             raise ValueError(f"{self.type} 配方必须提供 package")
+        if self.type == "pip" and self.sha256 and "==" not in (self.package or ""):
+            raise ValueError("pip 配方带 sha256 时 package 必须 == 固定版本")
         return self
 
 
@@ -47,6 +49,7 @@ class ToolManifest(BaseModel):
     install: list[InstallRecipe] = Field(min_length=1)
     parser: str | None = None  # 输出解析器标识（解析器属后续里程碑）
     tags: list[str] = Field(default_factory=list)
+    image: str | None = None  # M3b：沙箱运行镜像覆盖（如 sqlmap 需 python 镜像）
 
 
 def load_manifest(path: str | Path) -> ToolManifest:

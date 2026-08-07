@@ -50,9 +50,10 @@ def _cmd_show(finding_id: str, evidence_dir: Path) -> int:
         anchor = item.get("line_anchor")
         if anchor is not None:
             evidence_file = pack_dir / item["file"]
+            # 行号按 \n 切分（与 grep/编辑器一致；工具输出可能含裸 \r 进度符）
             lines = evidence_file.read_text(
                 encoding="utf-8", errors="replace"
-            ).splitlines()
+            ).split("\n")
             if 1 <= anchor <= len(lines):
                 print(f"      L{anchor}> {lines[anchor - 1]}")
             else:

@@ -51,13 +51,14 @@ class TestBuiltinWebScan:
         assert skill.manifest.risk_level == "L1"
         assert skill.enabled
         assert not skill.requires_confirmation  # L1 不需要逐次确认
-        assert registry.find_by_tool("httpx") == [skill]
+        assert skill in registry.find_by_tool("httpx")  # M3b 起 verify-sqli 也依赖 httpx
 
     def test_progressive_disclosure(self):
         registry = SkillRegistry(REPO_SKILLS_DIR).discover()
         summaries = registry.list()
-        assert summaries[0]["name"] == "web-scan"
-        assert "body" not in summaries[0]  # 列表视图不含正文
+        # M3b 起内置库新增 verify-sqli（字典序在 web-scan 前），按名查找
+        summary = next(s for s in summaries if s["name"] == "web-scan")
+        assert "body" not in summary  # 列表视图不含正文
         body = registry.get("web-scan").read_body()
         assert "httpx" in body and "SOP" in body
 

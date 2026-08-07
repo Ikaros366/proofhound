@@ -6,10 +6,23 @@
 """
 
 from proofhound.tools.parsers.httpx_json import parse_httpx_jsonl
+from proofhound.tools.parsers.sqlmap_stdout import (
+    SqlmapReport,
+    SqlmapTechnique,
+    parse_sqlmap_stdout,
+)
 
 # key = ToolManifest.parser 标识
+# 注意：sqlmap_stdout 是验证结论解析器（产 SqlmapReport 而非 Signal），
+# 不登记进本注册表——该表契约是 Signal 解析器，供 scan 阶段自动桥接。
 PARSER_REGISTRY = {
     "httpx_json": parse_httpx_jsonl,
 }
 
-__all__ = ["PARSER_REGISTRY", "parse_httpx_jsonl"]
+__all__ = [
+    "PARSER_REGISTRY",
+    "SqlmapReport",
+    "SqlmapTechnique",
+    "parse_httpx_jsonl",
+    "parse_sqlmap_stdout",
+]

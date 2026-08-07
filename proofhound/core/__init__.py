@@ -16,7 +16,6 @@ from proofhound.core.failures import (
     FailureRule,
     classify,
 )
-from proofhound.core.orchestrator import Orchestrator
 from proofhound.core.plan import (
     Plan,
     PlanAction,
@@ -31,6 +30,17 @@ from proofhound.core.tasks import (
     aggregate_phase,
     run_dag,
 )
+
+
+def __getattr__(name: str):
+    """Orchestrator 延迟加载（M3b）：orchestrator 依赖 verify（L4 证据门/
+    Verifier），而 verify.verifier 复用 core.context——包初始化期 eager
+    import 会成环，故延迟到首次访问。"""
+    if name == "Orchestrator":
+        from proofhound.core.orchestrator import Orchestrator
+
+        return Orchestrator
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 __all__ = [
     "ContextOverflowError",

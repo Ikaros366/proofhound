@@ -8,7 +8,10 @@
   配置的 ``network_mode``（M1 行为）；``none`` 完全断网；
 - 每条命令执行前先过 scope 校验（红线 5），越界或未识别出目标直接拒绝、
   不启动容器、记审计日志；
-- 原始输出 100% 落盘 ``evidence/``（红线 3），审计日志只记摘要与路径。
+- 原始输出 100% 落盘 ``evidence/``（红线 3），审计日志只记摘要与路径；
+- M3b：``run(..., image=...)`` 可按次覆盖沙箱镜像（ToolManifest.image 声明，
+  如 sqlmap 需 python 镜像）；scope 配了预置会话时，审计与返回值中的命令
+  经凭据脱敏（只记 sha256 前 8 位），容器执行仍用原始 argv。
 """
 
 from __future__ import annotations
@@ -23,6 +26,7 @@ from docker.types import Mount
 
 from proofhound.compliance.audit import AuditLog
 from proofhound.compliance.scope import Scope, check_scope
+from proofhound.compliance.session import redact_argv, redact_bytes
 from proofhound.tools.egress import EGRESS_NETWORK_NAME, EgressPolicy, EgressProxy
 
 CONTAINER_TOOLS_DIR = "/opt/tools"
@@ -70,14 +74,28 @@ class SandboxRunner:
         self._base_dir = base_dir  # 目标列表文件（-l 等）相对路径的解析基准
         self._egress_proxy: EgressProxy | None = None
 
-    def run(self, tool: str, args: list[str], timeout: int = 300) -> RunResult:
-        """执行 ``tool args...``；越界命令拒绝执行并记审计日志。"""
+    def run(
+        self,
+        tool: str,
+        args: list[str],
+        timeout: int = 300,
+        image: str | None = None,
+    ) -> RunResult:
+        """执行 ``tool args...``；越界命令拒绝执行并记审计日志。
+
+        ``image`` 可按次覆盖沙箱镜像（如 sqlmap 需要 python 镜像，由
+        ToolManifest.image 声明）；审计与返回值中的命令经会话凭据脱敏
+        （M3b：只记 sha256 前 8 位），容器执行仍用原始 argv。
+        """
+        image = image or self.config.image
         command = [tool, *args]
+        secrets = self._session_secrets()
+        redacted_command = redact_argv(command, secrets)
         decision = check_scope(self.scope, args, base_dir=self._base_dir)
         if not decision.allowed:
             self.audit.record(
                 "command_rejected",
-                command=command,
+                command=redacted_command,
                 tool=tool,
                 violations=decision.violations,
                 no_targets=decision.no_targets,
@@ -85,7 +103,7 @@ class SandboxRunner:
             )
             return RunResult(
                 rejected=True,
-                command=command,
+                command=redacted_command,
                 violations=decision.violations,
                 no_targets=decision.no_targets,
             )
@@ -110,7 +128,7 @@ class SandboxRunner:
             env["https_proxy"] = proxy_url
             env["all_proxy"] = proxy_url
         container = self._client.containers.create(
-            self.config.image,
+            image,
             command=command,
             environment=env,
             mounts=[
@@ -134,13 +152,17 @@ class SandboxRunner:
         finally:
             container.remove(force=True)
 
+        # 证据落盘前字节级脱敏（sqlmap 会回显 Cookie 请求头）；审计哈希
+        # 与落盘内容一致，证据链不断裂
+        stdout = redact_bytes(stdout, secrets)
+        stderr = redact_bytes(stderr, secrets)
         stdout_path.write_bytes(stdout)
         stderr_path.write_bytes(stderr)
         self.audit.record(
             "command_executed",
-            command=command,
+            command=redacted_command,
             tool=tool,
-            image=self.config.image,
+            image=image,
             targets=[t.host for t in decision.targets],
             no_targets=decision.no_targets,
             file_targets=decision.file_targets,
@@ -153,12 +175,18 @@ class SandboxRunner:
         )
         return RunResult(
             rejected=False,
-            command=command,
+            command=redacted_command,
             exit_code=exit_code,
             no_targets=decision.no_targets,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
         )
+
+    def _session_secrets(self) -> list[str]:
+        """当前 scope 预置会话的凭据子串清单（无会话为空）。"""
+        if self.scope.session is None:
+            return []
+        return self.scope.session.secret_values()
 
     def close(self) -> None:
         """关闭出口代理（restricted 模式下由 ``run()`` 懒启动）。"""

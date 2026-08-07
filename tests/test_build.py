@@ -50,8 +50,8 @@ def test_httpx_bad_params_rejected():
 
 def test_unknown_tool():
     with pytest.raises(UnknownToolError):
-        build_command("sqlmap", {"target": "h.tld"})
+        build_command("nmap", {"target": "h.tld"})
 
 
 def test_known_tools():
-    assert known_tools() == ["httpx"]
+    assert known_tools() == ["httpx", "sqlmap"]  # M3b：sqlmap 构造器接入

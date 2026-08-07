@@ -1,0 +1,14 @@
+# sqlmap —— SQL 注入行为验证工具（verify-sqli 专用，L2）
+# 版本 pin + SHA256 为 PyPI 发行件实测值；升级走显式动作并重新校验哈希。
+name: sqlmap
+version: "1.10.8"
+check: "sqlmap --version"
+install:
+  - type: local                    # 1. 用户预置目录（离线场景）
+    path: ./tools.d/sqlmap
+  - type: pip                      # 2. PyPI 哈希钉版（白名单源 + 版本 pin + 强制 SHA256）
+    package: "sqlmap==1.10.8"
+    sha256: "e4725e27d4d53b1be4a35c8c4d28aee7033230a245c281995eabd5ba2199eea3"
+parser: sqlmap_stdout              # 解析器产验证结论（非 Signal），不进 PARSER_REGISTRY
+tags: [verify, sqli]
+image: python:3.12-alpine          # sqlmap 为 Python 工具，沙箱运行镜像按次覆盖

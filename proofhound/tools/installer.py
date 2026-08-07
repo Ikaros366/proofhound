@@ -192,11 +192,101 @@ class ToolInstaller:
         )
 
     def _install_pip(self, recipe: InstallRecipe, manifest: ToolManifest) -> None:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", recipe.package],
-            check=True,
-            timeout=600,
+        if not recipe.sha256:
+            # 旧路径（无哈希约束，仅兜底用途）：直接装进当前环境
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", recipe.package],
+                check=True,
+                timeout=600,
+            )
+            return
+        self._install_pip_pinned(recipe, manifest)
+
+    # ---- pip + sha256（M3b：白名单源 + 版本 pin + 强制哈希 + 隔离安装） ----
+
+    _PIP_METADATA_HOST = "pypi.org"
+    _PIP_FILE_HOSTS = ("files.pythonhosted.org",)
+
+    def _install_pip_pinned(
+        self, recipe: InstallRecipe, manifest: ToolManifest
+    ) -> None:
+        """pip + sha256 配方：PyPI 元数据解析 → 哈希定位发行件 → 白名单源
+        下载 → 二次校验 → 隔离安装到 ``tools.d/<name>/lib`` 并生成 wrapper。
+
+        包名与版本来自 ``package`` 的 ``name==version`` pin（schema 层已强制）；
+        发行件以 recipe.sha256 在 PyPI 元数据中精确匹配（wheel/sdist 均可），
+        宿主限 pypi.org（元数据）与 files.pythonhosted.org（文件）。
+        """
+        name, _, version = (recipe.package or "").partition("==")
+        meta_url = f"https://{self._PIP_METADATA_HOST}/pypi/{name}/{version}/json"
+        try:
+            with urllib.request.urlopen(meta_url, timeout=30) as resp:
+                meta = json.load(resp)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise InstallError(f"PyPI 元数据获取失败: {meta_url}（{exc}）") from exc
+        artifact = self._match_pip_artifact(meta.get("urls") or [], recipe)
+        file_host = (urlparse(artifact["url"]).hostname or "").lower()
+        if file_host not in self._PIP_FILE_HOSTS:
+            raise InstallError(f"pip 下载源不在白名单内: {file_host or artifact['url']}")
+
+        lib_dir = self.tools_dir / manifest.name / "lib"
+        lib_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / artifact["filename"]
+            urllib.request.urlretrieve(artifact["url"], archive)
+            digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+            if digest.lower() != recipe.sha256.lower():
+                raise InstallError(
+                    f"SHA256 校验失败: 期望 {recipe.sha256}，实际 {digest}"
+                )
+            subprocess.run(
+                [
+                    sys.executable, "-m", "pip", "install",
+                    "--no-deps", "--no-index", "--upgrade",
+                    "--target", str(lib_dir), str(archive),
+                ],
+                check=True,
+                timeout=600,
+            )
+        self._write_pip_wrapper(manifest, lib_dir)
+
+    @staticmethod
+    def _match_pip_artifact(urls: list[dict], recipe: InstallRecipe) -> dict:
+        """在 PyPI 发行件列表中按 sha256 精确匹配（哈希即身份）。"""
+        for item in urls:
+            digests = item.get("digests") or {}
+            if digests.get("sha256", "").lower() == recipe.sha256.lower():
+                if not item.get("url") or not item.get("filename"):
+                    break
+                return item
+        raise InstallError(
+            f"PyPI 上找不到 sha256={recipe.sha256} 对应的发行件（{recipe.package}）"
         )
+
+    def _write_pip_wrapper(self, manifest: ToolManifest, lib_dir: Path) -> None:
+        """生成 ``tools.d/<name>/<name>`` wrapper：优先 console script
+        （``lib/bin/<name>``），否则直跑 ``lib/<name>/<name>.py``；显式
+        python3 + PYTHONPATH，宿主与容器（python 镜像）均可执行。"""
+        console = Path("bin") / manifest.name
+        module = Path(manifest.name) / f"{manifest.name}.py"
+        if (lib_dir / console).is_file():
+            entry = f'"$HERE/lib/{console}"'
+        elif (lib_dir / module).is_file():
+            entry = f'"$HERE/lib/{module}"'
+        else:
+            raise InstallError(
+                f"pip 安装后找不到可执行入口: {lib_dir}/bin/{manifest.name} "
+                f"或 {lib_dir}/{manifest.name}/{manifest.name}.py"
+            )
+        wrapper = lib_dir.parent / manifest.name
+        wrapper.write_text(
+            "#!/bin/sh\n"
+            'HERE="$(cd "$(dirname "$0")" && pwd)"\n'
+            f'PYTHONPATH="$HERE/lib${{PYTHONPATH:+:$PYTHONPATH}}" '
+            f'exec python3 {entry} "$@"\n',
+            encoding="utf-8",
+        )
+        self._make_executable(wrapper)
 
     # ---- 版本快照 ----
 

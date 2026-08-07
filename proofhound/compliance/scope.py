@@ -15,6 +15,9 @@ host:port 形式），与授权 scope 比对；任一目标越界即拒绝。
   （M2 后续切片处理）。
 - 裸域名识别基于正则，形如 ``out.json`` 的参数可能被误判为域名目标
   （fail-closed 方向，最多误拒，不会误放）。
+
+M3b：``Scope`` 增加可选 ``session``（预置会话，§5.3 认证旁路第①条）；
+``--cookie``/``-H``/``--header`` 等凭据旗标的值从目标提取中剔除。
 """
 
 from __future__ import annotations
@@ -27,6 +30,8 @@ from urllib.parse import urlparse
 
 import yaml
 from pydantic import BaseModel, Field
+
+from proofhound.compliance.session import SessionConfig
 
 _DOMAIN_RE = re.compile(
     r"^(?=.{1,253}\.?$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,24}\.?$"
@@ -44,6 +49,11 @@ DEFAULT_PROXY_FLAGS: tuple[str, ...] = (
     "-http-proxy",
     "--http-proxy",
 )
+
+# 凭据旗标（M3b）：其值是会话凭据（Cookie/自定义请求头），既不是扫描目标，
+# 也不参与目标提取——防止 cookie 中域名形态子串被裸域名正则误判为目标
+# （fail-closed 方向再收紧）。凭据值的脱敏由 sandbox runner 在审计前执行。
+DEFAULT_SECRET_FLAGS: tuple[str, ...] = ("--cookie", "-H", "--header")
 
 
 @dataclass(frozen=True)
@@ -64,6 +74,9 @@ class Scope(BaseModel):
     domains: list[str] = Field(default_factory=list)
     networks: list[str] = Field(default_factory=list)
     ports: list[int] = Field(default_factory=list)
+    # 预置会话（M3b，§5.3 认证旁路第①条）：授权配置中的 Cookie/请求头，
+    # 供构造器注入工具参数；其值在审计/state/日志中只记 sha256 前 8 位。
+    session: SessionConfig | None = None
 
     @classmethod
     def from_file(cls, path: str | Path) -> "Scope":
@@ -109,6 +122,7 @@ def check_scope(
     base_dir: str | Path | None = None,
     target_file_flags: tuple[str, ...] = DEFAULT_TARGET_FILE_FLAGS,
     proxy_flags: tuple[str, ...] = DEFAULT_PROXY_FLAGS,
+    secret_flags: tuple[str, ...] = DEFAULT_SECRET_FLAGS,
     allow_no_targets: bool = False,
 ) -> ScopeDecision:
     """从命令参数（含目标列表文件）提取目标并逐一比对 scope。
@@ -118,11 +132,14 @@ def check_scope(
       含无法解析的行，均为 fail-closed 拒绝。
     - 代理旗标（``-proxy`` 等）的值是基础设施端点而非扫描目标，从目标
       提取中剔除；实际外联由出口白名单代理强制。
+    - 凭据旗标（``--cookie``/``-H``/``--header``，M3b）的值是会话凭据，
+      同样从目标提取中剔除（不参与目标判定）。
     - 整条命令未识别出任何目标时默认拒绝；``allow_no_targets=True`` 才放行
       并以 ``no_targets`` 标注。
     """
     rest, files = _strip_flag_values(argv, target_file_flags)
     rest, _proxies = _strip_flag_values(rest, proxy_flags)
+    rest, _secrets = _strip_flag_values(rest, secret_flags)
     targets = extract_targets(rest)
     violations: list[str] = []
     resolved_files: list[str] = []
