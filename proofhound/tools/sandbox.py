@@ -2,9 +2,12 @@
 
 - 通过 ``/var/run/docker.sock`` 以兄弟容器方式拉起任务容器；
 - 宿主工具目录只读挂载到容器 ``/opt/tools``；
-- CPU（nano_cpus）/ 内存（mem_limit）配额，网络模式可配；
-- 每条命令执行前先过 scope 校验（红线 5），越界直接拒绝、不启动容器、
-  记审计日志；
+- CPU（nano_cpus）/ 内存（mem_limit）配额；
+- 网络出口策略（M2a，见 ``tools/egress.py``）：默认 restricted——容器接入
+  internal 出口网络，HTTP(S) 流量强制经白名单正向代理出站；``open`` 沿用
+  配置的 ``network_mode``（M1 行为）；``none`` 完全断网；
+- 每条命令执行前先过 scope 校验（红线 5），越界或未识别出目标直接拒绝、
+  不启动容器、记审计日志；
 - 原始输出 100% 落盘 ``evidence/``（红线 3），审计日志只记摘要与路径。
 """
 
@@ -20,6 +23,7 @@ from docker.types import Mount
 
 from proofhound.compliance.audit import AuditLog
 from proofhound.compliance.scope import Scope, check_scope
+from proofhound.tools.egress import EGRESS_NETWORK_NAME, EgressPolicy, EgressProxy
 
 CONTAINER_TOOLS_DIR = "/opt/tools"
 
@@ -29,7 +33,8 @@ class SandboxConfig:
     image: str = "alpine:3.20"
     nano_cpus: int = 1_000_000_000  # 1 CPU
     mem_limit: str = "512m"
-    network_mode: str = "bridge"
+    network_mode: str = "bridge"  # 仅 egress.mode="open" 时生效
+    egress: EgressPolicy = field(default_factory=EgressPolicy)
 
 
 @dataclass
@@ -54,6 +59,7 @@ class SandboxRunner:
         tools_dir: str | Path,
         config: SandboxConfig | None = None,
         client: docker.DockerClient | None = None,
+        base_dir: str | Path | None = None,
     ):
         self.scope = scope
         self.audit = audit
@@ -61,20 +67,27 @@ class SandboxRunner:
         self.tools_dir = Path(tools_dir)
         self.config = config or SandboxConfig()
         self._client = client or docker.from_env()
+        self._base_dir = base_dir  # 目标列表文件（-l 等）相对路径的解析基准
+        self._egress_proxy: EgressProxy | None = None
 
     def run(self, tool: str, args: list[str], timeout: int = 300) -> RunResult:
         """执行 ``tool args...``；越界命令拒绝执行并记审计日志。"""
         command = [tool, *args]
-        decision = check_scope(self.scope, args)
+        decision = check_scope(self.scope, args, base_dir=self._base_dir)
         if not decision.allowed:
             self.audit.record(
                 "command_rejected",
                 command=command,
                 tool=tool,
                 violations=decision.violations,
+                no_targets=decision.no_targets,
+                file_targets=decision.file_targets,
             )
             return RunResult(
-                rejected=True, command=command, violations=decision.violations
+                rejected=True,
+                command=command,
+                violations=decision.violations,
+                no_targets=decision.no_targets,
             )
 
         run_id = uuid.uuid4().hex[:12]
@@ -82,12 +95,20 @@ class SandboxRunner:
         stdout_path = self.evidence_dir / f"{run_id}.stdout.log"
         stderr_path = self.evidence_dir / f"{run_id}.stderr.log"
 
+        network_mode, proxy_url = self._resolve_network()
         env = {
             "PATH": (
                 f"{CONTAINER_TOOLS_DIR}/{tool}"
                 ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             )
         }
+        if proxy_url:
+            env["HTTP_PROXY"] = proxy_url
+            env["HTTPS_PROXY"] = proxy_url
+            env["ALL_PROXY"] = proxy_url
+            env["http_proxy"] = proxy_url
+            env["https_proxy"] = proxy_url
+            env["all_proxy"] = proxy_url
         container = self._client.containers.create(
             self.config.image,
             command=command,
@@ -102,7 +123,7 @@ class SandboxRunner:
             ],
             nano_cpus=self.config.nano_cpus,
             mem_limit=self.config.mem_limit,
-            network_mode=self.config.network_mode,
+            network_mode=network_mode,
         )
         try:
             container.start()
@@ -122,6 +143,8 @@ class SandboxRunner:
             image=self.config.image,
             targets=[t.host for t in decision.targets],
             no_targets=decision.no_targets,
+            file_targets=decision.file_targets,
+            egress=self._egress_audit_fields(network_mode),
             exit_code=exit_code,
             stdout_sha256=hashlib.sha256(stdout).hexdigest(),
             stderr_sha256=hashlib.sha256(stderr).hexdigest(),
@@ -136,3 +159,50 @@ class SandboxRunner:
             stdout_path=stdout_path,
             stderr_path=stderr_path,
         )
+
+    def close(self) -> None:
+        """关闭出口代理（restricted 模式下由 ``run()`` 懒启动）。"""
+        if self._egress_proxy is not None:
+            self._egress_proxy.close()
+            self._egress_proxy = None
+
+    @property
+    def egress_proxy_url(self) -> str | None:
+        """restricted 模式下的白名单代理地址；供不读 proxy 环境变量、
+        需要显式代理参数的工具（如 httpx ``-proxy``）使用。其余模式为 None。"""
+        if self.config.egress.mode != "restricted":
+            return None
+        return self._ensure_egress_proxy().proxy_url
+
+    def __enter__(self) -> "SandboxRunner":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+    # ---- 网络出口 ----
+
+    def _resolve_network(self) -> tuple[str, str | None]:
+        """按出口策略解析 (network_mode, proxy_url)。"""
+        mode = self.config.egress.mode
+        if mode == "none":
+            return "none", None
+        if mode == "open":
+            return self.config.network_mode, None
+        # restricted：internal 出口网络 + 白名单正向代理
+        return EGRESS_NETWORK_NAME, self._ensure_egress_proxy().proxy_url
+
+    def _ensure_egress_proxy(self) -> EgressProxy:
+        if self._egress_proxy is None:
+            self._egress_proxy = EgressProxy(self.scope, self.config.egress, self.audit)
+            self._egress_proxy.start(self._client)
+        return self._egress_proxy
+
+    def _egress_audit_fields(self, network_mode: str) -> dict:
+        policy = self.config.egress
+        fields: dict = {"mode": policy.mode, "network": network_mode}
+        if policy.mode == "restricted":
+            fields["allowed_hosts"] = (
+                self._egress_proxy.allowed_hosts if self._egress_proxy else []
+            )
+        return fields

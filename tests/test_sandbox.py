@@ -4,6 +4,7 @@ import pytest
 
 from proofhound.compliance.audit import AuditLog
 from proofhound.compliance.scope import Scope
+from proofhound.tools.egress import EgressPolicy
 from proofhound.tools.sandbox import SandboxConfig, SandboxRunner
 
 pytestmark = pytest.mark.docker
@@ -18,7 +19,11 @@ def runner(tmp_path, docker_client, sandbox_image, fake_tools_dir):
         audit,
         evidence_dir=tmp_path / "evidence",
         tools_dir=fake_tools_dir,
-        config=SandboxConfig(image=sandbox_image),
+        # 本文件聚焦配额/只读挂载/scope 前置，出口策略显式置 open 保持 M1 语义；
+        # 出口白名单行为见 test_sandbox_egress.py
+        config=SandboxConfig(
+            image=sandbox_image, egress=EgressPolicy(mode="open")
+        ),
         client=docker_client,
     )
 
@@ -95,3 +100,18 @@ def test_port_out_of_scope_rejected(tmp_path, docker_client, sandbox_image, fake
     result = runner.run("echo-tool", ["http://127.0.0.1:8080/"])
     assert result.rejected
     assert any("端口 8080" in v for v in result.violations)
+
+
+def test_no_targets_command_rejected(runner, monkeypatch):
+    """M2a 起：整条命令未识别出目标默认拒绝，不启动容器。"""
+    calls = _spy_create(monkeypatch)
+    result = runner.run("echo-tool", ["-silent", "-json"])
+
+    assert result.rejected
+    assert result.no_targets
+    assert calls == []
+
+    events = runner.audit.read_all()
+    assert len(events) == 1
+    assert events[0]["event"] == "command_rejected"
+    assert events[0]["no_targets"] is True

@@ -69,8 +69,16 @@ class TestCheckScope:
         )
         assert not decision.allowed
 
-    def test_no_targets_allowed_but_flagged(self):
+    def test_no_targets_rejected_by_default(self):
+        """M2a 起：未识别出目标默认拒绝（消除 no_targets 放行口子）。"""
         decision = check_scope(self.scope, ["-silent", "-json"])
+        assert not decision.allowed
+        assert decision.no_targets
+
+    def test_no_targets_allowed_only_when_explicit(self):
+        decision = check_scope(
+            self.scope, ["-silent", "-json"], allow_no_targets=True
+        )
         assert decision.allowed
         assert decision.no_targets
 

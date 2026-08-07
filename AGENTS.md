@@ -1,13 +1,14 @@
 # AGENTS.md
 
-> 面向 AI 编码 Agent 的项目指南。本文件基于仓库当前实际内容编写；项目已完成 M1（工具底座）。
+> 面向 AI 编码 Agent 的项目指南。本文件基于仓库当前实际内容编写；项目已完成 M1（工具底座）与 M2a（Skill 系统 + M1 遗留补强）。
 
 ## 项目概述
 
 本项目是 **ProofHound**（暂定名，发布前需复查 GitHub/PyPI/Docker Hub/域名占用）——一个**自动化渗透测试 Agent 系统**。仓库包含设计文档与 M1 实现：
 
 - `docs/design.md` —— 设计文档 v0.7（草案，状态：待评审），是整个仓库的权威输入，用途为"作为 Kimi Code 开发输入，指导从零实现"。
-- `proofhound/` —— M1 工具底座（L0+L1）已实现：Tool Manifest、安装器、Docker 沙箱、scope 校验、append-only 审计日志；其余分层（core/skills/verify/findings/report/llm/infra）仅有占位目录，属后续里程碑。
+- `proofhound/` —— M1 工具底座（L0+L1）：Tool Manifest、安装器、Docker 沙箱、scope 校验、append-only 审计日志；M2a：L2 Skill 系统（registry + 导入安全闸）+ 两项 M1 遗留补强（文件目标 scope 解析、沙箱网络出口白名单）；其余分层（core/verify/findings/report/llm/infra）仅有占位目录，属后续里程碑。
+- `skills/` —— 内置 skill 库，目前已有 `web-scan`（httpx SOP）。
 
 系统针对现有编排型 AI 渗透工具（以 PentAGI 为代表）的三大痛点设计：误报泛滥、速度慢、成本高。核心设计哲学是"**证据为王、验证驱动**"：一切候选发现默认为假，必须通过验证层状态机和证据门才能进入报告。
 
@@ -19,7 +20,7 @@
 
 ## 仓库现状与开发阶段
 
-- **M1 已完成**：`pyproject.toml`、pytest 测试套件已就位；尚未实现 CLI、编排器（M2）及之后的模块，也没有 CI、lint 配置。
+- **M1 已完成，M2a 已完成（2026-08-07）**：`pyproject.toml`、pytest 测试套件已就位；M2a 交付 L2 Skill 系统（`proofhound/skills/`：manifest 强校验、registry、导入安全闸）、scope 文件目标解析（`httpx -l targets.txt` 逐行校验，任一行越界即拒）、no_targets 默认拒绝、沙箱网络出口白名单（`proofhound/tools/egress.py`，默认 restricted）；尚未实现 CLI、编排器（DAG/规划器、模型路由，M2 后续切片）及之后的模块，也没有 CI、lint 配置。
 - 一切实现工作都应以 `docs/design.md` 为准。修改设计决策时，同步更新该文档。
 - 开发路线图（文档 §8）：
 
@@ -27,7 +28,7 @@
 |---|---|---|
 | M0 流程验证（1~2 周） | 不写平台代码：把 recon/scan/verify/report 5 个 skill 装进 Kimi Code，手工编排跑通一个靶场 | 全流程 SOP 跑通，skill 划分定型 |
 | M1 工具底座（2 周）——已完成（2026-08-06） | L0+L1：manifest、安装器、Docker 沙箱、scope 校验、审计日志；打通 httpx 一条工具链 | 离线镜像可用；越界命令被拒且有日志 |
-| M2 编排器（2~3 周） | skill registry、任务 DAG、模型路由、预算帽、上下文治理 | 单目标 recon+扫描全自动；上下文体积有上限；成本仪表盘可见 |
+| M2 编排器（2~3 周）——M2a 已完成（2026-08-07） | skill registry（M2a ✅）、任务 DAG、模型路由、预算帽、上下文治理；M1 遗留补强（M2a ✅）：文件目标 scope 解析、沙箱网络出口白名单 | 单目标 recon+扫描全自动；上下文体积有上限；成本仪表盘可见 |
 | M3 验证层（3 周） | 状态机、baseline 对照、3 个 verify skill（sqli/xss/lfi）、Verifier Agent、去重、误报库 | XBEN/DVWA 上 Confirmed 发现 100% 带证据；误报率达标 |
 | M4 报告引擎（1~2 周） | docxtpl 管线、叙述润色、误报附录 | 给定模板一键出报告，事实字段零手写 |
 | M5 产品化（按需） | 本机 Web 控制台、MCP 暴露、持续监测、增量复测 | — |
@@ -131,7 +132,8 @@ python3.12 -m venv .venv
 2. 环境注记：开发环境为 WSL（Linux），项目根 `~/proofhound`，Docker 为 WSL 内引擎，`/var/run/docker.sock` 原生可用；镜像拉取走 daemon 级代理（systemd drop-in 已配置），容器不继承任何代理。
 3. 仓库卫生：.env、API 密钥、evidence/ 目录内容永不入库，.gitignore 必须包含 .env 和 evidence/。
 
-## 已知限制（M1 遗留，M2 处理）
+## 已知限制（M2a 遗留，M2 后续切片处理）
 
-1. **文件目标不解析**：`httpx -l targets.txt` 这类从文件读取目标的情形，scope 校验不解析文件内容；未识别到目标时命令放行，但审计日志标注 `no_targets`。M2 须实现文件目标的 scope 解析与校验，消除该放行口子。
-2. **沙箱网络出口未限白名单**：容器网络模式可配（bridge/host/none），但出口未按 scope 做白名单限制。M2 须实现网络出口白名单。
+1. **目标文件不挂进容器**：`httpx -l targets.txt` 的目标文件只在 scope 校验阶段于宿主侧读取；把目标文件（只读）挂载进容器属编排器职责，M2 后续切片处理。
+2. **出口白名单仅覆盖 HTTP(S)**：restricted 模式下 HTTP(S) 流量经宿主机白名单正向代理强制出站；非 HTTP 原始 TCP 被 internal 网络整体阻断（fail-closed）；完整协议覆盖待 §5.10 mitmproxy 代理链。不读 proxy 环境变量的工具（如 httpx）须显式传代理参数（沙箱 `egress_proxy_url`）；工具级代理参数声明待 Tool Manifest 扩展。
+3. **输出文件名误判**：形如 `out.json` 的参数会被裸域名正则误判为目标（fail-closed 方向，最多误拒，不会误放）； `-l` 消费的目标文件名已不受影响。
