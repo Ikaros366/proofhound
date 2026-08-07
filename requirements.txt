@@ -1,0 +1,5 @@
+# M5a 新增依赖锁定（fastapi + uvicorn；httpx 为 TestClient 依赖，仅测试用）
+# 完整依赖声明以 pyproject.toml 为准；本文件锁 API 层直接引入的三项。
+fastapi==0.141.1
+uvicorn==0.52.1
+httpx==0.28.1

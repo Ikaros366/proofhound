@@ -258,6 +258,14 @@ class Orchestrator:
         """verify skill 名 → (覆盖的 vuln_type 集合, 处理函数)。"""
         return {"verify-sqli": (frozenset({"sqli"}), self._verify_sqli)}
 
+    def verify_skill_coverage(self, skill_name: str = "verify-sqli") -> frozenset[str]:
+        """verify skill 覆盖的 vuln_type 集合（M5a：API 自主模式闸门按此
+        圈定待确认的 Hypothesis Finding）。"""
+        handlers = self._verify_handlers()
+        if skill_name not in handlers:
+            raise KeyError(f"skill 无 verify handler: {skill_name}")
+        return handlers[skill_name][0]
+
     def run_verify_phase(self, *, skill_name: str = "verify-sqli") -> list[Finding]:
         """跑 verify 阶段：对 Hypothesis 做行为验证 + 证据门 + Verifier 终审。
 
