@@ -17,3 +17,6 @@ __pycache__/
 .pytest_cache/
 build/
 dist/
+
+# Windows 下载标记垃圾
+*:Zone.Identifier

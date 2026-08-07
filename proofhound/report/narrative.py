@@ -8,9 +8,15 @@
   或固定章节键（``overview``/``remediation``）；Pydantic 强校验，**未知键
   （无锚文字）、坏 JSON、空段落一律抛 :class:`NarrativeError`，全量拒收、
   不落盘任何部分结果**；
-- 落盘：finding 段落写 ``Finding.narrative``（§5.5：叙述只存于此，不回写
-  事实字段）→ ``FindingStore.append`` 快照 → 重刷证据包；固定章节段落写
-  ``<evidence_dir>/narrative_sections.json``（衍生文件，覆盖写，非审计链）；
+- M4.5 叙述结构化：finding 键的段落为
+  :class:`~proofhound.findings.finding.NarrativeParts` 三段对象
+  （description/impact/remediation，章节键仍为字符串）；兼容旧字符串段落
+  （只写 ``narrative``）。三段对象的单段 ``narrative`` 由三段确定性拼接
+  派生（``\\n`` 连接）——单一事实源，default_template 契约不变；
+- 落盘：finding 段落写 ``Finding.narrative``（+ ``Finding.narrative_parts``）
+  （§5.5：叙述只存于此，不回写事实字段）→ ``FindingStore.append`` 快照 →
+  重刷证据包；固定章节段落写 ``<evidence_dir>/narrative_sections.json``
+  （衍生文件，覆盖写，非审计链）；
 - 每段落记审计 ``narrative_generated{finding_id|section, model, tokens}``
   （单次调用产出全部段落，tokens 为该次调用的总量，各段事件同值；逐次
   调用计量以路由层 ``llm_call`` 审计为准）；
@@ -28,7 +34,12 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 from proofhound.compliance.audit import AuditLog
 from proofhound.core.context import ContextOverflowError, ContextPolicy, messages_chars
 from proofhound.findings.evidence import assemble_evidence_pack
-from proofhound.findings.finding import Finding, FindingState, FindingStore
+from proofhound.findings.finding import (
+    Finding,
+    FindingState,
+    FindingStore,
+    NarrativeParts,
+)
 from proofhound.llm.router import ModelRouter, Tier
 from proofhound.report.data import SECTION_KEYS, SECTIONS_FILE
 
@@ -40,12 +51,17 @@ _NARRATED_STATES = frozenset({FindingState.CONFIRMED, FindingState.REPRODUCED})
 
 SYSTEM_PROMPT = """\
 你是渗透测试报告的叙述撰写员。你只收到结构化摘要（无工具原始输出），职责：
-1. 为每条 finding 写一段报告叙述（中文，客观陈述风险与影响，只能基于给定
-   结构化字段，不得编造未提供的细节、不得虚构 payload 或数据）；
-2. 为固定章节写段落：overview = 测试概述（范围/方法/结论统计层面），
+1. 为每条 finding 写三段式叙述（中文，只能基于给定结构化字段，不得编造
+   未提供的细节、不得虚构 payload 或数据），输出一个对象：
+   {"description": "漏洞描述（客观陈述漏洞成因与位置）",
+    "impact": "漏洞危害（可被利用造成的后果与影响面）",
+    "remediation": "建议措施（针对该漏洞的修复/加固建议）"}；
+2. 为固定章节写字符串段落：overview = 测试概述（范围/方法/结论统计层面），
    remediation = 修复建议（按漏洞类型归纳，指向 finding id）。
-只输出一个 JSON 对象：{"paragraphs": {"<finding id 或章节键>": "段落文字", ...}}，
-键只能来自给出的 allowed_keys，不要输出任何其他文字。"""
+只输出一个 JSON 对象：{"paragraphs": {"<finding id>": {"description": "...",
+"impact": "...", "remediation": "..."}, "overview": "...", "remediation": "..."}}，
+键只能来自给出的 allowed_keys（finding 键给三段对象、章节键给字符串），
+不要输出任何其他文字。"""
 
 
 class NarrativeError(RuntimeError):
@@ -53,15 +69,19 @@ class NarrativeError(RuntimeError):
 
 
 class _NarrativeOut(BaseModel):
-    """叙述输出的 schema 强校验：段落非空、至少一段。"""
+    """叙述输出的 schema 强校验：段落非空、至少一段。
 
-    paragraphs: dict[str, str] = Field(min_length=1)
+    M4.5：finding 键为三段对象（NarrativeParts，字段空白/多余键即非法），
+    兼容旧字符串段落；章节键须为字符串（在 _parse_paragraphs 语义校验）。
+    """
+
+    paragraphs: dict[str, str | NarrativeParts] = Field(min_length=1)
 
     @field_validator("paragraphs")
     @classmethod
-    def _non_empty(cls, value: dict[str, str]) -> dict[str, str]:
-        for key, text in value.items():
-            if not text.strip():
+    def _non_empty(cls, value: dict[str, str | NarrativeParts]) -> dict:
+        for key, item in value.items():
+            if isinstance(item, str) and not item.strip():
                 raise ValueError(f"段落为空: {key}")
         return value
 
@@ -90,7 +110,7 @@ class NarrativeGenerator:
         *,
         store: FindingStore,
         evidence_dir: str | Path,
-    ) -> dict[str, str]:
+    ) -> dict[str, str | NarrativeParts]:
         """生成叙述并落盘，返回 {键: 段落}（键 = finding id 或固定章节键）。
 
         失败语义：输出非法抛 :class:`NarrativeError`（不落盘任何部分结果）；
@@ -118,11 +138,20 @@ class NarrativeGenerator:
 
         # 全部校验通过后一次性落盘（无部分结果）
         findings_by_id = {f.id: f for f in findings}
-        for key, text in paragraphs.items():
+        for key, item in paragraphs.items():
             if key in FIXED_SECTIONS:
                 continue
             finding = findings_by_id[key]
-            finding.narrative = text.strip()
+            if isinstance(item, NarrativeParts):
+                # M4.5 三段叙述：单段 narrative 由三段确定性拼接派生
+                finding.narrative_parts = item
+                finding.narrative = "\n".join(
+                    part.strip()
+                    for part in (item.description, item.impact, item.remediation)
+                )
+            else:  # 旧字符串段落：只写 narrative，清掉可能残留的三段
+                finding.narrative = item.strip()
+                finding.narrative_parts = None
             finding.updated_at = _utc_now()
             store.append(finding)
             assemble_evidence_pack(finding, evidence_base=evidence_dir)
@@ -134,7 +163,9 @@ class NarrativeGenerator:
                     tokens=tokens,
                 )
         sections = {
-            k: v.strip() for k, v in paragraphs.items() if k in FIXED_SECTIONS
+            k: v.strip()
+            for k, v in paragraphs.items()
+            if k in FIXED_SECTIONS and isinstance(v, str)
         }
         (evidence_dir / SECTIONS_FILE).write_text(
             json.dumps(sections, ensure_ascii=False, indent=2) + "\n",
@@ -223,7 +254,9 @@ class NarrativeGenerator:
         }
 
     @staticmethod
-    def _parse_paragraphs(raw: str, allowed_keys: set[str]) -> dict[str, str]:
+    def _parse_paragraphs(
+        raw: str, allowed_keys: set[str]
+    ) -> dict[str, str | NarrativeParts]:
         """解析并强校验 LLM 输出；无锚文字/坏 JSON/空段落抛 NarrativeError。"""
         text = raw.strip()
         if text.startswith("```"):  # 宽容一层代码围栏
@@ -249,6 +282,11 @@ class NarrativeGenerator:
                 f"叙述输出含无锚段落（键不在允许集合 {sorted(allowed_keys)}）: "
                 f"{sorted(unknown)}——全量拒收"
             )
+        for key in FIXED_SECTIONS:
+            if key in out.paragraphs and not isinstance(out.paragraphs[key], str):
+                raise NarrativeError(
+                    f"固定章节段落必须为字符串（非三段对象）: {key}——全量拒收"
+                )
         return out.paragraphs
 
     def _t1_model_name(self) -> str:

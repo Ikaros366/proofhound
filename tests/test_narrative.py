@@ -19,7 +19,7 @@ import pytest
 from proofhound.compliance.audit import AuditLog
 from proofhound.core.context import ContextOverflowError, ContextPolicy
 from proofhound.findings.evidence import assemble_evidence_pack
-from proofhound.findings.finding import FindingStore
+from proofhound.findings.finding import FindingStore, NarrativeParts
 from proofhound.llm.router import Tier
 from proofhound.llm.usage import BudgetExceededError, UsageRecord, UsageTracker
 from proofhound.report.narrative import NarrativeError, NarrativeGenerator
@@ -220,3 +220,126 @@ def test_prompt_payload_keys_and_stats(report_evidence_dir):
     narrated_ids = {f["id"] for f in payload["findings"]}
     assert "F-2026-0004" not in narrated_ids
     assert "F-2026-0003" not in narrated_ids
+
+
+# ---- M4.5：三段叙述（narrative_parts） ----
+
+PARTS_REPLY = json.dumps(
+    {
+        "paragraphs": {
+            "F-2026-0001": {
+                "description": "登录接口存在 SQL 注入。",
+                "impact": "可致后台数据库内容泄漏。",
+                "remediation": "改用参数化查询。",
+            },
+            "F-2026-0005": {
+                "description": "接口可执行系统命令。",
+                "impact": "可完全控制服务器。",
+                "remediation": "收敛危险函数并加白名单。",
+            },
+            "overview": "本次测试共确认 2 个漏洞。",
+            "remediation": "建议使用参数化查询。",
+        }
+    },
+    ensure_ascii=False,
+)
+
+
+def test_valid_parts_persist_with_audit(report_evidence_dir):
+    """三段对象：narrative_parts 落盘可回放、narrative 派生、审计同形。"""
+    tracker = UsageTracker()
+    audit = AuditLog(report_evidence_dir / "audit.jsonl")
+    paragraphs = _generate(
+        report_evidence_dir, MockRouter(PARTS_REPLY, tracker), audit
+    )
+    parts = paragraphs["F-2026-0001"]
+    assert isinstance(parts, NarrativeParts)
+    assert parts.description == "登录接口存在 SQL 注入。"
+
+    store = _store(report_evidence_dir)
+    finding = store.get("F-2026-0001")
+    assert finding.narrative_parts is not None
+    assert finding.narrative_parts.impact == "可致后台数据库内容泄漏。"
+    # 单段 narrative 由三段确定性拼接派生（default_template 契约不变）
+    assert finding.narrative == (
+        "登录接口存在 SQL 注入。\n可致后台数据库内容泄漏。\n改用参数化查询。"
+    )
+    # 事实字段不动
+    assert finding.vuln_type == "sqli" and finding.severity == "high"
+
+    # 固定章节仍为字符串，落 narrative_sections.json
+    sections = json.loads(
+        (report_evidence_dir / "narrative_sections.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert sections == {
+        "overview": "本次测试共确认 2 个漏洞。",
+        "remediation": "建议使用参数化查询。",
+    }
+
+    # 审计事件形状不变
+    events = [
+        e for e in audit.read_all() if e["event"] == "narrative_generated"
+    ]
+    assert {e["finding_id"] for e in events if "finding_id" in e} == {
+        "F-2026-0001",
+        "F-2026-0005",
+    }
+    assert {e["section"] for e in events if "section" in e} == {
+        "overview",
+        "remediation",
+    }
+    assert all(e["tokens"] == 16 for e in events)
+
+    # 证据包 finding.json 重刷带出 narrative_parts
+    pack_snapshot = json.loads(
+        (
+            report_evidence_dir / "findings" / "F-2026-0001" / "finding.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert pack_snapshot["narrative_parts"]["remediation"] == "改用参数化查询。"
+
+
+def test_parts_invalid_rejected_all_or_nothing(report_evidence_dir):
+    """三段对象非法（缺字段/字段空白/多余键）→ NarrativeError，零落盘。"""
+    store_before = _store(report_evidence_dir)
+    lines_before = len(
+        store_before.path.read_text(encoding="utf-8").splitlines()
+    )
+    base = {"description": "描", "impact": "危", "remediation": "改"}
+    bad_parts = [
+        {k: v for k, v in base.items() if k != "impact"},  # 缺字段
+        {**base, "impact": "  "},  # 字段空白
+        {**base, "poc": "不该有"},  # 多余键（extra=forbid）
+    ]
+    for bad in bad_parts:
+        reply = json.dumps(
+            {"paragraphs": {"F-2026-0001": bad, "overview": "概述"}},
+            ensure_ascii=False,
+        )
+        with pytest.raises(NarrativeError):
+            _generate(report_evidence_dir, MockRouter(reply))
+    assert (
+        len(store_before.path.read_text(encoding="utf-8").splitlines())
+        == lines_before
+    )
+    assert not (report_evidence_dir / "narrative_sections.json").exists()
+
+
+def test_section_key_must_be_string(report_evidence_dir):
+    """固定章节键给三段对象 → NarrativeError（章节段落必须是字符串）。"""
+    reply = json.dumps(
+        {
+            "paragraphs": {
+                "overview": {
+                    "description": "描",
+                    "impact": "危",
+                    "remediation": "改",
+                }
+            }
+        },
+        ensure_ascii=False,
+    )
+    with pytest.raises(NarrativeError, match="章节"):
+        _generate(report_evidence_dir, MockRouter(reply))

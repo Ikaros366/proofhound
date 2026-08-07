@@ -129,3 +129,116 @@ def test_template_context_is_plain_json(report_evidence_dir):
         "conditional_findings", "hypothesis_findings", "rejected_findings",
         "sections",
     }
+
+
+# ---- M4.5：extras 透传 / severity_cn / repro_text / evidence_index ----
+
+
+def test_engagement_extras_passthrough(report_evidence_dir):
+    """M4.5：engagement.json 任意额外键原样透传进渲染上下文（只进模板）。"""
+    (report_evidence_dir / "engagement.json").write_text(
+        json.dumps(
+            {
+                "target": "http://127.0.0.1:9",
+                "company_name": "某某单位",
+                "system_name": "自定义企业演示系统",
+                "report_date": "2026年8月",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    engagement = build_context(report_evidence_dir).as_template_context()["engagement"]
+    assert engagement["company_name"] == "某某单位"
+    assert engagement["system_name"] == "自定义企业演示系统"
+    assert engagement["report_date"] == "2026年8月"
+    assert engagement["target"] == "http://127.0.0.1:9"  # 已知字段不变
+
+
+def test_engagement_no_file_no_extras(report_evidence_dir):
+    """无 engagement.json：只有四个契约字段，无 extras。"""
+    engagement = build_context(report_evidence_dir).as_template_context()["engagement"]
+    assert set(engagement) == {"target", "scope", "started_at", "finished_at"}
+
+
+def test_engagement_known_field_validation_unchanged(report_evidence_dir):
+    """已知字段校验不变：坏类型仍 ValidationError（extras 不放松已知字段）。"""
+    import pydantic
+    import pytest
+
+    (report_evidence_dir / "engagement.json").write_text(
+        json.dumps({"target": 123, "company_name": "某单位"}), encoding="utf-8"
+    )
+    with pytest.raises(pydantic.ValidationError):
+        build_context(report_evidence_dir)
+
+
+def test_severity_cn_mapping(report_evidence_dir):
+    """M4.5：中文档位映射 critical→严重/high→高/medium→中/low→低/info→提示。"""
+    context = build_context(report_evidence_dir)
+    by_id = {
+        f.id: f
+        for bucket in (
+            context.confirmed_findings,
+            context.conditional_findings,
+            context.hypothesis_findings,
+            context.rejected_findings,
+        )
+        for f in bucket
+    }
+    assert by_id["F-2026-0005"].severity_cn == "严重"  # critical
+    assert by_id["F-2026-0001"].severity_cn == "高"  # high
+    assert by_id["F-2026-0002"].severity_cn == "中"  # medium
+    assert by_id["F-2026-0004"].severity_cn == "低"  # low
+    assert by_id["F-2026-0003"].severity_cn == "提示"  # info
+
+
+def test_severity_cn_unknown_passthrough(report_evidence_dir):
+    """未知级别原样返回。"""
+    from proofhound.findings.finding import Finding, FindingStore
+
+    store = FindingStore(report_evidence_dir / "findings.jsonl")
+    store.append(
+        Finding(
+            id="F-2026-0009",
+            state="hypothesis",
+            vuln_type="custom",
+            severity="weird",
+            asset="http://127.0.0.1:9/x",
+            dedup_key="sha256:weird",
+            created_at="2026-08-07T00:00:00.000+00:00",
+            updated_at="2026-08-07T00:00:00.000+00:00",
+        )
+    )
+    context = build_context(report_evidence_dir)
+    weird = next(f for f in context.hypothesis_findings if f.id == "F-2026-0009")
+    assert weird.severity_cn == "weird"
+
+
+def test_repro_text(report_evidence_dir):
+    """M4.5：编号拼接复现文本（\\n 连接）；无 verification 为空串。"""
+    context = build_context(report_evidence_dir)
+    confirmed = next(f for f in context.confirmed_findings if f.id == "F-2026-0001")
+    assert confirmed.repro_text == "1. 步骤一\n2. 步骤二"
+    no_verification = next(
+        f for f in context.confirmed_findings if f.id == "F-2026-0005"
+    )
+    assert no_verification.repro_text == ""
+
+
+def test_evidence_index_assembly(report_evidence_dir):
+    """M4.5 扁平证据索引：confirmed+conditional 全部条目，稳定桶序。"""
+    context = build_context(report_evidence_dir)
+    # fixture 中仅 F-2026-0001 组装了证据包（1 条目）；conditional 未组装不贡献
+    assert len(context.evidence_index) == 1
+    item = context.evidence_index[0]
+    assert item.finding_id == "F-2026-0001"
+    source = report_evidence_dir / "run1.stdout.log"
+    assert item.sha256 == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert item.source_ref == f"{source}#L2"
+    assert item.line_anchor == 2
+    assert item.file is not None and item.file.startswith("run1.stdout-")
+    # 渲染上下文可见（纯 JSON 结构化）
+    dumped = context.as_template_context()["evidence_index"]
+    assert dumped[0]["finding_id"] == "F-2026-0001"
+    assert dumped[0]["sha256"] == item.sha256

@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from proofhound.compliance.audit import AuditLog
 
@@ -83,6 +83,28 @@ class VerifierVerdict(BaseModel):
     reason: str = ""
 
 
+class NarrativeParts(BaseModel):
+    """报告叙述三段结构（M4.5，§5.7）：描述/危害/建议措施。
+
+    由报告阶段 LLM 产出（narrative.py 强校验后落盘），叙述文字只存于
+    narrative / narrative_parts，不回写事实字段。``extra="forbid"``：
+    契约外键即非法输出（与无锚文字同款拒收语义）。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    description: str = Field(min_length=1)  # 漏洞描述
+    impact: str = Field(min_length=1)  # 漏洞危害
+    remediation: str = Field(min_length=1)  # 建议措施
+
+    @field_validator("description", "impact", "remediation")
+    @classmethod
+    def _non_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("叙述段落为空白")
+        return value
+
+
 class Finding(BaseModel):
     """一条发现（§5.5）。Confirmed 只能经状态机 + 铁律闸到达（红线 2）。"""
 
@@ -104,6 +126,7 @@ class Finding(BaseModel):
     cvss: float | None = None
     rejection_reason: str | None = None
     narrative: str | None = None  # 报告阶段 LLM 叙述只存于此，不回写事实字段
+    narrative_parts: NarrativeParts | None = None  # M4.5 三段叙述（描述/危害/建议）
     source_signal_refs: list[str] = Field(default_factory=list)
     created_at: str = Field(min_length=1)
     updated_at: str = Field(min_length=1)

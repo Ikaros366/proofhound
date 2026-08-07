@@ -1,13 +1,13 @@
 # AGENTS.md
 
-> 面向 AI 编码 Agent 的项目指南。本文件基于仓库当前实际内容编写；项目已完成 M1（工具底座）、M2a（Skill 系统 + M1 遗留补强）、M2b（编排器核心）、M2c（模型路由与成本治理）、M3a（Finding 生命周期、证据包与去重）、M3b（验证执行层第一刀：证据门 + Verifier + verify-sqli 垂直切片）与 M4（报告引擎：数据组装 + T1 叙述 + docxtpl 渲染 + 报告 CLI）。
+> 面向 AI 编码 Agent 的项目指南。本文件基于仓库当前实际内容编写；项目已完成 M1（工具底座）、M2a（Skill 系统 + M1 遗留补强）、M2b（编排器核心）、M2c（模型路由与成本治理）、M3a（Finding 生命周期、证据包与去重）、M3b（验证执行层第一刀：证据门 + Verifier + verify-sqli 垂直切片）、M4（报告引擎：数据组装 + T1 叙述 + docxtpl 渲染 + 报告 CLI）与 M4.5（模板适配与叙述结构化：报告引擎驱动自定义企业模板）。
 
 ## 项目概述
 
 本项目是 **ProofHound**（暂定名，发布前需复查 GitHub/PyPI/Docker Hub/域名占用）——一个**自动化渗透测试 Agent 系统**。仓库包含设计文档与 M1 实现：
 
 - `docs/design.md` —— 设计文档 v0.7（草案，状态：待评审），是整个仓库的权威输入，用途为"作为 Kimi Code 开发输入，指导从零实现"。
-- `proofhound/` —— M1 工具底座（L0+L1）：Tool Manifest、安装器、Docker 沙箱、scope 校验、append-only 审计日志；M2a：L2 Skill 系统（registry + 导入安全闸）+ 两项 M1 遗留补强（文件目标 scope 解析、沙箱网络出口白名单）；M2b：L3 编排器核心（`proofhound/core/`：任务树/状态机、规划器、失败预算）+ 最小 LLM 客户端（`proofhound/llm/`）+ 确定性命令构造器（`tools/build.py`）+ 首个输出解析器（`tools/parsers/httpx_json.py`）+ Signal 模型（`findings/signal.py`）；M2c：模型路由三档 T0/T1/T2（`llm/router.py`）+ 用量计量与 Run 级 token 预算硬闸（`llm/usage.py`）+ 上下文治理（`core/context.py`：确定性压缩 + prompt 字符硬上限）+ live 演示脚本（`scripts/demo_live.py`）；M3a：Finding 数据模型与生命周期状态机（`findings/finding.py`，铁律硬编码）+ append-only FindingStore（findings.jsonl 快照追加）+ 去重指纹（`findings/dedup.py`）+ 证据包组装与离线 show（`findings/evidence.py` + `python -m proofhound.findings show`）+ 确定性 triage（`Orchestrator.run_triage_phase()`，规则表零 LLM 调用）；M3b：证据门（`verify/gate.py`，§5.4.2 矩阵代码化，fail-closed）+ 预置会话（`compliance/session.py`，Cookie/headers 挂 Scope，审计/state/日志只记 sha256 前 8 位）+ sqlmap 工具接入（pip 配方版本 pin + 强制 SHA256、PyPI 白名单源、`tools.d/<name>/lib` 隔离安装 + wrapper、manifest 新增 `image` 沙箱镜像声明、stdout 验证结论解析器配版本快照）+ Verifier Agent（`verify/verifier.py`，T2 档对抗校验，Pydantic 强校验 verdict，非法输出拒收）+ verify-sqli 垂直切片（`Orchestrator.run_verify_phase()` 确定性编排：带会话 baseline → sqlmap 确认 → 证据门 → Verifier 终审 → CONFIRMED/REJECTED），DVWA 实靶验收通过；M4：报告引擎（`proofhound/report/`：数据组装 data.py + T1 叙述 narrative.py + docxtpl 渲染 render.py + `python -m proofhound.report build` CLI + 默认模板 `templates/default_template.docx`），DVWA 产物出真实报告验收通过；其余分层（infra）仅有占位目录，属后续里程碑。
+- `proofhound/` —— M1 工具底座（L0+L1）：Tool Manifest、安装器、Docker 沙箱、scope 校验、append-only 审计日志；M2a：L2 Skill 系统（registry + 导入安全闸）+ 两项 M1 遗留补强（文件目标 scope 解析、沙箱网络出口白名单）；M2b：L3 编排器核心（`proofhound/core/`：任务树/状态机、规划器、失败预算）+ 最小 LLM 客户端（`proofhound/llm/`）+ 确定性命令构造器（`tools/build.py`）+ 首个输出解析器（`tools/parsers/httpx_json.py`）+ Signal 模型（`findings/signal.py`）；M2c：模型路由三档 T0/T1/T2（`llm/router.py`）+ 用量计量与 Run 级 token 预算硬闸（`llm/usage.py`）+ 上下文治理（`core/context.py`：确定性压缩 + prompt 字符硬上限）+ live 演示脚本（`scripts/demo_live.py`）；M3a：Finding 数据模型与生命周期状态机（`findings/finding.py`，铁律硬编码）+ append-only FindingStore（findings.jsonl 快照追加）+ 去重指纹（`findings/dedup.py`）+ 证据包组装与离线 show（`findings/evidence.py` + `python -m proofhound.findings show`）+ 确定性 triage（`Orchestrator.run_triage_phase()`，规则表零 LLM 调用）；M3b：证据门（`verify/gate.py`，§5.4.2 矩阵代码化，fail-closed）+ 预置会话（`compliance/session.py`，Cookie/headers 挂 Scope，审计/state/日志只记 sha256 前 8 位）+ sqlmap 工具接入（pip 配方版本 pin + 强制 SHA256、PyPI 白名单源、`tools.d/<name>/lib` 隔离安装 + wrapper、manifest 新增 `image` 沙箱镜像声明、stdout 验证结论解析器配版本快照）+ Verifier Agent（`verify/verifier.py`，T2 档对抗校验，Pydantic 强校验 verdict，非法输出拒收）+ verify-sqli 垂直切片（`Orchestrator.run_verify_phase()` 确定性编排：带会话 baseline → sqlmap 确认 → 证据门 → Verifier 终审 → CONFIRMED/REJECTED），DVWA 实靶验收通过；M4：报告引擎（`proofhound/report/`：数据组装 data.py + T1 叙述 narrative.py + docxtpl 渲染 render.py + `python -m proofhound.report build` CLI + 默认模板 `templates/default_template.docx`），DVWA 产物出真实报告验收通过；M4.5：模板适配与叙述结构化（engagement extras 透传、severity_cn 中文档位、narrative_parts 三段叙述 + 单段派生、repro_text、cn_date 过滤器、evidence_index、`{{r }}` RichText 适配），自定义企业模板验收通过；其余分层（infra）仅有占位目录，属后续里程碑。
 - `skills/` —— 内置 skill 库，目前已有 `web-scan`（httpx SOP）与 `verify-sqli`（SQL 注入行为验证 SOP，risk_level L2）。
 
 系统针对现有编排型 AI 渗透工具（以 PentAGI 为代表）的三大痛点设计：误报泛滥、速度慢、成本高。核心设计哲学是"**证据为王、验证驱动**"：一切候选发现默认为假，必须通过验证层状态机和证据门才能进入报告。
@@ -20,7 +20,7 @@
 
 ## 仓库现状与开发阶段
 
-- **M1（2026-08-06）、M2a、M2b、M2c、M3a、M3b（2026-08-07）已完成**：`pyproject.toml`、pytest 测试套件已就位；M2a 交付 L2 Skill 系统（`proofhound/skills/`：manifest 强校验、registry、导入安全闸）、scope 文件目标解析（`httpx -l targets.txt` 逐行校验，任一行越界即拒）、no_targets 默认拒绝、沙箱网络出口白名单（`proofhound/tools/egress.py`，默认 restricted）；M2b 交付 L3 编排器核心（任务树/DAG + 节点状态机、规划器——结构化 JSON 计划经 Pydantic schema + 语义双层校验、失败预算 + 规则表失败分类、最小 LLM 客户端，OpenAI 兼容、配置走 .env）并打通"web-scan → 计划 → 沙箱 httpx → Signal 落盘 → 全链路审计"最小链路；M2c 交付模型路由（三档 T0/T1/T2 独立配置、规划走 T1、T1==T2 同模型启动警告——红线 4）、用量计量（`llm_call` 审计；响应无 usage 按字符估算并标 estimated）与 Run 级 token 预算硬闸（调用前检查，超限停止规划循环、节点 blocked、记 `llm_budget_exceeded`，与 scope 同级不可绕过）、上下文治理（Signal 摘要按 kind 聚合压缩、计数不丢；prompt 字符硬上限，超则任务 failed 记 `context_overflow`，禁静默截断）；M3a 交付 Finding 生命周期状态机（Signal→Hypothesis→Reproduced→Confirmed + Rejected，铁律硬编码：version-cve 型与纯 status-code 证据永远禁止 Confirmed，迁移记 `finding_state` 审计）、去重指纹（sha256 规范化资产+漏洞类型+参数，同指纹合并记 `finding_deduplicated`）、证据包与"出处可调出"（`evidence/findings/<id>/`：证据原文 + sha256 manifest + finding.json，`python -m proofhound.findings show` 离线调出，纯文件查询）、确定性 triage（scan Signals 经规则表映射建/并 Finding 置 Hypothesis，落 findings.jsonl，零 LLM 调用）；M3b 交付验证执行层第一刀：证据门（`verify/gate.py`：sqli 要求 method ∈ {sqlmap-confirmed, boolean-diff, time-blind-diff} 且 evidence_kinds 含 behavioral，未知类型 fail-closed，与状态机铁律双层防守）、预置会话（`Scope.session`，构造器注入 `httpx -H`/`sqlmap --cookie`，LLM 只声明 `with_session` 不碰凭据；Cookie 在审计/state/日志中只记 sha256 前 8 位，专项测试断言全审计链无原文）、sqlmap 接入（`tools/manifests/sqlmap.yaml`：pip 配方 `sqlmap==1.10.8` + SHA256 + PyPI 白名单源，隔离装进 `tools.d/sqlmap/lib`；构造器强校验 level≤3/risk≤2/`--batch` 恒在；`SandboxRunner.run(image=...)` 按次覆盖沙箱镜像为 python:3.12-alpine）、Verifier Agent（`verify/verifier.py`：T2 档 kimi-k3，输入仅结构化摘要+证据包索引+diff 摘要——红线 3，输出 Pydantic 校验 confirm|reject，非法 verdict 拒收 fail-closed，记 `verifier_verdict`）、verify-sqli 垂直切片（`skills/verify-sqli/SKILL.md` L2 + `Orchestrator.run_verify_phase()`：Hypothesis→带会话 baseline→sqlmap 确认→证据入包（behavioral 标签/method/复现步骤）→REPRODUCED→Verifier 终审→CONFIRMED/REJECTED；Confirmed 三要件=行为证据∧证据门∧Verifier confirm）+ 种子入口（`scripts/seed_finding.py`）+ DVWA 实靶验收（`scripts/demo_verify_dvwa.py`：确定性 admin/password 登录拿 Cookie、security=low，正例 Confirmed、反例 version-cve 铁律拦截、show 离线调出全要素）；M4 交付报告引擎（`report/data.py`：findings.jsonl + 证据包 → ReportContext 四桶分桶（confirmed/conditional/hypothesis/rejected）+ 证据索引 + engagement 派生；`report/narrative.py`：T1 叙述生成，段落绑定 finding_id/固定章节键、无锚文字全量拒收，落 `Finding.narrative` + `narrative_sections.json` 并记 `narrative_generated`，BudgetExceededError 上抛；`report/render.py`：docxtpl + Jinja2 StrictUndefined + autoescape；`python -m proofhound.report build [--no-llm]`；`scripts/make_default_template.py` 生成默认模板；`scripts/demo_report.py` DVWA 产物验收通过）；尚未实现统一 engagement CLI（M1~M4 交互为 python -m 模块入口）、成本仪表盘/模型自动降级（M2c 仅有审计事件）及 M3 其余切片（baseline 完整档案、verify-xss/verify-lfi、LLM triage、误报库）与 M5 之后的模块，也没有 CI、lint 配置。
+- **M1（2026-08-06）、M2a、M2b、M2c、M3a、M3b（2026-08-07）已完成**：`pyproject.toml`、pytest 测试套件已就位；M2a 交付 L2 Skill 系统（`proofhound/skills/`：manifest 强校验、registry、导入安全闸）、scope 文件目标解析（`httpx -l targets.txt` 逐行校验，任一行越界即拒）、no_targets 默认拒绝、沙箱网络出口白名单（`proofhound/tools/egress.py`，默认 restricted）；M2b 交付 L3 编排器核心（任务树/DAG + 节点状态机、规划器——结构化 JSON 计划经 Pydantic schema + 语义双层校验、失败预算 + 规则表失败分类、最小 LLM 客户端，OpenAI 兼容、配置走 .env）并打通"web-scan → 计划 → 沙箱 httpx → Signal 落盘 → 全链路审计"最小链路；M2c 交付模型路由（三档 T0/T1/T2 独立配置、规划走 T1、T1==T2 同模型启动警告——红线 4）、用量计量（`llm_call` 审计；响应无 usage 按字符估算并标 estimated）与 Run 级 token 预算硬闸（调用前检查，超限停止规划循环、节点 blocked、记 `llm_budget_exceeded`，与 scope 同级不可绕过）、上下文治理（Signal 摘要按 kind 聚合压缩、计数不丢；prompt 字符硬上限，超则任务 failed 记 `context_overflow`，禁静默截断）；M3a 交付 Finding 生命周期状态机（Signal→Hypothesis→Reproduced→Confirmed + Rejected，铁律硬编码：version-cve 型与纯 status-code 证据永远禁止 Confirmed，迁移记 `finding_state` 审计）、去重指纹（sha256 规范化资产+漏洞类型+参数，同指纹合并记 `finding_deduplicated`）、证据包与"出处可调出"（`evidence/findings/<id>/`：证据原文 + sha256 manifest + finding.json，`python -m proofhound.findings show` 离线调出，纯文件查询）、确定性 triage（scan Signals 经规则表映射建/并 Finding 置 Hypothesis，落 findings.jsonl，零 LLM 调用）；M3b 交付验证执行层第一刀：证据门（`verify/gate.py`：sqli 要求 method ∈ {sqlmap-confirmed, boolean-diff, time-blind-diff} 且 evidence_kinds 含 behavioral，未知类型 fail-closed，与状态机铁律双层防守）、预置会话（`Scope.session`，构造器注入 `httpx -H`/`sqlmap --cookie`，LLM 只声明 `with_session` 不碰凭据；Cookie 在审计/state/日志中只记 sha256 前 8 位，专项测试断言全审计链无原文）、sqlmap 接入（`tools/manifests/sqlmap.yaml`：pip 配方 `sqlmap==1.10.8` + SHA256 + PyPI 白名单源，隔离装进 `tools.d/sqlmap/lib`；构造器强校验 level≤3/risk≤2/`--batch` 恒在；`SandboxRunner.run(image=...)` 按次覆盖沙箱镜像为 python:3.12-alpine）、Verifier Agent（`verify/verifier.py`：T2 档 kimi-k3，输入仅结构化摘要+证据包索引+diff 摘要——红线 3，输出 Pydantic 校验 confirm|reject，非法 verdict 拒收 fail-closed，记 `verifier_verdict`）、verify-sqli 垂直切片（`skills/verify-sqli/SKILL.md` L2 + `Orchestrator.run_verify_phase()`：Hypothesis→带会话 baseline→sqlmap 确认→证据入包（behavioral 标签/method/复现步骤）→REPRODUCED→Verifier 终审→CONFIRMED/REJECTED；Confirmed 三要件=行为证据∧证据门∧Verifier confirm）+ 种子入口（`scripts/seed_finding.py`）+ DVWA 实靶验收（`scripts/demo_verify_dvwa.py`：确定性 admin/password 登录拿 Cookie、security=low，正例 Confirmed、反例 version-cve 铁律拦截、show 离线调出全要素）；M4 交付报告引擎（`report/data.py`：findings.jsonl + 证据包 → ReportContext 四桶分桶（confirmed/conditional/hypothesis/rejected）+ 证据索引 + engagement 派生；`report/narrative.py`：T1 叙述生成，段落绑定 finding_id/固定章节键、无锚文字全量拒收，落 `Finding.narrative` + `narrative_sections.json` 并记 `narrative_generated`，BudgetExceededError 上抛；`report/render.py`：docxtpl + Jinja2 StrictUndefined + autoescape；`python -m proofhound.report build [--no-llm]`；`scripts/make_default_template.py` 生成默认模板；`scripts/demo_report.py` DVWA 产物验收通过）；M4.5 交付模板适配与叙述结构化（engagement extras 透传、severity_cn 中文档位、narrative_parts 三段叙述 + 单段 narrative 确定性派生（旧字符串格式兼容）、repro_text 编号复现文本、cn_date 过滤器、evidence_index 扁平证据索引、`{{r }}` RichText 渲染适配；`scripts/demo_report_enterprise.py` 自定义企业模板验收通过）；尚未实现统一 engagement CLI（M1~M4.5 交互为 python -m 模块入口）、成本仪表盘/模型自动降级（M2c 仅有审计事件）及 M3 其余切片（baseline 完整档案、verify-xss/verify-lfi、LLM triage、误报库）与 M5 之后的模块，也没有 CI、lint 配置。
 - 一切实现工作都应以 `docs/design.md` 为准。修改设计决策时，同步更新该文档。
 - 开发路线图（文档 §8）：
 
@@ -31,6 +31,7 @@
 | M2 编排器（2~3 周）——M2a、M2b、M2c 已完成（2026-08-07） | skill registry（M2a ✅）、任务 DAG + 规划器 + 失败预算 + 最小 LLM 客户端（M2b ✅）、模型路由 + 预算硬闸 + 上下文治理（M2c ✅；成本仪表盘未做，仅有 llm_call 审计事件）；M1 遗留补强（M2a ✅）：文件目标 scope 解析、沙箱网络出口白名单 | 单目标 recon+扫描全自动；上下文体积有上限；成本仪表盘可见 |
 | M3 验证层（3 周）——M3a、M3b 已完成（2026-08-07） | M3a ✅：Finding 生命周期状态机（铁律硬编码）、证据包与离线 show、去重指纹、确定性 triage（零 LLM 调用）；M3b ✅：证据门（verify/gate.py）、预置会话（Cookie 脱敏）、sqlmap 接入（pip pin + SHA256）、Verifier Agent（T2）、verify-sqli 垂直切片（run_verify_phase），DVWA 实靶 Confirmed；待做：baseline 完整档案、verify-xss/verify-lfi、LLM triage、误报库 | XBEN/DVWA 上 Confirmed 发现 100% 带证据；误报率达标 |
 | M4 报告引擎（1~2 周）——已完成（2026-08-07） | docxtpl 管线（render.py + 默认模板 ✅）、叙述润色（narrative.py T1 档，段落绑定 finding_id、无锚拒收 ✅）、误报附录（rejected 桶 + rejection_reason ✅）；PDF 管线未做 | 给定模板一键出报告，事实字段零手写 |
+| M4.5 模板适配与叙述结构化——已完成（2026-08-07） | engagement extras 透传、severity_cn 中文档位、narrative_parts 三段叙述（单段 narrative 确定性派生、旧字符串格式兼容）、repro_text 复现文本、cn_date 过滤器、evidence_index 扁平证据索引、`{{r }}` RichText 渲染适配 | 自定义企业模板出真实报告（封面/时间/风险项/附录 A B/流程章读回自检通过），default_template 渲染回归不变 |
 | M5 产品化（按需） | 本机 Web 控制台、MCP 暴露、持续监测、增量复测 | — |
 
 **注意 M0 的特殊性**：第一阶段刻意不写平台代码，只做 skill（SKILL.md 目录）并用 Kimi Code 手工编排验证流程。
@@ -169,23 +170,29 @@ M4 报告引擎演示（真实 T1 叙述，产物落 `evidence/demo_report/`）�
 .venv/bin/python -m proofhound.report build --dir <evidence_dir> --out <docx> --no-llm             # 跳过叙述生成（槽位留占位）
 .venv/bin/python scripts/demo_report.py [--dir evidence/demo_verify/<时间戳>]  # 端到端验收：复制 DVWA 产物 → 补齐 Rejected/Hypothesis 矩阵
                                                                              # → no-llm 对照 + T1 叙述版 → python-docx 读回自检
+.venv/bin/python scripts/demo_report_enterprise.py [--dir evidence/demo_verify/<时间戳>]  # M4.5 验收：engagement.json 补 extras
+                                                                             # → 自定义企业模板 T1 叙述版 + default_template 对照 → 读回自检
 ```
 
-engagement 元信息：可选 `<evidence_dir>/engagement.json`（`{"target","scope","started_at","finished_at"}`，字段可缺省）；缺字段自动派生（target 取 findings 资产最高频 host，时间窗取 audit.jsonl 首/末条 ts）。
+engagement 元信息：可选 `<evidence_dir>/engagement.json`（`{"target","scope","started_at","finished_at"}`，字段可缺省）；缺字段自动派生（target 取 findings 资产最高频 host，时间窗取 audit.jsonl 首/末条 ts）。M4.5 起允许任意额外键（company_name/system_name/report_date 等）原样透传进渲染上下文（extras 只进模板，不进叙述 prompt）。
 
-## 报告模板变量契约（M4，§5.7）
+## 报告模板变量契约（M4/M4.5，§5.7）
 
 docx 模板用 docxtpl（Jinja2 语法），渲染环境 **StrictUndefined**（引用契约外变量即报错）且替换值做 XML 转义（`autoescape=True`）。docxtpl 布局纪律：`{%tr ... %}/{%p ... %}` 标签必须**独占表格行/段落**（整行/整段被替换为标签），行内 `{{ }}` 与 `{% if %}` 不受限。可用变量：
 
-- `engagement.target` / `engagement.scope` / `engagement.started_at` / `engagement.finished_at`（可为 null）
+- `engagement.target` / `engagement.scope` / `engagement.started_at` / `engagement.finished_at`（可为 null）；**M4.5 extras**：engagement.json 任意额外键原样透传（如 `engagement.company_name` / `engagement.system_name` / `engagement.report_date`，缺键即 StrictUndefined 报错）
 - `summary.confirmed` / `summary.conditional` / `summary.hypothesis` / `summary.rejected` / `summary.severity_counts`（dict，confirmed 按严重级计数）
 - `confirmed_findings[]` / `conditional_findings[]`（Reproduced 未 Confirmed）/ `hypothesis_findings[]` / `rejected_findings[]`（误报附录数据源），每项：
-  - `id, state, title, vuln_type, severity, asset, param, preconditions[], confidence, evidence_kinds[]`
-  - `narrative`（叙述槽位，可为 null；模板用 `{{ f.narrative or '占位' }}`）、`rejection_reason`（可为 null）
+  - `id, state, title, vuln_type, severity, severity_cn`（M4.5 中文档位：严重/高/中/低/提示，未知原样）`, asset, param, preconditions[], confidence, evidence_kinds[]`
+  - `narrative`（叙述槽位，可为 null；模板用 `{{ f.narrative or '占位' }}`）、`narrative_parts`（M4.5 三段叙述 `{description, impact, remediation}`，可为 null；引用其子键须先确认叙述已生成）、`rejection_reason`（可为 null）
+  - `repro_text`（M4.5 编号拼接复现文本，`\n` 连接，无步骤为空串；配 `{{r f.repro_text }}` 富文本换行）
   - `verification.{method, evidence_refs[], baseline_diff, reproduction_steps[], verified_by, verified_at}`（可为 null，用 `{%p if f.verification %}` 守卫）
   - `verifier.{model, verdict, reason}`（可为 null）
   - `evidence_pack.{pack_dir, assembled, entries[]}`；`entries[]` = `{file, sha256, source_ref, line_anchor, missing}`（**注意是 entries 不是 items**：dict 的 `.items` 方法会遮蔽 Jinja 属性解析）
 - `sections.overview` / `sections.remediation`（固定章节叙述，键恒在、值可为 null）
+- `evidence_index[]`（M4.5 扁平证据索引：confirmed+conditional 全部条目，稳定排序），每项 `{finding_id, file, sha256, source_ref, line_anchor}`
+- 过滤器 `cn_date`（M4.5：ISO 时间 → 「2026年8月7日」，空值 → 空串，非 ISO 原样返回），用法 `{{ engagement.started_at | cn_date }}`
+- **`{{r }}` 富文本适配**（M4.5）：docxtpl 会把 `{{r }}` 的值插到 run 之外，纯字符串会被丢弃；渲染器自动扫描模板 `{{r }}` 标签并把 context 对应键的字符串值包装成 RichText（`\n` → 换行，`& < >` 内部转义），模板作者直接用 `{{r f.repro_text }}` 即可
 
 参考实现即 `templates/default_template.docx`（尾部附同样契约说明页），由 `scripts/make_default_template.py` 生成、可入库重现。
 
@@ -195,7 +202,7 @@ docx 模板用 docxtpl（Jinja2 语法），渲染环境 **StrictUndefined**（�
 2. 环境注记：开发环境为 WSL（Linux），项目根 `~/proofhound`，Docker 为 WSL 内引擎，`/var/run/docker.sock` 原生可用；镜像拉取走 daemon 级代理（systemd drop-in 已配置），容器不继承任何代理。
 3. 仓库卫生：.env、API 密钥、evidence/ 目录内容永不入库，.gitignore 必须包含 .env 和 evidence/。
 
-## 已知限制（M2a/M2c/M3a/M3b/M4 遗留，后续里程碑处理）
+## 已知限制（M2a/M2c/M3a/M3b/M4/M4.5 遗留，后续里程碑处理）
 
 1. **目标文件不挂进容器**：`httpx -l targets.txt` 的目标文件只在 scope 校验阶段于宿主侧读取；把目标文件（只读）挂载进容器属编排器职责，M2 后续切片处理。
 2. **出口白名单仅覆盖 HTTP(S)**：restricted 模式下 HTTP(S) 流量经宿主机白名单正向代理强制出站；非 HTTP 原始 TCP 被 internal 网络整体阻断（fail-closed）；完整协议覆盖待 §5.10 mitmproxy 代理链。不读 proxy 环境变量的工具（如 httpx）须显式传代理参数（沙箱 `egress_proxy_url`）；工具级代理参数声明待 Tool Manifest 扩展。
@@ -216,3 +223,6 @@ docx 模板用 docxtpl（Jinja2 语法），渲染环境 **StrictUndefined**（�
 17. **叙述生成为单遍全量校验**：一次 T1 调用产出全部段落，任一段落非法（无锚键/空段/坏 JSON）即全量拒收零落盘，无部分落盘与自动重试；Rejected 附录直接用结构化 `rejection_reason`（不经 LLM）。
 18. **报告不含生成时刻 wall-clock**：为保证"同输入同输出"（内容级确定性），context 只含 engagement 时间窗；docx zip 字节级时间戳不保证一致（两次渲染 `word/document.xml` 一致、zip 容器字节未必）。engagement 元信息靠可选 `engagement.json`，缺省派生（资产高频 host + audit 首末条）。
 19. **报告时间窗派生会被叙述延后**：时间窗取 audit.jsonl 首/末条，叙述生成的 `narrative_generated` 审计事件会使窗口末尾延后（晚于实际测试结束时刻）；后续切片改为 engagement.json 显式时间或叙述前定型。
+20. **用户模板叙述槽位无守卫**：自定义企业模板直接引用 `f.narrative_parts.*` 与 `sections.overview`，`--no-llm`（叙述未生成）下触发 StrictUndefined——用户模板须叙述版构建；engagement extras 键缺失同理（StrictUndefined 即报错）。
+21. **{{r }} 富文本依赖渲染器包装**：docxtpl 0.20.2 把 `{{r }}` 的值插到 run 之外、纯字符串会被丢弃（实测）；渲染器扫描模板 `{{r }}` 标签、按点路径末段键名把 context 字符串值包装成 RichText——契约内同名键会被一并包装（当前仅 `repro_text`，无碰撞）；数据层 context 仍为纯 JSON。
+22. **cn_date 非 ISO 原样返回**：过滤器对非 ISO 输入不报错、原样透传（用户手填「2026年8月」类值可用）；转换只取年月日（丢弃时分秒，不做时区换算）。

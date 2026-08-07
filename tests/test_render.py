@@ -202,3 +202,164 @@ def test_render_escapes_xml_special_chars(report_evidence_dir, minimal_template,
     assert any(
         "http://127.0.0.1:9/app?id=1&Submit=Submit<b>" == cell for cell in cells2
     )
+
+
+# ---- M4.5：cn_date 过滤器 + 自定义企业模板渲染读回 ----
+
+
+@pytest.fixture
+def cn_date_template(tmp_path):
+    """cn_date 过滤器用最小模板。"""
+    doc = Document()
+    doc.add_paragraph("开始：{{ engagement.started_at | cn_date }}")
+    doc.add_paragraph("结束：{{ engagement.finished_at | cn_date }}")
+    path = tmp_path / "cn_date.docx"
+    doc.save(str(path))
+    return path
+
+
+def test_cn_date_filter_iso(report_evidence_dir, cn_date_template, tmp_path):
+    """ISO 时间 → 「2026年8月7日」（不补零；日期-only 串也可）。"""
+    import json
+
+    (report_evidence_dir / "engagement.json").write_text(
+        json.dumps(
+            {
+                "started_at": "2026-08-07T12:34:56.789+00:00",
+                "finished_at": "2026-08-09",
+            }
+        ),
+        encoding="utf-8",
+    )
+    context = build_context(report_evidence_dir).as_template_context()
+    out = render_docx(context, cn_date_template, tmp_path / "out.docx")
+    paras = _paragraph_texts(Document(str(out)))
+    assert "开始：2026年8月7日" in paras
+    assert "结束：2026年8月9日" in paras
+
+
+def test_cn_date_filter_empty_and_passthrough(tmp_path, cn_date_template):
+    """空值 → 空串；非 ISO 串原样返回（用户手填的「2026年8月」类值可透）。"""
+    import json
+
+    (tmp_path / "findings.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "engagement.json").write_text(
+        json.dumps({"started_at": "", "finished_at": "2026年8月"}),
+        encoding="utf-8",
+    )
+    context = build_context(tmp_path).as_template_context()
+    out = render_docx(context, cn_date_template, tmp_path / "out.docx")
+    paras = _paragraph_texts(Document(str(out)))
+    assert "开始：" in paras  # 空值渲染为空串
+    assert "结束：2026年8月" in paras  # 非 ISO 原样
+
+
+ENTERPRISE_TEMPLATE_PATH = REPO_ROOT / "templates" / "custom_enterprise_template.docx"
+
+
+def _flow_section_texts(doc: Document) -> list[str]:
+    """「渗透测试流程」章段落文本（该 Heading 2 → 下一 Heading 1 之间）。"""
+    paras = doc.paragraphs
+    start = next(
+        i for i, p in enumerate(paras) if p.text.strip() == "渗透测试流程"
+    )
+    end = next(
+        i
+        for i, p in enumerate(paras[start + 1 :], start + 1)
+        if p.style.name == "Heading 1"
+    )
+    return [p.text for p in paras[start:end]]
+
+
+def test_enterprise_template_renders(report_evidence_dir, tmp_path):
+    """M4.5 验收：自定义企业模板渲染读回（封面/时间/风险项/附录 A B/流程章）。"""
+    import json
+
+    from proofhound.findings.finding import FindingStore, NarrativeParts
+
+    store = FindingStore(report_evidence_dir / "findings.jsonl")
+    parts_map = {
+        "F-2026-0001": ("登录接口存在 SQL 注入。", "可致后台数据库内容泄漏。", "改用参数化查询。"),
+        "F-2026-0005": ("接口可执行系统命令。", "可完全控制服务器。", "收敛危险函数并加白名单。"),
+    }
+    for fid, (desc, impact, remediation) in parts_map.items():
+        finding = store.get(fid)
+        finding.narrative_parts = NarrativeParts(
+            description=desc, impact=impact, remediation=remediation
+        )
+        finding.narrative = f"{desc}\n{impact}\n{remediation}"
+        store.append(finding)
+    (report_evidence_dir / "narrative_sections.json").write_text(
+        json.dumps({"overview": "概述段落。", "remediation": "建议段落。"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (report_evidence_dir / "engagement.json").write_text(
+        json.dumps(
+            {
+                "target": "http://127.0.0.1:9",
+                "scope": "127.0.0.0/8",
+                "started_at": "2026-08-07T01:00:00.000+00:00",
+                "finished_at": "2026-08-09T02:00:00.000+00:00",
+                "company_name": "某某单位",
+                "system_name": "自定义企业演示系统",
+                "report_date": "2026年8月",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    context = build_context(report_evidence_dir).as_template_context()
+    out = render_docx(context, ENTERPRISE_TEMPLATE_PATH, tmp_path / "enterprise.docx")
+    doc = Document(str(out))
+    paras = _paragraph_texts(doc)
+
+    # 封面/时间/系统名（engagement extras 透传 + cn_date）
+    assert "某某单位" in paras
+    assert "自定义企业演示系统" in paras
+    assert "2026年8月" in paras
+    assert "1）初测时间：2026年8月7日开始至2026年8月9日结束；" in paras
+    assert "概述段落。" in paras
+
+    # 风险项循环：Heading 4 数量 == confirmed 数，severity_cn + 标题，桶序
+    h4 = [p.text for p in doc.paragraphs if p.style.name == "Heading 4"]
+    assert h4 == ["【严重】rce 标题", "【高】sqli 标题"]
+    # 三段叙述槽位
+    for text in (
+        "登录接口存在 SQL 注入。",
+        "可致后台数据库内容泄漏。",
+        "改用参数化查询。",
+        "接口可执行系统命令。",
+    ):
+        assert text in paras
+    # {{r }} 富文本复现步骤：\n → <w:br/>（python-docx 读回为 \n）
+    assert any("1. 步骤一\n2. 步骤二" in p for p in paras)
+
+    # 附录 A：与证据包 manifest（evidence_index）逐条一致
+    appendix_a = next(
+        t for t in doc.tables if t.rows[0].cells[0].text == "Finding ID"
+    )
+    assert len(appendix_a.rows) == 1 + len(context["evidence_index"])
+    row = [c.text for c in appendix_a.rows[1].cells]
+    entry = context["evidence_index"][0]
+    assert row[0] == entry["finding_id"] == "F-2026-0001"
+    assert row[1] == entry["file"]
+    assert row[2] == entry["sha256"]
+    assert row[3] == f"{entry['source_ref']}#L{entry['line_anchor']}"
+
+    # 附录 B：version-cve + 排除原因
+    appendix_b = next(
+        t
+        for t in doc.tables
+        if t.rows[0].cells[0].text == "ID"
+        and t.rows[0].cells[1].text == "漏洞类型"
+    )
+    assert len(appendix_b.rows) == 2
+    cells = [c.text for c in appendix_b.rows[1].cells]
+    assert cells[0] == "F-2026-0004" and cells[1] == "version-cve"
+    assert "铁律禁止直接 Confirmed" in cells[3]
+
+    # 1.4 渗透测试流程章：与源模板逐段一致（静态内容未被渲染改动）
+    assert _flow_section_texts(doc) == _flow_section_texts(
+        Document(str(ENTERPRISE_TEMPLATE_PATH))
+    )

@@ -13,6 +13,7 @@ from proofhound.findings.finding import (
     FindingStore,
     InvalidTransitionError,
     IronRuleViolationError,
+    NarrativeParts,
     Verification,
     VerifierVerdict,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "FindingStore",
     "InvalidTransitionError",
     "IronRuleViolationError",
+    "NarrativeParts",
     "Signal",
     "Verification",
     "VerifierVerdict",

@@ -12,7 +12,11 @@
 - engagement 元信息：可选 ``<evidence_dir>/engagement.json`` 优先，缺字段
   派生（target 取资产最高频 host；时间窗取 audit.jsonl 首/末条 ts，无
   audit 退化为 findings 时间戳 min/max）；
-- 固定章节叙述（narrative.py 产物）读 ``<evidence_dir>/narrative_sections.json``。
+- 固定章节叙述（narrative.py 产物）读 ``<evidence_dir>/narrative_sections.json``；
+- M4.5 增补：engagement.json 任意额外键（extras）原样透传进渲染上下文；
+  finding 增 ``severity_cn``（中文档位）、``narrative_parts``（三段叙述）、
+  ``repro_text``（编号拼接复现文本）；context 增 ``evidence_index`` 扁平
+  证据索引（confirmed+conditional 全部条目，稳定排序）。
 
 全程纯文件查询：不碰网络、不调 LLM。context 不含 wall-clock"报告生成
 时间"——同输入同 context（渲染确定性，§5.7）。
@@ -25,7 +29,7 @@ from collections import Counter
 from pathlib import Path
 from urllib.parse import urlparse
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from proofhound.findings.finding import Finding, FindingState, FindingStore
 
@@ -42,6 +46,15 @@ SEVERITY_ORDER: dict[str, int] = {
     "medium": 2,
     "low": 3,
     "info": 4,
+}
+
+#: severity 中文档位映射（M4.5）；未知级别原样返回
+SEVERITY_CN: dict[str, str] = {
+    "critical": "严重",
+    "high": "高",
+    "medium": "中",
+    "low": "低",
+    "info": "提示",
 }
 
 
@@ -76,6 +89,7 @@ class FindingReport(BaseModel):
     title: str | None = None
     vuln_type: str
     severity: str
+    severity_cn: str  # M4.5：中文档位（critical→严重/high→高/...，未知原样）
     asset: str
     param: str | None = None
     preconditions: list[str] = Field(default_factory=list)
@@ -85,11 +99,20 @@ class FindingReport(BaseModel):
     verifier: dict | None = None  # VerifierVerdict 结构化原样
     rejection_reason: str | None = None
     narrative: str | None = None  # 叙述槽位：渲染器只读，不回写事实字段
+    narrative_parts: dict | None = None  # M4.5 三段叙述（描述/危害/建议措施）
+    repro_text: str = ""  # M4.5：编号拼接复现文本（\n 连接，供 {{r }} 富文本）
     evidence_pack: EvidencePackIndex
 
 
 class EngagementMeta(BaseModel):
-    """engagement 元信息（target/scope/时间窗）；字段均可派生。"""
+    """engagement 元信息（target/scope/时间窗）；字段均可派生。
+
+    ``extra="allow"``（M4.5）：engagement.json 的任意额外键
+    （company_name/system_name/report_date 等）原样透传进渲染上下文；
+    只进模板渲染，不进叙述 prompt。已知字段类型校验不变。
+    """
+
+    model_config = ConfigDict(extra="allow")
 
     target: str | None = None
     scope: str | None = None
@@ -107,6 +130,16 @@ class ReportSummary(BaseModel):
     severity_counts: dict[str, int] = Field(default_factory=dict)
 
 
+class EvidenceIndexItem(BaseModel):
+    """扁平证据索引项（M4.5，附录 A 数据源）：条目 + 所属 finding。"""
+
+    finding_id: str
+    file: str | None = None
+    sha256: str | None = None
+    source_ref: str = ""
+    line_anchor: int | None = None
+
+
 class ReportContext(BaseModel):
     """渲染器唯一输入（数据与表现分离：模板只读这里的结构化字段）。"""
 
@@ -119,6 +152,7 @@ class ReportContext(BaseModel):
     sections: dict[str, str | None] = Field(
         default_factory=dict
     )  # 固定章节叙述段落；契约键恒在（值可为 None），StrictUndefined 下可判空
+    evidence_index: list[EvidenceIndexItem] = Field(default_factory=list)  # M4.5 扁平证据索引（confirmed+conditional，稳定排序）
 
     def as_template_context(self) -> dict:
         """渲染输入：纯结构化 dict（JSON 类型），渲染器只读它。"""
@@ -127,6 +161,21 @@ class ReportContext(BaseModel):
 
 def _severity_rank(severity: str) -> int:
     return SEVERITY_ORDER.get(severity.strip().lower(), len(SEVERITY_ORDER))
+
+
+def _severity_cn(severity: str) -> str:
+    """中文档位映射；未知级别原样返回。"""
+    return SEVERITY_CN.get(severity.strip().lower(), severity)
+
+
+def _repro_text(finding: Finding) -> str:
+    """编号拼接复现文本（\\n 连接供 {{r }} 富文本）；无步骤为空串。"""
+    if finding.verification is None:
+        return ""
+    return "\n".join(
+        f"{index}. {step}"
+        for index, step in enumerate(finding.verification.reproduction_steps, 1)
+    )
 
 
 def _load_evidence_pack(finding: Finding, evidence_dir: Path) -> EvidencePackIndex:
@@ -156,6 +205,7 @@ def _to_report(finding: Finding, evidence_dir: Path) -> FindingReport:
         title=finding.title,
         vuln_type=finding.vuln_type,
         severity=finding.severity,
+        severity_cn=_severity_cn(finding.severity),
         asset=finding.asset,
         param=finding.param,
         preconditions=list(finding.preconditions),
@@ -171,6 +221,12 @@ def _to_report(finding: Finding, evidence_dir: Path) -> FindingReport:
         ),
         rejection_reason=finding.rejection_reason,
         narrative=finding.narrative,
+        narrative_parts=(
+            finding.narrative_parts.model_dump(mode="json")
+            if finding.narrative_parts
+            else None
+        ),
+        repro_text=_repro_text(finding),
         evidence_pack=_load_evidence_pack(finding, evidence_dir),
     )
 
@@ -210,7 +266,7 @@ def _derive_time_window(
 def _load_engagement(
     findings: list[Finding], evidence_dir: Path
 ) -> EngagementMeta:
-    """engagement.json 优先；缺字段派生（target/时间窗）。"""
+    """engagement.json 优先；缺字段就地补派生（保住 extras，M4.5）。"""
     meta = EngagementMeta()
     path = evidence_dir / ENGAGEMENT_FILE
     if path.is_file():
@@ -218,12 +274,10 @@ def _load_engagement(
             json.loads(path.read_text(encoding="utf-8"))
         )
     started, finished = _derive_time_window(findings, evidence_dir)
-    return EngagementMeta(
-        target=meta.target or _derive_target(findings),
-        scope=meta.scope,
-        started_at=meta.started_at or started,
-        finished_at=meta.finished_at or finished,
-    )
+    meta.target = meta.target or _derive_target(findings)
+    meta.started_at = meta.started_at or started
+    meta.finished_at = meta.finished_at or finished
+    return meta
 
 
 def _load_sections(evidence_dir: Path) -> dict[str, str | None]:
@@ -283,6 +337,22 @@ def build_context(evidence_dir: str | Path) -> ReportContext:
             sorted(severity_counts.items(), key=lambda kv: _severity_rank(kv[0]))
         ),
     )
+    # M4.5 扁平证据索引：confirmed → conditional 桶序（桶内已 severity,id
+    # 排序），entries 按 manifest 原序展开——稳定确定；未组装的包跳过。
+    evidence_index: list[EvidenceIndexItem] = []
+    for report in buckets["confirmed"] + buckets["conditional"]:
+        if not report.evidence_pack.assembled:
+            continue
+        for entry in report.evidence_pack.entries:
+            evidence_index.append(
+                EvidenceIndexItem(
+                    finding_id=report.id,
+                    file=entry.file,
+                    sha256=entry.sha256,
+                    source_ref=entry.source_ref,
+                    line_anchor=entry.line_anchor,
+                )
+            )
     return ReportContext(
         engagement=_load_engagement(findings, evidence_dir),
         summary=summary,
@@ -291,4 +361,5 @@ def build_context(evidence_dir: str | Path) -> ReportContext:
         hypothesis_findings=buckets["hypothesis"],
         rejected_findings=buckets["rejected"],
         sections=_load_sections(evidence_dir),
+        evidence_index=evidence_index,
     )

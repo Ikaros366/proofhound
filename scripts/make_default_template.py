@@ -305,14 +305,18 @@ def build_document() -> DocumentType:
     )
     for line in [
         "engagement.target / engagement.scope / engagement.started_at / engagement.finished_at",
+        "  （M4.5：engagement.json 任意额外键原样透传，如 engagement.company_name / engagement.system_name / engagement.report_date）",
         "summary.confirmed / summary.conditional / summary.hypothesis / summary.rejected / summary.severity_counts（dict，按严重级计数）",
         "confirmed_findings[] / conditional_findings[] / hypothesis_findings[] / rejected_findings[]，每项字段：",
-        "  id, state, title, vuln_type, severity, asset, param, preconditions[], confidence, evidence_kinds[]",
-        "  narrative（叙述槽位，可为 null）, rejection_reason（可为 null）",
+        "  id, state, title, vuln_type, severity, severity_cn（M4.5 中文档位：严重/高/中/低/提示）, asset, param, preconditions[], confidence, evidence_kinds[]",
+        "  narrative（叙述槽位，可为 null）, narrative_parts（M4.5 三段叙述 {description, impact, remediation}，可为 null）, rejection_reason（可为 null）",
+        "  repro_text（M4.5 编号拼接复现文本，\\n 连接，供 {% raw %}{{r }}{% endraw %} 富文本；无步骤为空串）",
         "  verification.{method, evidence_refs[], baseline_diff, reproduction_steps[], verified_by, verified_at}（可为 null）",
         "  verifier.{model, verdict, reason}（可为 null）",
         "  evidence_pack.{pack_dir, assembled, entries[]}；entries[] = {file, sha256, source_ref, line_anchor, missing}",
         "sections.overview / sections.remediation（固定章节叙述，可为 null）",
+        "evidence_index[]（M4.5 扁平证据索引，confirmed+conditional 全部条目，稳定排序）：{finding_id, file, sha256, source_ref, line_anchor}",
+        "过滤器：cn_date（M4.5，ISO 时间 → 「2026年8月7日」，空值 → 空串，非 ISO 原样返回），用法 {% raw %}{{ engagement.started_at | cn_date }}{% endraw %}",
     ]:
         _para(doc, line, style="List Bullet")
 
