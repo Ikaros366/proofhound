@@ -98,3 +98,28 @@ def fake_tools_dir(tmp_path):
     )
     script.chmod(0o755)
     return tmp_path / "tools.d"
+
+
+@pytest.fixture
+def make_skill_dir(tmp_path):
+    """M2b 测试用 skill 目录工厂：写一个最小合法 SKILL.md，返回 skills 根目录。"""
+
+    def _make(name="web-scan", tools=("httpx",), body="SOP 正文：先探活，再解析。"):
+        skill_dir = tmp_path / "skills" / name
+        skill_dir.mkdir(parents=True)
+        skill_dir.joinpath("SKILL.md").write_text(
+            f"---\n"
+            f"name: {name}\n"
+            f"description: 测试用 skill\n"
+            f"version: 1.0.0\n"
+            f"required_tools: [{', '.join(tools)}]\n"
+            f"risk_level: L1\n"
+            f"inputs: [targets]\n"
+            f"outputs: [signals]\n"
+            f"---\n"
+            f"\n{body}\n",
+            encoding="utf-8",
+        )
+        return tmp_path / "skills"
+
+    return _make
