@@ -3,7 +3,8 @@
 
 链路：本地 http.server 靶标 → ModelRouter（T1 档真实调用，计量 + 预算硬闸）
 → 规划器 → Docker 沙箱 httpx（network_mode=host，egress=open，同 e2e 打法）
-→ Signal 落盘 → 打印审计链。
+→ Signal 落盘 → M3a 确定性 triage（规则表，零 LLM 调用）→ Finding +
+证据包落盘 → 打印审计链。
 
 用法：
     .venv/bin/python scripts/demo_live.py                 # 正常跑通（读 .env 的 T1 配置）
@@ -169,6 +170,21 @@ def main() -> int:
                 s = json.loads(line)
                 print(f"  - {s['asset']} status={s.get('status_code')} "
                       f"title={s.get('title')!r} evidence={s['evidence_ref']}")
+
+    # 5.5 M3a 确定性 triage（规则表，零 LLM 调用）：Signals → findings.jsonl + 证据包
+    print("\n[*] 确定性 triage（无 LLM）...")
+    findings = orch.run_triage_phase()
+    if not findings:
+        print("  （无可映射 Signal，全部保持 Signal）")
+    seen_ids = set()
+    for f in findings:
+        if f.id in seen_ids:
+            continue
+        seen_ids.add(f.id)
+        print(f"  - {f.id} [{f.state.value}] {f.vuln_type} {f.asset} "
+              f"dedup={f.dedup_key[:24]}... 证据引用 {len(f.source_signal_refs)} 条")
+        print(f"    调出证据包: .venv/bin/python -m proofhound.findings show "
+              f"{f.id} --dir {evidence_dir}")
 
     # 6. 用量与审计链
     print(f"\n[用量] 合计 {tracker.total_tokens()} tokens（"

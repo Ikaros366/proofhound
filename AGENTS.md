@@ -1,13 +1,13 @@
 # AGENTS.md
 
-> 面向 AI 编码 Agent 的项目指南。本文件基于仓库当前实际内容编写；项目已完成 M1（工具底座）、M2a（Skill 系统 + M1 遗留补强）、M2b（编排器核心）与 M2c（模型路由与成本治理）。
+> 面向 AI 编码 Agent 的项目指南。本文件基于仓库当前实际内容编写；项目已完成 M1（工具底座）、M2a（Skill 系统 + M1 遗留补强）、M2b（编排器核心）、M2c（模型路由与成本治理）与 M3a（Finding 生命周期、证据包与去重）。
 
 ## 项目概述
 
 本项目是 **ProofHound**（暂定名，发布前需复查 GitHub/PyPI/Docker Hub/域名占用）——一个**自动化渗透测试 Agent 系统**。仓库包含设计文档与 M1 实现：
 
 - `docs/design.md` —— 设计文档 v0.7（草案，状态：待评审），是整个仓库的权威输入，用途为"作为 Kimi Code 开发输入，指导从零实现"。
-- `proofhound/` —— M1 工具底座（L0+L1）：Tool Manifest、安装器、Docker 沙箱、scope 校验、append-only 审计日志；M2a：L2 Skill 系统（registry + 导入安全闸）+ 两项 M1 遗留补强（文件目标 scope 解析、沙箱网络出口白名单）；M2b：L3 编排器核心（`proofhound/core/`：任务树/状态机、规划器、失败预算）+ 最小 LLM 客户端（`proofhound/llm/`）+ 确定性命令构造器（`tools/build.py`）+ 首个输出解析器（`tools/parsers/httpx_json.py`）+ Signal 模型（`findings/signal.py`）；M2c：模型路由三档 T0/T1/T2（`llm/router.py`）+ 用量计量与 Run 级 token 预算硬闸（`llm/usage.py`）+ 上下文治理（`core/context.py`：确定性压缩 + prompt 字符硬上限）+ live 演示脚本（`scripts/demo_live.py`）；其余分层（verify/report/infra）仅有占位目录，属后续里程碑。
+- `proofhound/` —— M1 工具底座（L0+L1）：Tool Manifest、安装器、Docker 沙箱、scope 校验、append-only 审计日志；M2a：L2 Skill 系统（registry + 导入安全闸）+ 两项 M1 遗留补强（文件目标 scope 解析、沙箱网络出口白名单）；M2b：L3 编排器核心（`proofhound/core/`：任务树/状态机、规划器、失败预算）+ 最小 LLM 客户端（`proofhound/llm/`）+ 确定性命令构造器（`tools/build.py`）+ 首个输出解析器（`tools/parsers/httpx_json.py`）+ Signal 模型（`findings/signal.py`）；M2c：模型路由三档 T0/T1/T2（`llm/router.py`）+ 用量计量与 Run 级 token 预算硬闸（`llm/usage.py`）+ 上下文治理（`core/context.py`：确定性压缩 + prompt 字符硬上限）+ live 演示脚本（`scripts/demo_live.py`）；M3a：Finding 数据模型与生命周期状态机（`findings/finding.py`，铁律硬编码）+ append-only FindingStore（findings.jsonl 快照追加）+ 去重指纹（`findings/dedup.py`）+ 证据包组装与离线 show（`findings/evidence.py` + `python -m proofhound.findings show`）+ 确定性 triage（`Orchestrator.run_triage_phase()`，规则表零 LLM 调用）；其余分层（verify/report/infra）仅有占位目录，属后续里程碑。
 - `skills/` —— 内置 skill 库，目前已有 `web-scan`（httpx SOP）。
 
 系统针对现有编排型 AI 渗透工具（以 PentAGI 为代表）的三大痛点设计：误报泛滥、速度慢、成本高。核心设计哲学是"**证据为王、验证驱动**"：一切候选发现默认为假，必须通过验证层状态机和证据门才能进入报告。
@@ -20,7 +20,7 @@
 
 ## 仓库现状与开发阶段
 
-- **M1（2026-08-06）、M2a、M2b、M2c（2026-08-07）已完成**：`pyproject.toml`、pytest 测试套件已就位；M2a 交付 L2 Skill 系统（`proofhound/skills/`：manifest 强校验、registry、导入安全闸）、scope 文件目标解析（`httpx -l targets.txt` 逐行校验，任一行越界即拒）、no_targets 默认拒绝、沙箱网络出口白名单（`proofhound/tools/egress.py`，默认 restricted）；M2b 交付 L3 编排器核心（任务树/DAG + 节点状态机、规划器——结构化 JSON 计划经 Pydantic schema + 语义双层校验、失败预算 + 规则表失败分类、最小 LLM 客户端，OpenAI 兼容、配置走 .env）并打通"web-scan → 计划 → 沙箱 httpx → Signal 落盘 → 全链路审计"最小链路；M2c 交付模型路由（三档 T0/T1/T2 独立配置、规划走 T1、T1==T2 同模型启动警告——红线 4）、用量计量（`llm_call` 审计；响应无 usage 按字符估算并标 estimated）与 Run 级 token 预算硬闸（调用前检查，超限停止规划循环、节点 blocked、记 `llm_budget_exceeded`，与 scope 同级不可绕过）、上下文治理（Signal 摘要按 kind 聚合压缩、计数不丢；prompt 字符硬上限，超则任务 failed 记 `context_overflow`，禁静默截断）；尚未实现 CLI、成本仪表盘/模型自动降级（M2c 仅有审计事件）及 M3 之后的模块，也没有 CI、lint 配置。
+- **M1（2026-08-06）、M2a、M2b、M2c、M3a（2026-08-07）已完成**：`pyproject.toml`、pytest 测试套件已就位；M2a 交付 L2 Skill 系统（`proofhound/skills/`：manifest 强校验、registry、导入安全闸）、scope 文件目标解析（`httpx -l targets.txt` 逐行校验，任一行越界即拒）、no_targets 默认拒绝、沙箱网络出口白名单（`proofhound/tools/egress.py`，默认 restricted）；M2b 交付 L3 编排器核心（任务树/DAG + 节点状态机、规划器——结构化 JSON 计划经 Pydantic schema + 语义双层校验、失败预算 + 规则表失败分类、最小 LLM 客户端，OpenAI 兼容、配置走 .env）并打通"web-scan → 计划 → 沙箱 httpx → Signal 落盘 → 全链路审计"最小链路；M2c 交付模型路由（三档 T0/T1/T2 独立配置、规划走 T1、T1==T2 同模型启动警告——红线 4）、用量计量（`llm_call` 审计；响应无 usage 按字符估算并标 estimated）与 Run 级 token 预算硬闸（调用前检查，超限停止规划循环、节点 blocked、记 `llm_budget_exceeded`，与 scope 同级不可绕过）、上下文治理（Signal 摘要按 kind 聚合压缩、计数不丢；prompt 字符硬上限，超则任务 failed 记 `context_overflow`，禁静默截断）；M3a 交付 Finding 生命周期状态机（Signal→Hypothesis→Reproduced→Confirmed + Rejected，铁律硬编码：version-cve 型与纯 status-code 证据永远禁止 Confirmed，迁移记 `finding_state` 审计）、去重指纹（sha256 规范化资产+漏洞类型+参数，同指纹合并记 `finding_deduplicated`）、证据包与"出处可调出"（`evidence/findings/<id>/`：证据原文 + sha256 manifest + finding.json，`python -m proofhound.findings show` 离线调出，纯文件查询）、确定性 triage（scan Signals 经规则表映射建/并 Finding 置 Hypothesis，落 findings.jsonl，零 LLM 调用）；尚未实现 CLI、成本仪表盘/模型自动降级（M2c 仅有审计事件）及 M3 其余切片（baseline 对照、verify-* skill、Verifier Agent、误报库）与 M4 之后的模块，也没有 CI、lint 配置。
 - 一切实现工作都应以 `docs/design.md` 为准。修改设计决策时，同步更新该文档。
 - 开发路线图（文档 §8）：
 
@@ -29,7 +29,7 @@
 | M0 流程验证（1~2 周） | 不写平台代码：把 recon/scan/verify/report 5 个 skill 装进 Kimi Code，手工编排跑通一个靶场 | 全流程 SOP 跑通，skill 划分定型 |
 | M1 工具底座（2 周）——已完成（2026-08-06） | L0+L1：manifest、安装器、Docker 沙箱、scope 校验、审计日志；打通 httpx 一条工具链 | 离线镜像可用；越界命令被拒且有日志 |
 | M2 编排器（2~3 周）——M2a、M2b、M2c 已完成（2026-08-07） | skill registry（M2a ✅）、任务 DAG + 规划器 + 失败预算 + 最小 LLM 客户端（M2b ✅）、模型路由 + 预算硬闸 + 上下文治理（M2c ✅；成本仪表盘未做，仅有 llm_call 审计事件）；M1 遗留补强（M2a ✅）：文件目标 scope 解析、沙箱网络出口白名单 | 单目标 recon+扫描全自动；上下文体积有上限；成本仪表盘可见 |
-| M3 验证层（3 周） | 状态机、baseline 对照、3 个 verify skill（sqli/xss/lfi）、Verifier Agent、去重、误报库 | XBEN/DVWA 上 Confirmed 发现 100% 带证据；误报率达标 |
+| M3 验证层（3 周）——M3a 已完成（2026-08-07） | M3a ✅：Finding 生命周期状态机（铁律硬编码）、证据包与离线 show、去重指纹、确定性 triage（零 LLM 调用）；待做：baseline 对照、3 个 verify skill（sqli/xss/lfi）、Verifier Agent、误报库 | XBEN/DVWA 上 Confirmed 发现 100% 带证据；误报率达标 |
 | M4 报告引擎（1~2 周） | docxtpl 管线、叙述润色、误报附录 | 给定模板一键出报告，事实字段零手写 |
 | M5 产品化（按需） | 本机 Web 控制台、MCP 暴露、持续监测、增量复测 | — |
 
@@ -145,8 +145,9 @@ python3.12 -m venv .venv
 live 演示（真实 key，不进 pytest，产物落 `evidence/demo_live/`）：
 
 ```bash
-.venv/bin/python scripts/demo_live.py                 # 正常链路：T1 真实调用 + 沙箱 httpx 打本地靶标
+.venv/bin/python scripts/demo_live.py                 # 正常链路：T1 真实调用 + 沙箱 httpx 打本地靶标 + M3a triage 建 Finding
 .venv/bin/python scripts/demo_live.py --max-tokens 0  # 演示预算硬闸：首次调用前即被闸（llm_budget_exceeded）
+.venv/bin/python -m proofhound.findings show <finding_id> --dir evidence/demo_live/<时间戳>  # 离线调出完整证据包（纯文件查询，不碰网络/LLM）
 ```
 
 ## 项目纪律与环境
@@ -155,7 +156,7 @@ live 演示（真实 key，不进 pytest，产物落 `evidence/demo_live/`）：
 2. 环境注记：开发环境为 WSL（Linux），项目根 `~/proofhound`，Docker 为 WSL 内引擎，`/var/run/docker.sock` 原生可用；镜像拉取走 daemon 级代理（systemd drop-in 已配置），容器不继承任何代理。
 3. 仓库卫生：.env、API 密钥、evidence/ 目录内容永不入库，.gitignore 必须包含 .env 和 evidence/。
 
-## 已知限制（M2a/M2c 遗留，后续里程碑处理）
+## 已知限制（M2a/M2c/M3a 遗留，后续里程碑处理）
 
 1. **目标文件不挂进容器**：`httpx -l targets.txt` 的目标文件只在 scope 校验阶段于宿主侧读取；把目标文件（只读）挂载进容器属编排器职责，M2 后续切片处理。
 2. **出口白名单仅覆盖 HTTP(S)**：restricted 模式下 HTTP(S) 流量经宿主机白名单正向代理强制出站；非 HTTP 原始 TCP 被 internal 网络整体阻断（fail-closed）；完整协议覆盖待 §5.10 mitmproxy 代理链。不读 proxy 环境变量的工具（如 httpx）须显式传代理参数（沙箱 `egress_proxy_url`）；工具级代理参数声明待 Tool Manifest 扩展。
@@ -164,3 +165,7 @@ live 演示（真实 key，不进 pytest，产物落 `evidence/demo_live/`）：
 5. **预算并发精度**：token 预算为调用前检查（check-then-call），并行子任务间不互斥，最多超出一个在途调用的用量；不追求 token 级精确互斥。
 6. **token 估算为启发式**：响应无 usage 字段时按 4 字符≈1 token 估算并标 `estimated`，以服务商 usage 为准。
 7. **成本仪表盘与自动降级未做**：M2c 的成本可观测仅有 `llm_call` 审计事件；§5.3"超额自动降级模型或挂起请示"与 §5.6 成本仪表盘待后续里程碑。
+8. **triage 规则表仅覆盖 web-probe→web-exposure**（存活状态码 2xx/301/302/307/308/401/403）；更多映射规则与 LLM triage（T1 档）待 M3 后续切片。
+9. **证据包整文件拷贝**：按 evidence_ref 把源文件整份拷入证据包（保留 #L 锚点语义），大文件场景的裁剪策略待定。
+10. **Finding.asset 字符串化**：M3a 暂用字符串（Signal 原样）+ 独立 `param` 字段，§5.5 结构化 `asset{host,url,param}` 延后；Finding 存储为 findings.jsonl 快照追加（last-wins 回放），§5.5 SQLite 存储待后续。
+11. **Confirmed 仅状态机层可达**：verify-\* skill 与 Verifier Agent 未接入（M3b 起），当前 triage 只产 Hypothesis；Confirmed/Reproduced 路径仅有状态机层与测试覆盖。

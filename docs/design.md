@@ -201,6 +201,8 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 
 铁律：**版本匹配型 CVE、纯状态码型发现，永远只能是 Signal**，必须经行为验证才能晋级。
 
+> **M3a 落地注记**（2026-08-07）：状态机实现于 `proofhound/findings/finding.py`（`Finding.transition` + `_TRANSITIONS` 表；非法迁移抛 `InvalidTransitionError`，Confirmed/Rejected 为终态）。铁律**硬编码在状态机层**（非 prompt 层）：`vuln_type` 命中版本匹配型集合（`VERSION_MATCH_VULN_TYPES`，当前含 `version-cve`）、或证据种类标签（`evidence_kinds`）中没有任何非 `status-code` 的种类（空列表同拒，fail-closed）的 Finding 迁入 Confirmed 即抛 `IronRuleViolationError`；Confirmed 另须携带 `verification.evidence_refs`（证据完备率 100%）。每次迁移记审计 `finding_state{finding_id, from, to, actor, reason}`。triage 为确定性规则表（`Orchestrator.run_triage_phase()`，零 LLM 调用）：`web-probe` 且状态码 ∈ {2xx/301/302/307/308/401/403} → `web-exposure` 建/并 Finding 置 Hypothesis，不可映射保持 Signal；LLM triage（T1 档）与 Reproduced 之后的 verify-\* skill 接入留 M3 后续切片。
+
 #### 5.4.2 证据门：各漏洞类型最低验收标准
 
 | 漏洞类型 | Confirmed 最低标准（不达标即降级或驳回） |
@@ -260,6 +262,8 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 存储：SQLite（单文件，便于归档与移交）；所有证据文件按 Finding ID 归档于 `evidence/`。
 
 **出处可调出（溯源为一等公民）**：任何 Finding 可通过 CLI/API 一键调出完整证据包（请求/响应原文、baseline 对照、复现步骤、关联审计记录）；报告正文中每条 Finding 附证据包索引。（M3 实现）
+
+> **M3a 落地注记**（2026-08-07）：字段已按本 Schema 落地（`proofhound/findings/finding.py`），两点偏差——① `asset` 暂为字符串（Signal 原样）+ 独立可选 `param` 字段，结构化 `asset{host,url,param}` 延后；② 存储暂为 `findings.jsonl`（append-only，全量快照追加 + 按 id 回放 last-wins），SQLite 延后；另新增 `source_signal_refs`、`created_at`/`updated_at` 字段。去重指纹实现于 `proofhound/findings/dedup.py`：规范化（资产小写去尾斜杠、漏洞类型小写、参数缺省与空串等价）后 NUL 连接取 sha256，同指纹合并记审计 `finding_deduplicated`。"出处可调出"已落地：证据包组装（`proofhound/findings/evidence.py`，`<evidence_dir>/findings/<finding_id>/`：证据原文整文件拷贝 + 含 sha256 的 `manifest.json` + `finding.json` 快照 + `reproduction_steps.md`）与 `python -m proofhound.findings show <id> --dir <evidence_dir>`（离线打印全字段 + 证据索引 + `#L` 行号锚点原文，纯文件查询，不碰网络/LLM）。
 
 ### 5.6 成本与性能工程
 
