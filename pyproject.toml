@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "proofhound"
+version = "0.1.0"
+description = "自动化渗透测试 Agent 系统（M1 工具底座）"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.5",
+    "PyYAML>=6.0",
+    "docker>=7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["proofhound*"]
+
+[tool.setuptools.package-data]
+"proofhound.tools" = ["manifests/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "docker: 需要可用 Docker 守护进程的测试",
+]

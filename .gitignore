@@ -1,0 +1,19 @@
+# 环境与密钥（仓库卫生红线）
+.env
+
+# 运行时证据与审计归档，永不入库
+evidence/*
+!evidence/.gitkeep
+
+# 工具安装产物与版本快照（运行时状态）
+tools.d/*
+!tools.d/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/

@@ -1,0 +1,15 @@
+# projectdiscovery/httpx —— HTTP 探活与指纹探测工具
+# 版本固定，SHA256 为发布资产实测值；升级走显式动作并重新校验哈希。
+name: httpx
+version: "1.10.0"
+check: "httpx -version"
+install:
+  - type: local                    # 1. 用户预置目录（离线场景）
+    path: ./tools.d/httpx
+  - type: binary                   # 2. 官方 release 二进制（白名单源 + 强制 SHA256）
+    url: "https://github.com/projectdiscovery/httpx/releases/download/v1.10.0/httpx_1.10.0_linux_amd64.zip"
+    sha256: "63eac4dcd6e5c9867c94765fdaaf66e7b4eeae3474a1f06e600e266a1c81a53e"
+  - type: go                       # 3. 包管理器兜底
+    package: "github.com/projectdiscovery/httpx/cmd/httpx@v1.10.0"
+parser: httpx_json
+tags: [recon, web, http]
