@@ -64,6 +64,8 @@ from proofhound.tools.build import UnknownToolError, build_command, known_tools
 from proofhound.tools.manifest import load_manifest
 from proofhound.tools.parsers import PARSER_REGISTRY, parse_sqlmap_stdout
 from proofhound.tools.sandbox import RunResult, SandboxRunner
+from proofhound.verify.cvss import base_score as cvss_base_score
+from proofhound.verify.cvss import severity_for_score
 from proofhound.verify.gate import BEHAVIORAL_EVIDENCE_KIND
 from proofhound.verify.gate import check as gate_check
 from proofhound.verify.verifier import Verifier, VerifierError
@@ -563,6 +565,11 @@ class Orchestrator:
 
         # 7. 终审裁定 → 终态迁移（铁律在状态机层兜底，双层防守）
         if verdict.verdict == "confirm":
+            # M6b：向量来自 Verifier（schema 层已校验合法）；分数与严重级
+            # 只由代码按官方公式计算（LLM 不产数字），覆盖 triage 种子 severity
+            finding.cvss_vector = verdict.cvss_vector
+            finding.cvss_score = cvss_base_score(verdict.cvss_vector)
+            finding.severity = severity_for_score(finding.cvss_score)
             try:
                 finding.transition(
                     FindingState.CONFIRMED, actor="verifier", reason=verdict.reason

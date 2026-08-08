@@ -56,7 +56,7 @@ class _ConfirmRouter(ModelRouter):
         self.configs = {Tier.T2: SimpleNamespace(model="verifier-mock")}
 
     def complete(self, tier, messages):
-        return '{"verdict": "confirm", "reason": "e2e mock：证据链完整"}'
+        return '{"verdict": "confirm", "reason": "e2e mock：证据链完整", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}'
 
 
 @pytest.fixture(scope="session")

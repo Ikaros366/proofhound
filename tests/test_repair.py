@@ -108,7 +108,7 @@ VALID_NARRATIVE = json.dumps(
     ensure_ascii=False,
 )
 
-VALID_VERDICT = '{"verdict": "confirm", "reason": "证据链完整，方法认可"}'
+VALID_VERDICT = '{"verdict": "confirm", "reason": "证据链完整，方法认可", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}'
 
 
 @pytest.fixture

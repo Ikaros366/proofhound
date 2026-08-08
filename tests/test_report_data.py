@@ -242,3 +242,60 @@ def test_evidence_index_assembly(report_evidence_dir):
     dumped = context.as_template_context()["evidence_index"]
     assert dumped[0]["finding_id"] == "F-2026-0001"
     assert dumped[0]["sha256"] == item.sha256
+
+
+def test_cvss_fields_confirmed_only_and_none_tolerant(report_evidence_dir):
+    """M6b：cvss_vector/cvss_score 仅 Confirmed 桶透传；旧数据容忍 None。"""
+    from proofhound.findings.finding import Finding, FindingStore
+
+    store = FindingStore(report_evidence_dir / "findings.jsonl")
+    stamps = {
+        "created_at": "2026-08-07T00:00:00.000+00:00",
+        "updated_at": "2026-08-07T00:00:00.000+00:00",
+    }
+    store.append(  # M6b 新数据：Confirmed 带向量 + 代码算分
+        Finding(
+            id="F-2026-0010",
+            state="confirmed",
+            vuln_type="sqli",
+            severity="critical",
+            asset="http://127.0.0.1:9/app?q=10",
+            dedup_key="sha256:cvss10",
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            cvss_score=9.8,
+            **stamps,
+        )
+    )
+    store.append(  # 边界：非 Confirmed 即使携带 cvss 字段也不展示
+        Finding(
+            id="F-2026-0011",
+            state="reproduced",
+            vuln_type="sqli",
+            severity="medium",
+            asset="http://127.0.0.1:9/app?q=11",
+            dedup_key="sha256:cvss11",
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            cvss_score=9.8,
+            **stamps,
+        )
+    )
+    context = build_context(report_evidence_dir)
+
+    confirmed = {f.id: f for f in context.confirmed_findings}
+    assert confirmed["F-2026-0010"].cvss_score == 9.8
+    assert (
+        confirmed["F-2026-0010"].cvss_vector
+        == "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"
+    )
+    # 旧 engagement 数据（无 cvss 字段）：容忍 None，不崩溃
+    assert confirmed["F-2026-0001"].cvss_score is None
+    assert confirmed["F-2026-0001"].cvss_vector is None
+    # 非 Confirmed 桶恒 None（报告不展示分数）
+    conditional = {f.id: f for f in context.conditional_findings}
+    assert conditional["F-2026-0011"].cvss_score is None
+    assert conditional["F-2026-0011"].cvss_vector is None
+    # 渲染上下文为纯 JSON 类型（float/str/None）
+    dumped = context.as_template_context()["confirmed_findings"]
+    by_id = {f["id"]: f for f in dumped}
+    assert by_id["F-2026-0010"]["cvss_score"] == 9.8
+    assert by_id["F-2026-0001"]["cvss_score"] is None

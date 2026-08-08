@@ -364,3 +364,35 @@ def test_enterprise_template_renders(report_evidence_dir, tmp_path):
     assert _flow_section_texts(doc) == _flow_section_texts(
         Document(str(ENTERPRISE_TEMPLATE_PATH))
     )
+
+
+# ---- M6b：CVSS 行条件渲染 ----
+
+
+def test_cvss_line_conditional_render(report_evidence_dir, default_template, tmp_path):
+    """Confirmed 带分 → 渲染 CVSS 行；无分（旧 engagement 数据）→ 该行不出现。"""
+    from proofhound.findings.finding import Finding, FindingStore
+
+    store = FindingStore(report_evidence_dir / "findings.jsonl")
+    store.append(
+        Finding(
+            id="F-2026-0010",
+            state="confirmed",
+            vuln_type="sqli",
+            severity="critical",
+            asset="http://127.0.0.1:9/app?q=10",
+            dedup_key="sha256:cvss10",
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+            cvss_score=9.8,
+            created_at="2026-08-07T00:00:00.000+00:00",
+            updated_at="2026-08-07T00:00:00.000+00:00",
+        )
+    )
+    context = build_context(report_evidence_dir).as_template_context()
+    out = render_docx(context, default_template, tmp_path / "out.docx")
+    paras = _paragraph_texts(Document(str(out)))
+    cvss_lines = [p for p in paras if p.startswith("CVSS：")]
+    # 仅带分的 F-2026-0010 渲染；fixture 两条旧 confirmed（无分）不出现该行
+    assert cvss_lines == [
+        "CVSS：9.8（CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H）"
+    ]

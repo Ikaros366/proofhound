@@ -76,11 +76,18 @@ class Verification(BaseModel):
 
 
 class VerifierVerdict(BaseModel):
-    """Verifier Agent 裁定（§5.4.4，M3 后续切片接入）。"""
+    """Verifier Agent 裁定（§5.4.4，M3 后续切片接入）。
+
+    M6b：confirm 裁定携带 ``cvss_vector``（LLM 只产向量字符串，分数与
+    严重级由 ``verify/cvss.py`` 确定性计算，见编排层置态）与
+    ``cvss_rationale``（逐项理由）；reject 不携带。
+    """
 
     model: str = Field(min_length=1)
     verdict: str = Field(min_length=1)  # confirm / downgrade / reject
     reason: str = ""
+    cvss_vector: str | None = None  # M6b：confirm 必填（verdict 层强校验）
+    cvss_rationale: str | None = None
 
 
 class NarrativeParts(BaseModel):
@@ -123,7 +130,8 @@ class Finding(BaseModel):
     verification: Verification | None = None
     verifier: VerifierVerdict | None = None
     dedup_key: str = Field(min_length=1)
-    cvss: float | None = None
+    cvss_vector: str | None = None  # M6b：Confirmed 时由 Verifier 向量写入
+    cvss_score: float | None = None  # M6b：代码按 v3.1 公式算分（LLM 不产数字）
     rejection_reason: str | None = None
     narrative: str | None = None  # 报告阶段 LLM 叙述只存于此，不回写事实字段
     narrative_parts: NarrativeParts | None = None  # M4.5 三段叙述（描述/危害/建议）

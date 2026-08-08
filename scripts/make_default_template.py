@@ -186,6 +186,10 @@ def build_document() -> DocumentType:
             ("置信度", "{{ f.confidence }}"),
         ],
     )
+    # M6b：CVSS 行仅 Confirmed 有分数时渲染（0.0 是合法值，须 is not none 判空）
+    _para(doc, "{%p if f.cvss_score is not none %}")
+    _para(doc, "CVSS：{{ f.cvss_score }}（{{ f.cvss_vector }}）")
+    _para(doc, "{%p endif %}")
     _para(doc, "{%p if f.verification %}")
     _field_table(
         doc,
@@ -311,8 +315,9 @@ def build_document() -> DocumentType:
         "  id, state, title, vuln_type, severity, severity_cn（M4.5 中文档位：严重/高/中/低/提示）, asset, param, preconditions[], confidence, evidence_kinds[]",
         "  narrative（叙述槽位，可为 null）, narrative_parts（M4.5 三段叙述 {description, impact, remediation}，可为 null）, rejection_reason（可为 null）",
         "  repro_text（M4.5 编号拼接复现文本，\\n 连接，供 {% raw %}{{r }}{% endraw %} 富文本；无步骤为空串）",
+        "  cvss_vector / cvss_score（M6b：CVSS v3.1 向量 + 代码确定性算分，仅 Confirmed 有值，可为 null）",
         "  verification.{method, evidence_refs[], baseline_diff, reproduction_steps[], verified_by, verified_at}（可为 null）",
-        "  verifier.{model, verdict, reason}（可为 null）",
+        "  verifier.{model, verdict, reason, cvss_vector, cvss_rationale}（可为 null；后两者 M6b，reject 为 null）",
         "  evidence_pack.{pack_dir, assembled, entries[]}；entries[] = {file, sha256, source_ref, line_anchor, missing}",
         "sections.overview / sections.remediation（固定章节叙述，可为 null）",
         "evidence_index[]（M4.5 扁平证据索引，confirmed+conditional 全部条目，稳定排序）：{finding_id, file, sha256, source_ref, line_anchor}",

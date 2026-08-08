@@ -142,7 +142,7 @@ def env(tmp_path, make_skill_dir):
     )
 
 
-def _orch(env, script, router_reply='{"verdict": "confirm", "reason": "证据链完整"}'):
+def _orch(env, script, router_reply='{"verdict": "confirm", "reason": "证据链完整", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}'):
     runner = FakeRunner(env.scope, env.evidence_dir, script)
     router = MockRouter(router_reply)
     orch = Orchestrator(env.registry, runner, router, env.audit, evidence_dir=env.evidence_dir)
@@ -359,3 +359,70 @@ def test_sqlmap_tool_failure_keeps_hypothesis(env):
     assert processed[0].state is FindingState.HYPOTHESIS
     events = env.audit.read_all()
     assert any(e["event"] == "verify_tool_failed" for e in events)
+
+
+# ---- M6b：Confirmed 置态——CVSS 向量落盘、代码算分覆盖种子 severity ----
+
+CVSS_98 = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"  # 9.8 critical
+
+
+def test_confirmed_cvss_overrides_seed_severity(env):
+    """向量来自 Verifier，分数/severity 由代码算：种子 medium 被覆盖。"""
+    seed = _seed(env.store, env.audit)
+    assert seed.severity == "medium"  # triage 种子值
+    reply = (
+        '{"verdict": "confirm", "reason": "证据链完整", '
+        f'"cvss_vector": "{CVSS_98}", "cvss_rationale": "sqlmap 确认注入"}}'
+    )
+    orch, _, _ = _orch(
+        env,
+        {
+            "httpx": [(_httpx_line(200), 0)],
+            "sqlmap": [(_confirmed_stdout(), 0)],
+        },
+        router_reply=reply,
+    )
+    processed = orch.run_verify_phase(skill_name="verify-sqli")
+
+    finding = processed[0]
+    assert finding.state is FindingState.CONFIRMED
+    assert finding.cvss_vector == CVSS_98
+    assert finding.cvss_score == 9.8  # 代码按官方公式算分
+    assert finding.severity == "critical"  # 算分覆盖种子 medium
+
+    # 持久化：store 回放后三字段仍在（append-only 快照）
+    reloaded = env.store.get(seed.id)
+    assert reloaded.cvss_vector == CVSS_98
+    assert reloaded.cvss_score == 9.8
+    assert reloaded.severity == "critical"
+
+    # 审计：verifier_verdict 携带向量与理由
+    events = env.audit.read_all()
+    verdicts = [e for e in events if e["event"] == "verifier_verdict"]
+    assert len(verdicts) == 1
+    assert verdicts[0]["cvss_vector"] == CVSS_98
+    assert verdicts[0]["cvss_rationale"]
+
+
+def test_confirm_without_vector_stays_reproduced(env):
+    """fail-closed：confirm 缺向量 = 非法裁决，停 Reproduced，无分数确认降级。"""
+    _seed(env.store, env.audit)
+    orch, _, _ = _orch(
+        env,
+        {
+            "httpx": [(_httpx_line(200), 0)],
+            "sqlmap": [(_confirmed_stdout(), 0)],
+        },
+        router_reply='{"verdict": "confirm", "reason": "故意缺向量"}',
+    )
+    processed = orch.run_verify_phase(skill_name="verify-sqli")
+
+    finding = processed[0]
+    assert finding.state is FindingState.REPRODUCED
+    assert finding.cvss_vector is None and finding.cvss_score is None
+    assert finding.severity == "medium"  # 种子值未被触碰
+    events = env.audit.read_all()
+    assert any(e["event"] == "verify_blocked" for e in events)
+    assert not any(
+        e["event"] == "finding_state" and e["to"] == "confirmed" for e in events
+    )

@@ -219,6 +219,8 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 | 暴露面板/敏感路径 | baseline 对照后仍存在可归因内容差异 |
 
 > **M3b 落地注记**（2026-08-07）：证据门实现于 `proofhound/verify/gate.py`——每 `vuln_type` 在 `GATE_MATRIX` 声明 `verification.method` 白名单与行为类 `evidence_kinds` 标签要求（当前仅落 sqli：method ∈ {sqlmap-confirmed, boolean-diff, time-blind-diff} 且含 `behavioral` 标签）；`check(finding) -> GateResult{passed, missing}` 产出缺项清单，未知 `vuln_type` fail-closed。编排层（`run_verify_phase`）在 `transition(CONFIRMED)` 前必过本门，与 M3a 状态机铁律构成**双层防守**；门不过记审计 `verify_gate_failed`，Finding 停于 Reproduced。XSS/LFI 等其余类型随对应 verify-* skill 扩展矩阵项。
+>
+> **M6b 落地注记**（2026-08-08，CVSS 评分真实化）：Confirmed 的严重级不再用 triage 种子值——改为 **CVSS v3.1 向量 + 代码确定性算分**。分工与理由：**LLM（T2 Verifier）只产向量字符串**（`cvss_vector` + 逐项理由 `cvss_rationale`），分数与严重级由 `proofhound/verify/cvss.py` 按 FIRST 官方公式（含官方 roundup）计算——分数必须确定性可复现、防 LLM 编数字、审计可按向量重算复核，故模型不接受 LLM 给的任何分数字段（verdict schema 无此键，多余键忽略）。契约 fail-closed：**confirm 缺失/非法向量 = 整个 verdict 非法**（走 M6a repair 一次后仍失败则 VerifierError，编排层停 Reproduced，无"无分数确认"降级路径）；reject 不得携带向量。向量解析严格（8 个 base 指标各恰好一次，缺/重/未知/temporal 指标、非法值、错版本一律拒绝；顺序宽容）。置态：编排层 confirm 分支在 `transition(CONFIRMED)` 前写入 `Finding.cvss_vector`/`cvss_score`（字段取代 §5.5 曾预留的 `cvss` 标量占位）并以算分严重级覆盖 triage 种子 severity——种子值仅为过渡态，历史 Finding 不回填（append-only 哲学）。对抗 SOP 增补 CVSS 指导：按证据定指标、不按漏洞类型套模板（如 sqlmap 仅布尔盲注确认未拖数据 → C 至多为 L；拖出库名/表名 → C 可为 H）。报告层（`report/data.py`）仅 Confirmed 桶透传 `cvss_vector`/`cvss_score`（非 Confirmed 不展示分数，旧数据容忍 None），默认模板详细发现章加条件渲染 CVSS 行。
 
 #### 5.4.3 Baseline 对照
 

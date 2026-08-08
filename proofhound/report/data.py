@@ -16,7 +16,10 @@
 - M4.5 增补：engagement.json 任意额外键（extras）原样透传进渲染上下文；
   finding 增 ``severity_cn``（中文档位）、``narrative_parts``（三段叙述）、
   ``repro_text``（编号拼接复现文本）；context 增 ``evidence_index`` 扁平
-  证据索引（confirmed+conditional 全部条目，稳定排序）。
+  证据索引（confirmed+conditional 全部条目，稳定排序）；
+- M6b 增补：finding 增 ``cvss_vector``/``cvss_score``——仅 Confirmed
+  桶透传（非 Confirmed 不展示分数，代码层恒 None）；旧 engagement
+  数据无此字段时容忍 None。
 
 全程纯文件查询：不碰网络、不调 LLM。context 不含 wall-clock"报告生成
 时间"——同输入同 context（渲染确定性，§5.7）。
@@ -90,6 +93,8 @@ class FindingReport(BaseModel):
     vuln_type: str
     severity: str
     severity_cn: str  # M4.5：中文档位（critical→严重/high→高/...，未知原样）
+    cvss_vector: str | None = None  # M6b：仅 Confirmed 桶透传（旧数据容忍 None）
+    cvss_score: float | None = None  # M6b：代码算分；非 Confirmed 恒 None
     asset: str
     param: str | None = None
     preconditions: list[str] = Field(default_factory=list)
@@ -206,6 +211,17 @@ def _to_report(finding: Finding, evidence_dir: Path) -> FindingReport:
         vuln_type=finding.vuln_type,
         severity=finding.severity,
         severity_cn=_severity_cn(finding.severity),
+        # M6b：分数只对 Confirmed 展示（Confirmed 前 severity 可为种子值）
+        cvss_vector=(
+            finding.cvss_vector
+            if finding.state is FindingState.CONFIRMED
+            else None
+        ),
+        cvss_score=(
+            finding.cvss_score
+            if finding.state is FindingState.CONFIRMED
+            else None
+        ),
         asset=finding.asset,
         param=finding.param,
         preconditions=list(finding.preconditions),
