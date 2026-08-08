@@ -101,7 +101,7 @@ VALID_NARRATIVE = json.dumps(
     {
         "paragraphs": {
             "F-2026-0001": "该 SQL 注入可致数据泄漏。",
-            "overview": "本次测试共确认 1 个漏洞。",
+            "overview": "本次测试共确认 2 个漏洞。",
             "remediation": "建议使用参数化查询。",
         }
     },

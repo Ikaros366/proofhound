@@ -292,7 +292,7 @@ def build_document() -> DocumentType:
             "{{ f.id }}",
             "{{ f.vuln_type }}",
             "{{ f.asset }}",
-            "{{ f.rejection_reason or '—' }}",
+            "{{ f.reason_cn or f.rejection_reason or '—' }}",
         ],
     )
 
@@ -313,7 +313,7 @@ def build_document() -> DocumentType:
         "summary.confirmed / summary.conditional / summary.hypothesis / summary.rejected / summary.severity_counts（dict，按严重级计数）",
         "confirmed_findings[] / conditional_findings[] / hypothesis_findings[] / rejected_findings[]，每项字段：",
         "  id, state, title, vuln_type, severity, severity_cn（M4.5 中文档位：严重/高/中/低/提示）, asset, param, preconditions[], confidence, evidence_kinds[]",
-        "  narrative（叙述槽位，可为 null）, narrative_parts（M4.5 三段叙述 {description, impact, remediation}，可为 null）, rejection_reason（可为 null）",
+        "  narrative（叙述槽位，可为 null）, narrative_parts（M4.5 三段叙述 {description, impact, remediation}，可为 null）, rejection_reason（可为 null）, reason_cn（M6c 误报中文归因，可为 null，附录 B 用 reason_cn or rejection_reason 回退）",
         "  repro_text（M4.5 编号拼接复现文本，\\n 连接，供 {% raw %}{{r }}{% endraw %} 富文本；无步骤为空串）",
         "  cvss_vector / cvss_score（M6b：CVSS v3.1 向量 + 代码确定性算分，仅 Confirmed 有值，可为 null）",
         "  verification.{method, evidence_refs[], baseline_diff, reproduction_steps[], verified_by, verified_at}（可为 null）",

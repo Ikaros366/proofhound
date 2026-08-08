@@ -20,6 +20,9 @@
 - M6b 增补：finding 增 ``cvss_vector``/``cvss_score``——仅 Confirmed
   桶透传（非 Confirmed 不展示分数，代码层恒 None）；旧 engagement
   数据无此字段时容忍 None。
+- M6c 增补：finding 增 ``reason_cn``（附录 B 误报中文归因，narrative.py
+  产物 ``rejected_reasons_cn.json``）——仅 Rejected 桶透传（其余桶恒
+  None）；缺文件/坏 JSON 容忍 None，模板回退 ``rejection_reason`` 原文。
 
 全程纯文件查询：不碰网络、不调 LLM。context 不含 wall-clock"报告生成
 时间"——同输入同 context（渲染确定性，§5.7）。
@@ -38,6 +41,8 @@ from proofhound.findings.finding import Finding, FindingState, FindingStore
 
 ENGAGEMENT_FILE = "engagement.json"
 SECTIONS_FILE = "narrative_sections.json"
+#: M6c：附录 B 误报中文归因（narrative.py 产物，衍生文件）
+REASONS_CN_FILE = "rejected_reasons_cn.json"
 
 #: 固定章节键（概述/修复建议）：narrative.py 的 FIXED_SECTIONS 同源于此
 SECTION_KEYS: tuple[str, ...] = ("overview", "remediation")
@@ -103,6 +108,7 @@ class FindingReport(BaseModel):
     verification: dict | None = None  # Verification 结构化原样
     verifier: dict | None = None  # VerifierVerdict 结构化原样
     rejection_reason: str | None = None
+    reason_cn: str | None = None  # M6c：误报中文归因（仅 Rejected 桶透传，缺省 None）
     narrative: str | None = None  # 叙述槽位：渲染器只读，不回写事实字段
     narrative_parts: dict | None = None  # M4.5 三段叙述（描述/危害/建议措施）
     repro_text: str = ""  # M4.5：编号拼接复现文本（\n 连接，供 {{r }} 富文本）
@@ -316,6 +322,20 @@ def _load_sections(evidence_dir: Path) -> dict[str, str | None]:
     return sections
 
 
+def _load_reasons_cn(evidence_dir: Path) -> dict[str, str]:
+    """M6c 误报中文归因（narrative.py 产物）；缺文件/坏 JSON/非 dict → {}。"""
+    path = evidence_dir / REASONS_CN_FILE
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items()}
+
+
 def build_context(evidence_dir: str | Path) -> ReportContext:
     """从 evidence 目录装配报告上下文（纯文件查询，确定性）。"""
     evidence_dir = Path(evidence_dir)
@@ -340,6 +360,11 @@ def build_context(evidence_dir: str | Path) -> ReportContext:
             buckets["hypothesis"].append(report)
     for bucket in buckets.values():
         bucket.sort(key=lambda f: (_severity_rank(f.severity), f.id))
+
+    # M6c：误报中文归因只透传 Rejected 桶（其余桶恒 None，模板回退原文）
+    reasons_cn = _load_reasons_cn(evidence_dir)
+    for report in buckets["rejected"]:
+        report.reason_cn = reasons_cn.get(report.id)
 
     severity_counts = Counter(
         f.severity.strip().lower() for f in buckets["confirmed"]
