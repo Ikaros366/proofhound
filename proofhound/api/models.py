@@ -43,12 +43,28 @@ class CreateEngagementRequest(BaseModel):
     cookie: str | None = None  # 可选预置会话 Cookie 头（k=v; k=v 形式）
     autonomy_mode: AutonomyMode = AutonomyMode.SEMI_AUTO  # 默认半自动（§5.9.2）
     budget: int | None = Field(default=None, ge=0)  # Run 级 token 预算；0 = 拒绝一切 LLM 调用
+    extras: dict[str, str] | None = None  # 报告元信息额外键（M4.5 extras 透传：company_name 等）
 
     @field_validator("cookie")
     @classmethod
     def _cookie_parseable(cls, value: str | None) -> str | None:
         if value is not None:
             parse_cookie(value)  # 畸形即 422（不创建任何资源）
+        return value
+
+    @field_validator("extras")
+    @classmethod
+    def _extras_valid(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        """extras 键约束：非空、不得占用系统保留键（报告元信息由系统生成）。"""
+        if value is None:
+            return value
+        reserved = {"target", "scope", "started_at", "finished_at"}
+        collision = reserved.intersection(value)
+        if collision:
+            raise ValueError(f"extras 含系统保留键 {sorted(collision)}（由系统自动生成）")
+        for key in value:
+            if not key.strip():
+                raise ValueError("extras 含空白键")
         return value
 
 

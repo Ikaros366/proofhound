@@ -134,6 +134,19 @@ function renderList(view) {
   cookieInput.placeholder = 'k=v; k=v（可选预置会话；提交后界面不再出现）';
   grid.appendChild(field('会话 Cookie（可选）', cookieInput, 'full'));
 
+  // 报告 extras（可选，写 engagement.json 透传进模板；自定义企业模板封面三件套）
+  const extrasInputs = [
+    ['company_name', '单位名称（可选）', '报告 extras：company_name'],
+    ['system_name', '系统名称（可选）', '报告 extras：system_name'],
+    ['report_date', '报告日期（可选）', '报告 extras：如 2026年8月'],
+  ].map(([key, label, placeholder]) => {
+    const input = el('input');
+    input.type = 'text';
+    input.placeholder = placeholder;
+    grid.appendChild(field(label, input));
+    return [key, input];
+  });
+
   const modeRow = el('div', 'mode-cards');
   let selectedMode = 'semi_auto';
   const modeCards = MODES.map((m) => {
@@ -188,6 +201,11 @@ function renderList(view) {
     }
     const cookie = cookieInput.value;
     if (cookie.trim()) body.cookie = cookie;
+    const extras = {};
+    extrasInputs.forEach(([key, input]) => {
+      if (input.value.trim()) extras[key] = input.value.trim();
+    });
+    if (Object.keys(extras).length) body.extras = extras;
     if (budgetInput.value.trim() !== '') body.budget = Number(budgetInput.value);
     // cookie 纪律：提交后立即清空，不缓存、不回显、不写任何存储
     cookieInput.value = '';

@@ -817,13 +817,18 @@ class EngagementManager:
         eng = Engagement(self, directory, meta)
         eng._persist()
         # 报告元信息（§5.7 engagement.json：target/scope/started_at）
+        # extras（M4.5 透传键，如 company_name/system_name/report_date）
+        # 在模型层已拒绝保留键，直接并入；_finish_meta 收尾保留这些键
+        engagement_meta = {
+            "target": request.target,
+            "scope": self._scope_summary(scope),
+            "started_at": created_at,
+        }
+        if request.extras:
+            engagement_meta.update(request.extras)
         (directory / "engagement.json").write_text(
             json.dumps(
-                {
-                    "target": request.target,
-                    "scope": self._scope_summary(scope),
-                    "started_at": created_at,
-                },
+                engagement_meta,
                 ensure_ascii=False,
                 indent=2,
             )
@@ -838,6 +843,7 @@ class EngagementManager:
             autonomy_mode=meta["autonomy_mode"],
             budget=request.budget,
             with_session=meta["with_session"],
+            extras=sorted(request.extras or {}),  # 只记键名
         )
         with self._lock:
             self._engagements[eng_id] = eng

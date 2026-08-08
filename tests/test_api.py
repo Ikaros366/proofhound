@@ -499,6 +499,66 @@ def test_malformed_cookie_rejected_422(client):
     assert resp.status_code == 422
 
 
+def test_extras_written_to_engagement_json(client, workspace):
+    """报告 extras（M4.5 透传）：创建时写入 engagement.json，审计记键名。"""
+    eng_id = _create(
+        client,
+        extras={
+            "company_name": "某某单位",
+            "system_name": "自定义企业演示系统",
+            "report_date": "2026年8月",
+        },
+    )
+    meta = json.loads(
+        (_eng_dir(workspace, eng_id) / "engagement.json").read_text(encoding="utf-8")
+    )
+    assert meta["company_name"] == "某某单位"
+    assert meta["system_name"] == "自定义企业演示系统"
+    assert meta["report_date"] == "2026年8月"
+    assert meta["target"] == "http://127.0.0.1:8080"  # 系统键不受影响
+    assert meta["started_at"]  # 系统生成键仍在
+    created = [
+        e
+        for e in (
+            json.loads(line)
+            for line in (_eng_dir(workspace, eng_id) / "audit.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        )
+        if e["event"] == "engagement_created"
+    ]
+    assert created[0]["extras"] == ["company_name", "report_date", "system_name"]
+
+
+def test_extras_reserved_keys_rejected_422(client, workspace):
+    """extras 占用系统保留键 → 422（与 cookie 畸形同纪律：不创建任何资源）。"""
+    before = set((_eng_dir(workspace, "").parent).glob("eng-*"))
+    resp = client.post(
+        "/api/engagements",
+        json={
+            "target": "http://127.0.0.1:8080",
+            "scope_paths": ["scope.yaml"],
+            "extras": {"started_at": "2026-01-01"},
+        },
+    )
+    assert resp.status_code == 422
+    after = set((_eng_dir(workspace, "").parent).glob("eng-*"))
+    assert after == before  # 零副作用
+
+
+def test_extras_blank_key_rejected_422(client):
+    resp = client.post(
+        "/api/engagements",
+        json={
+            "target": "http://127.0.0.1:8080",
+            "scope_paths": ["scope.yaml"],
+            "extras": {"  ": "x"},
+        },
+    )
+    assert resp.status_code == 422
+
+
 # ---- 确认队列重启恢复 ----
 
 

@@ -17,7 +17,17 @@ export async function api(path, { method = 'GET', body } = {}) {
   const data = ct.includes('application/json') ? await resp.json() : await resp.text();
   if (!resp.ok) {
     const detail = data && data.detail;
-    const err = new Error((detail && detail.message) || `HTTP ${resp.status}`);
+    // 两种错误形态：自定义 ApiError 为 {error, message}；FastAPI 请求校验
+    // （如 cookie 格式 422）为 [{msg, loc, ...}] 数组——数组形态逐条取 msg，
+    // 去掉 Pydantic 的 "Value error, " 前缀，让用户看到真正原因
+    let msg = detail && detail.message;
+    if (!msg && Array.isArray(detail)) {
+      msg = detail
+        .map((d) => d && typeof d.msg === 'string' ? d.msg.replace(/^Value error,\s*/, '') : '')
+        .filter(Boolean)
+        .join('；');
+    }
+    const err = new Error(msg || `HTTP ${resp.status}`);
     err.status = resp.status;
     err.code = detail && detail.error;
     throw err;

@@ -405,14 +405,13 @@ def test_enterprise_cvss_line(report_evidence_dir, tmp_path):
     from proofhound.findings.finding import Finding, FindingStore, NarrativeParts
 
     store = FindingStore(report_evidence_dir / "findings.jsonl")
-    store.append(  # M6b 新数据：Confirmed 带向量 + 代码算分
+    store.append(  # M6b 新数据：Confirmed 带向量 + 代码算分（无 title，验守卫）
         Finding(
             id="F-2026-0010",
             state="confirmed",
             vuln_type="sqli",
             severity="medium",
             asset="http://127.0.0.1:9/app?q=10",
-            title="sqli 标题",
             dedup_key="sha256:cvss10",
             cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N",
             cvss_score=4.3,
@@ -448,8 +447,12 @@ def test_enterprise_cvss_line(report_evidence_dir, tmp_path):
     )
     context = build_context(report_evidence_dir).as_template_context()
     out = render_docx(context, ENTERPRISE_TEMPLATE_PATH, tmp_path / "enterprise.docx")
-    paras = _paragraph_texts(Document(str(out)))
+    doc = Document(str(out))
+    paras = _paragraph_texts(doc)
     # 仅带分的 F-2026-0010 渲染；另两条无分 confirmed 不出现该行
     assert [p for p in paras if p.startswith("CVSS：")] == [
         "CVSS：4.3（CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N）"
     ]
+    # 标题守卫：F-2026-0010 无 title → 回退 vuln_type，不渲染 "None"
+    h4 = [p.text for p in doc.paragraphs if p.style.name == "Heading 4"]
+    assert h4 == ["【严重】rce 标题", "【高】sqli 标题", "【中】sqli"]

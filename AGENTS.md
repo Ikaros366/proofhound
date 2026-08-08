@@ -242,7 +242,7 @@ docx 模板用 docxtpl（Jinja2 语法），渲染环境 **StrictUndefined**（�
 
 可用变量：
 
-- `engagement.target` / `engagement.scope` / `engagement.started_at` / `engagement.finished_at`（可为 null）；**M4.5 extras**：engagement.json 任意额外键原样透传（如 `engagement.company_name` / `engagement.system_name` / `engagement.report_date`，缺键即 StrictUndefined 报错）
+- `engagement.target` / `engagement.scope` / `engagement.started_at` / `engagement.finished_at`（可为 null）；**M4.5 extras**：engagement.json 任意额外键原样透传（如 `engagement.company_name` / `engagement.system_name` / `engagement.report_date`，缺键即 StrictUndefined 报错）；控制台创建表单可直接填写这三个键（API `CreateEngagementRequest.extras` 可选字段，创建时写入 engagement.json，占用 target/scope/started_at/finished_at 保留键或空白键即 422 零副作用）
 - `summary.confirmed` / `summary.conditional` / `summary.hypothesis` / `summary.rejected` / `summary.severity_counts`（dict，confirmed 按严重级计数）
 - `confirmed_findings[]` / `conditional_findings[]`（Reproduced 未 Confirmed）/ `hypothesis_findings[]` / `rejected_findings[]`（误报附录数据源），每项：
   - `id, state, title, vuln_type, severity, severity_cn`（M4.5 中文档位：严重/高/中/低/提示，未知原样）`, asset, param, preconditions[], confidence, evidence_kinds[]`
