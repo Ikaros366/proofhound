@@ -21,7 +21,8 @@ import json
 from pathlib import Path
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 
 from proofhound.autonomy import AutonomyGate, AutonomySwitchError, gate_matrix
 from proofhound.api.models import (
@@ -46,6 +47,9 @@ from proofhound.llm.usage import BudgetExceededError
 DOCX_MEDIA_TYPE = (
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 )
+
+#: 证据文件单文件响应上限（M5b 控制台证据查看器）：超过即截断 + 响应头标记
+EVIDENCE_FILE_MAX_BYTES = 2 * 1024 * 1024
 
 
 def _findings_counts(eng: Engagement) -> dict:
@@ -127,6 +131,8 @@ def create_app(
         return {
             "status": "ok",
             "service": "proofhound-api",
+            "version": app.version,
+            "confirm_timeout": manager.confirm_timeout,
             "autonomy_gate": gate_matrix(),
         }
 
@@ -210,6 +216,47 @@ def create_app(
             "items": items,
         }
 
+    @app.get("/api/engagements/{eng_id}/findings/{finding_id}/evidence/{filename}")
+    def get_evidence_file(eng_id: str, finding_id: str, filename: str):
+        """证据包单文件全文（M5b 控制台证据查看器数据源，只读）。
+
+        守卫（fail-closed 双层）：文件名须精确命中 manifest items 白名单
+        （未列入/missing 即 404），且 resolve 后不得越出 pack_dir（防穿越）；
+        超过 ``EVIDENCE_FILE_MAX_BYTES`` 截断并带 ``X-ProofHound-Truncated`` 头。
+        响应文本做行尾归一化（``\r\n`` 与裸 ``\r`` 均归一为 ``\n``，与上方
+        evidence 端点 ``anchor_line_text`` 的 read_text 行为同款）——#L 行号
+        锚点按归一化后文本定义，控制台按 ``\n`` 分行渲染才能与锚点严格对齐；
+        证据完整性以 manifest sha256 对磁盘字节核验为准（本端点是展示层）。
+        """
+        eng = manager.get(eng_id)
+        store = FindingStore(eng.dir / "findings.jsonl")
+        finding = store.get(finding_id)
+        if finding is None:
+            raise NotFoundError(f"Finding 不存在: {finding_id}")
+        pack_dir = (eng.dir / "findings" / finding.id).resolve()
+        manifest_path = pack_dir / "manifest.json"
+        if not manifest_path.is_file():
+            raise NotFoundError(f"证据包尚未组装: {finding_id}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        listed = {
+            item["file"]
+            for item in manifest.get("items", [])
+            if item.get("file") and not item.get("missing")
+        }
+        if filename not in listed:
+            raise NotFoundError(f"证据文件不在证据包清单内: {filename}")
+        candidate = (pack_dir / filename).resolve()
+        if not candidate.is_relative_to(pack_dir) or not candidate.is_file():
+            raise NotFoundError(f"证据文件不存在: {filename}")
+        raw = candidate.read_bytes()
+        truncated = len(raw) > EVIDENCE_FILE_MAX_BYTES
+        if truncated:
+            raw = raw[:EVIDENCE_FILE_MAX_BYTES]
+        text = raw.decode("utf-8", errors="replace")
+        text = text.replace("\r\n", "\n").replace("\r", "\n")  # 行尾归一化（见 docstring）
+        headers = {"X-ProofHound-Truncated": "true"} if truncated else None
+        return PlainTextResponse(text, headers=headers)
+
     # ---- 报告 ----
 
     @app.post("/api/engagements/{eng_id}/report")
@@ -266,6 +313,18 @@ def create_app(
             out, media_type=DOCX_MEDIA_TYPE, filename=f"{eng.id}.docx"
         )
 
+    @app.get("/api/templates")
+    def list_templates() -> dict:
+        """报告模板清单（workspace ``templates/`` 内 *.docx，M5b 控制台报告区
+        下拉数据源；只读，与 :func:`_resolve_template` 同源目录）。"""
+        templates_dir = manager.templates_dir
+        names = (
+            sorted(p.name for p in templates_dir.glob("*.docx") if p.is_file())
+            if templates_dir.is_dir()
+            else []
+        )
+        return {"templates": names}
+
     # ---- 审计 ----
 
     @app.get("/api/engagements/{eng_id}/audit")
@@ -303,6 +362,17 @@ def create_app(
             cid, approved=False, operator=request.operator, note=request.note
         )
         return {"confirmation": conf.to_dict(), "engagement_id": eng.id}
+
+    # ---- M5b Web 控制台静态资源（挂载于全部 API 路由之后）----
+    # 纯静态零依赖（无 CDN/无构建链，完全离线可用）；前端只是本 API 的消费者，
+    # 不含任何业务逻辑/命令构造。
+
+    static_dir = Path(__file__).resolve().parent / "static"
+    app.mount("/static", StaticFiles(directory=static_dir), name="console-static")
+
+    @app.get("/", include_in_schema=False)
+    def console_index():
+        return FileResponse(static_dir / "index.html")
 
     return app
 

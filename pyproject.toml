@@ -28,6 +28,7 @@ include = ["proofhound*"]
 
 [tool.setuptools.package-data]
 "proofhound.tools" = ["manifests/*.yaml"]
+"proofhound.api" = ["static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
