@@ -363,24 +363,37 @@ class EngagementRunner:
     def _scan(self, phases) -> None:
         eng = self.rt.engagement
         eng.transition(EngagementState.SCANNING, reason="scan 阶段启动")
-        approved = [
-            target
-            for target in [eng.target]
-            if self._gate(
-                phases.scan_skill,
-                phases.scan_risk_level,
-                target=target,
-                summary=f"{phases.scan_skill} 扫描目标 {target}",
-                resume_state=EngagementState.SCANNING,
-            )
-            in ("auto", "approved")
-        ]
-        if approved:
-            phases.scan(approved)
-        else:
-            self.rt.audit.record(
-                "phase_skipped", phase="scan", reason="全部目标被拒绝或未授权"
-            )
+        # M3d：多 scan skill（web-scan + recon-crawl）逐 skill 过闸，确认/审计
+        # 粒度到 skill；无 scan_skills 属性的旧式 phases（FakePhases 等）
+        # 回退单 skill 接口，行为与 M5a 一致。
+        scan_skills = getattr(phases, "scan_skills", None)
+        legacy = scan_skills is None
+        if legacy:
+            scan_skills = [(phases.scan_skill, phases.scan_risk_level)]
+        for skill_name, risk_level in scan_skills:
+            approved = [
+                target
+                for target in [eng.target]
+                if self._gate(
+                    skill_name,
+                    risk_level,
+                    target=target,
+                    summary=f"{skill_name} 扫描目标 {target}",
+                    resume_state=EngagementState.SCANNING,
+                )
+                in ("auto", "approved")
+            ]
+            if approved:
+                if legacy:
+                    phases.scan(approved)
+                else:
+                    phases.scan_with_skill(skill_name, approved)
+            else:
+                self.rt.audit.record(
+                    "phase_skipped",
+                    phase="scan" if legacy else f"scan:{skill_name}",
+                    reason="全部目标被拒绝或未授权",
+                )
 
     def _triage(self, phases) -> None:
         self.rt.engagement.transition(EngagementState.TRIAGING, reason="triage 阶段启动")
@@ -550,7 +563,12 @@ class EngagementRunner:
 
 
 class OrchestratorPhases:
-    """把 ``Orchestrator`` 包装成 EngagementRunner 的阶段接口。"""
+    """把 ``Orchestrator`` 包装成 EngagementRunner 的阶段接口。
+
+    M3d：``scan_skills`` 暴露多 scan skill 清单（web-scan + recon-crawl），
+    供 EngagementRunner 逐 skill 过闸；recon-crawl 未注册/未启用则跳过并记
+    审计（爬行扫描是增强项，缺失不阻塞主链路）。
+    """
 
     def __init__(
         self,
@@ -559,15 +577,32 @@ class OrchestratorPhases:
         *,
         scan_skill: str = "web-scan",
         verify_skill: str = "verify-sqli",
+        crawl_skill: str = "recon-crawl",
     ):
         self._orch = orchestrator
         self.scan_skill = scan_skill
         self.verify_skill = verify_skill
         self.scan_risk_level = registry.get(scan_skill).manifest.risk_level
         self.verify_risk_level = registry.get(verify_skill).manifest.risk_level
+        self.scan_skills: list[tuple[str, str]] = [
+            (scan_skill, self.scan_risk_level)
+        ]
+        crawl = registry.get(crawl_skill)
+        if crawl is None or not crawl.enabled:
+            reason = "skill 未注册" if crawl is None else "skill 未启用"
+            orchestrator.audit.record(
+                "scan_skill_skipped",
+                skill=crawl_skill,
+                reason=f"{reason}，跳过爬行扫描",
+            )
+        else:
+            self.scan_skills.append((crawl_skill, crawl.manifest.risk_level))
 
     def scan(self, targets: list[str]) -> None:
         self._orch.run_scan_phase(targets, skill_name=self.scan_skill)
+
+    def scan_with_skill(self, skill_name: str, targets: list[str]) -> None:
+        self._orch.run_scan_phase(targets, skill_name=skill_name)
 
     def triage(self) -> list:
         return self._orch.run_triage_phase()
@@ -604,7 +639,7 @@ def default_phases_factory(rt: EngagementRuntime) -> OrchestratorPhases:
     # manifest 是包内数据（版本/安装配方的权威来源），从包装载而非 workspace
     manifests_dir = Path(__file__).resolve().parent.parent / "tools" / "manifests"
     installer = ToolInstaller(workspace / "tools.d")
-    for tool in ("httpx", "sqlmap"):
+    for tool in ("httpx", "sqlmap", "katana"):
         installer.ensure(load_manifest(manifests_dir / f"{tool}.yaml"))
     runner = SandboxRunner(
         rt.scope,

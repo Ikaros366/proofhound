@@ -1,0 +1,16 @@
+# projectdiscovery/katana —— Web 爬行与带参端点发现工具（recon-crawl 专用，L1）
+# 版本固定，SHA256 为发布资产实测值（本地下载重算，与 release checksums.txt
+# 及 GitHub API 资产摘要三方一致）；升级走显式动作并重新校验哈希。
+name: katana
+version: "1.7.0"
+check: "katana -version"
+install:
+  - type: local                    # 1. 用户预置目录（离线场景）
+    path: ./tools.d/katana
+  - type: binary                   # 2. 官方 release 二进制（白名单源 + 强制 SHA256）
+    url: "https://github.com/projectdiscovery/katana/releases/download/v1.7.0/katana_1.7.0_linux_amd64.zip"
+    sha256: "fe1142d92f418549338ea46d67a472124878482e225d279e9a42700c75d76a4d"
+  - type: go                       # 3. 包管理器兜底
+    package: "github.com/projectdiscovery/katana/cmd/katana@v1.7.0"
+parser: katana_jsonl
+tags: [recon, web, crawl]

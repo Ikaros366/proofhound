@@ -144,14 +144,70 @@ def _build_sqlmap(
     return argv
 
 
+class KatanaParams(BaseModel):
+    """katana 爬行参数（对应 skills/recon-crawl SOP，L1 发现类）。
+
+    恒在项（构造器写死，不接受参数覆盖）：``-jsonl -silent -nc -fs rdn``
+    （field-scope 限种子根域，三层 scope 纵深第一层）与
+    ``-cos "(?i)(logout|logoff|signout|signoff|phpids)"``（爬行安全排除，
+    v1.7.0 实测：katana 会把状态变更类 GET 链接当普通链接抓取——logout
+    销毁服务端会话导致带认证爬行中途失效；DVWA ``security.php?phpids=on``
+    会为该会话开启 PHPIDS、后续攻击载荷全被拦截。注意 -cos 值不能含
+    逗号——旗标按逗号分片，``{m,n}`` 量词会被截断）；
+    **永不产 ``-o``**——输出只走 stdout → 容器日志 → 证据落盘（红线 3）。
+    depth/concurrency/rate_limit 设硬上限，防爬行面失控；不暴露 headless。
+    """
+
+    target: str = Field(min_length=1)  # 单种子 URL
+    depth: int = Field(default=2, ge=1, le=5)
+    concurrency: int = Field(default=5, ge=1, le=10)
+    rate_limit: int | None = Field(default=None, gt=0, le=150)  # -rl，缺省不限
+    with_session: bool = False  # 注入预置会话（-H Cookie/自定义头）
+
+    @field_validator("target")
+    @classmethod
+    def _no_flag_injection(cls, value: str) -> str:
+        if value.strip().startswith("-"):
+            raise ValueError("target 不得以 - 开头（旗标注入防护）")
+        return value.strip()
+
+
+def _build_katana(
+    params: dict,
+    *,
+    egress_proxy_url: str | None = None,
+    session: SessionConfig | None = None,
+) -> list[str]:
+    p = KatanaParams.model_validate(params)
+    argv = ["katana", "-u", p.target]
+    if egress_proxy_url:
+        argv += ["-proxy", egress_proxy_url]
+    if p.with_session:
+        for header in _session_headers(_require_session(True, session)):
+            argv += ["-H", header]
+    argv += ["-d", str(p.depth), "-c", str(p.concurrency)]
+    if p.rate_limit is not None:
+        argv += ["-rl", str(p.rate_limit)]
+    # 恒在项（写死）：-fs rdn 限种子根域；-cos 排除状态变更类 GET 链接
+    # （logout 自毁会话、phpids 开关为目标开启 IDS）；值不含逗号
+    # （-cos 旗标按逗号分片，量词 {m,n} 会被截断失效）
+    argv += [
+        "-jsonl", "-silent", "-nc", "-fs", "rdn",
+        "-cos", "(?i)(logout|logoff|signout|signoff|phpids)",
+    ]
+    return argv
+
+
 _BUILDERS = {
     "httpx": _build_httpx,
     "sqlmap": _build_sqlmap,
+    "katana": _build_katana,
 }
 
 _PARAMS_MODELS = {
     "httpx": HttpxParams,
     "sqlmap": SqlmapParams,
+    "katana": KatanaParams,
 }
 
 

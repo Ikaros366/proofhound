@@ -6,6 +6,7 @@
 """
 
 from proofhound.tools.parsers.httpx_json import parse_httpx_jsonl
+from proofhound.tools.parsers.katana_jsonl import parse_katana_jsonl
 from proofhound.tools.parsers.sqlmap_stdout import (
     SqlmapReport,
     SqlmapTechnique,
@@ -17,6 +18,7 @@ from proofhound.tools.parsers.sqlmap_stdout import (
 # 不登记进本注册表——该表契约是 Signal 解析器，供 scan 阶段自动桥接。
 PARSER_REGISTRY = {
     "httpx_json": parse_httpx_jsonl,
+    "katana_jsonl": parse_katana_jsonl,
 }
 
 __all__ = [
@@ -24,5 +26,6 @@ __all__ = [
     "SqlmapReport",
     "SqlmapTechnique",
     "parse_httpx_jsonl",
+    "parse_katana_jsonl",
     "parse_sqlmap_stdout",
 ]

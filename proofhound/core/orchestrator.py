@@ -8,7 +8,9 @@ tools/build.py 拼装 argv（红线 1：LLM 不碰命令）→ SandboxRunner 执
   M3a 增加确定性 triage 阶段（run_triage_phase，规则表、零 LLM 调用）；
   M3b 增加确定性 verify 阶段（run_verify_phase：带会话 baseline → sqlmap
   行为确认 → 证据门 → Verifier T2 终审 → CONFIRMED/REJECTED，唯一 LLM
-  调用是 Verifier 终审）；
+  调用是 Verifier 终审）；M3d 扩展 triage：katana 爬参 Signal
+  （param-endpoint）按 query 参数键启发式展开 sqli 候选（上限 20 条防
+  确认洪泛 + 建/并前 check_scope 第三层纵深）；
 - 失败预算：同类失败默认上限 2 次，命中置 blocked 并升级（task_blocked）；
   验证码/锁定一次即硬阻塞；scope 拒绝与命令构造失败视为规划缺陷，
   直接 failed、不重试；
@@ -25,10 +27,13 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
+from urllib.parse import parse_qsl, urlparse
 
 from pydantic import ValidationError
 
 from proofhound.compliance.audit import AuditLog
+from proofhound.compliance.scope import check_scope
 from proofhound.compliance.session import SessionConfig, secret_marker
 from proofhound.findings.dedup import compute_dedup_key
 from proofhound.findings.evidence import assemble_evidence_pack
@@ -69,12 +74,66 @@ _OUTPUT_SAMPLE_LIMIT = 4096  # 失败分类的输出采样上限（字节）
 # 与 web-scan SKILL.md"存活"判定一致（2xx/3xx/401/403）；LLM triage 留后续切片。
 _EXPOSED_STATUSES = frozenset({200, 201, 204, 301, 302, 307, 308, 401, 403})
 
+# M3d：katana 爬参（kind="param-endpoint"）→ sqli 假设的参数键启发式。
+# 精确匹配（键小写比对）：宁可漏报（保持 Signal）不可滥建——每条 sqli
+# Hypothesis 都会在 verify 阶段消耗一次 L2 确认与一次行为验证。
+_SQLI_PARAM_HINTS = frozenset(
+    {
+        "id", "uid", "user", "username", "page", "file", "include", "cat",
+        "category", "search", "q", "query", "name", "order", "sort", "dir",
+        "path", "item", "view", "pid",
+    }
+)
 
-def _triage_vuln_type(signal: Signal) -> str | None:
-    """triage 规则映射：可映射返回 vuln_type，不可映射返回 None（保持 Signal）。"""
+# M3d：每 engagement 新建 sqli Hypothesis 上限（防确认洪泛，超出记 triage_capped）
+_TRIAGE_SQLI_CAP = 20
+
+# param-endpoint 候选的证据种类标签（爬行发现的带参端点，非行为证据）
+CRAWL_ENDPOINT_EVIDENCE_KIND = "crawl-endpoint"
+
+
+class _TriageCandidate(NamedTuple):
+    """一条 triage 候选；一个 Signal 可展开多条（param-endpoint 按参数键）。"""
+
+    vuln_type: str
+    param: str | None
+    severity: str
+    evidence_kind: str
+
+
+def _query_param_keys(url: str) -> list[str]:
+    """从 URL query 展开参数键（保序去重、小写化；空值键保留）。"""
+    keys: list[str] = []
+    for key, _value in parse_qsl(urlparse(url).query, keep_blank_values=True):
+        key = key.strip().lower()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _triage_candidates(signal: Signal) -> list[_TriageCandidate]:
+    """triage 规则映射：可映射返回候选列表，不可映射返回空（保持 Signal）。"""
     if signal.kind == "web-probe" and signal.status_code in _EXPOSED_STATUSES:
-        return "web-exposure"
-    return None
+        return [
+            _TriageCandidate(
+                vuln_type="web-exposure",
+                param=None,
+                severity="info",
+                evidence_kind=STATUS_CODE_EVIDENCE_KIND,
+            )
+        ]
+    if signal.kind == "param-endpoint":
+        return [
+            _TriageCandidate(
+                vuln_type="sqli",
+                param=key,
+                severity="medium",
+                evidence_kind=CRAWL_ENDPOINT_EVIDENCE_KIND,
+            )
+            for key in _query_param_keys(signal.asset)
+            if key in _SQLI_PARAM_HINTS
+        ]
+    return []
 
 
 def _utc_now() -> str:
@@ -175,66 +234,115 @@ class Orchestrator:
         可映射 vuln_type 的 Signal 建/并 Finding 置 Hypothesis（同 dedup_key
         合并证据并记审计 finding_deduplicated）；不可映射保持 Signal。
         全程规则表判定，不接 LLM。
+
+        M3d：param-endpoint Signal 按 query 参数键展开 sqli 候选（启发式
+        键名精确匹配 + 每 engagement 新建上限 ``_TRIAGE_SQLI_CAP`` 条防确认
+        洪泛，超出记 ``triage_capped``）；建/并 Hypothesis 前对 asset 过
+        check_scope（三层纵深第二层；runner 未挂 scope 时本层不触发，沙箱
+        层仍是最终强校验），越界丢弃记 ``triage_out_of_scope``。
         """
         store = FindingStore(self.evidence_dir / "findings.jsonl")
         signals, skipped = self._load_phase_signals()
+        scope = getattr(self.runner, "scope", None)
+        sqli_existing = sum(1 for f in store.load_all() if f.vuln_type == "sqli")
         findings: list[Finding] = []
-        created = merged = 0
+        created = merged = kept = capped = 0
+        created_by_type: dict[str, int] = {}
+        merged_by_type: dict[str, int] = {}
         for signal in signals:
-            vuln_type = _triage_vuln_type(signal)
-            if vuln_type is None:
-                continue  # 不可映射：保持 Signal
-            dedup_key = compute_dedup_key(signal.asset, vuln_type)
-            existing = store.get_by_dedup_key(dedup_key)
-            if existing is not None:
-                if signal.evidence_ref in existing.source_signal_refs:
-                    continue  # 幂等：该证据已归并过
-                existing.source_signal_refs.append(signal.evidence_ref)
-                if STATUS_CODE_EVIDENCE_KIND not in existing.evidence_kinds:
-                    existing.evidence_kinds.append(STATUS_CODE_EVIDENCE_KIND)
-                existing.updated_at = _utc_now()
-                store.append(existing)
-                self.audit.record(
-                    "finding_deduplicated",
-                    finding_id=existing.id,
-                    dedup_key=dedup_key,
-                    evidence_ref=signal.evidence_ref,
-                )
-                assemble_evidence_pack(existing, evidence_base=self.evidence_dir)
-                merged += 1
-                findings.append(existing)
+            candidates = _triage_candidates(signal)
+            if not candidates:
+                kept += 1
                 continue
-            finding = Finding(
-                id=store.next_id(),
-                state=FindingState.SIGNAL,
-                vuln_type=vuln_type,
-                severity="info",
-                asset=signal.asset,
-                confidence="low",
-                evidence_kinds=[STATUS_CODE_EVIDENCE_KIND],
-                dedup_key=dedup_key,
-                source_signal_refs=[signal.evidence_ref],
-                created_at=_utc_now(),
-                updated_at=_utc_now(),
-                audit=self.audit,
+            if scope is not None:
+                decision = check_scope(scope, [signal.asset])
+                if not decision.allowed:
+                    self.audit.record(
+                        "triage_out_of_scope",
+                        asset=signal.asset,
+                        kind=signal.kind,
+                        violations=decision.violations,
+                    )
+                    kept += 1
+                    continue
+            signal_mapped = False
+            for cand in candidates:
+                dedup_key = compute_dedup_key(signal.asset, cand.vuln_type, cand.param)
+                existing = store.get_by_dedup_key(dedup_key)
+                if existing is not None:
+                    if signal.evidence_ref in existing.source_signal_refs:
+                        continue  # 幂等：该证据已归并过
+                    existing.source_signal_refs.append(signal.evidence_ref)
+                    if cand.evidence_kind not in existing.evidence_kinds:
+                        existing.evidence_kinds.append(cand.evidence_kind)
+                    existing.updated_at = _utc_now()
+                    store.append(existing)
+                    self.audit.record(
+                        "finding_deduplicated",
+                        finding_id=existing.id,
+                        dedup_key=dedup_key,
+                        evidence_ref=signal.evidence_ref,
+                    )
+                    assemble_evidence_pack(existing, evidence_base=self.evidence_dir)
+                    merged += 1
+                    merged_by_type[cand.vuln_type] = (
+                        merged_by_type.get(cand.vuln_type, 0) + 1
+                    )
+                    signal_mapped = True
+                    findings.append(existing)
+                    continue
+                if cand.vuln_type == "sqli" and sqli_existing >= _TRIAGE_SQLI_CAP:
+                    capped += 1  # 防确认洪泛：每 engagement sqli 新建上限
+                    continue
+                finding = Finding(
+                    id=store.next_id(),
+                    state=FindingState.SIGNAL,
+                    vuln_type=cand.vuln_type,
+                    severity=cand.severity,
+                    asset=signal.asset,
+                    param=cand.param,
+                    confidence="low",
+                    evidence_kinds=[cand.evidence_kind],
+                    dedup_key=dedup_key,
+                    source_signal_refs=[signal.evidence_ref],
+                    created_at=_utc_now(),
+                    updated_at=_utc_now(),
+                    audit=self.audit,
+                )
+                finding.transition(
+                    FindingState.HYPOTHESIS,
+                    actor="triage",
+                    reason=f"规则映射 {signal.kind}→{cand.vuln_type}",
+                )
+                store.append(finding)
+                assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+                created += 1
+                created_by_type[cand.vuln_type] = (
+                    created_by_type.get(cand.vuln_type, 0) + 1
+                )
+                if cand.vuln_type == "sqli":
+                    sqli_existing += 1
+                signal_mapped = True
+                findings.append(finding)
+            if not signal_mapped:
+                kept += 1
+        if capped:
+            self.audit.record(
+                "triage_capped",
+                vuln_type="sqli",
+                limit=_TRIAGE_SQLI_CAP,
+                dropped=capped,
             )
-            finding.transition(
-                FindingState.HYPOTHESIS,
-                actor="triage",
-                reason=f"规则映射 {signal.kind}→{vuln_type}",
-            )
-            store.append(finding)
-            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
-            created += 1
-            findings.append(finding)
         self.audit.record(
             "triage_completed",
             signals=len(signals),
             mapped=created + merged,
             created=created,
             merged=merged,
-            kept_signal=len(signals) - created - merged,
+            kept_signal=kept,
             skipped_lines=skipped,
+            created_by_type=created_by_type,
+            merged_by_type=merged_by_type,
         )
         return findings
 

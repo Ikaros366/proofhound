@@ -54,4 +54,4 @@ def test_unknown_tool():
 
 
 def test_known_tools():
-    assert known_tools() == ["httpx", "sqlmap"]  # M3b：sqlmap 构造器接入
+    assert known_tools() == ["httpx", "katana", "sqlmap"]  # M3d：katana 构造器接入
