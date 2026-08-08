@@ -189,13 +189,19 @@ def main() -> int:
         ),
     )
 
-    count_mentions = re.findall(
-        r"确认\s*(?:（[^）]*）)?\s*(?:了|的)?\s*([0-9]+|[一二三四五六七八九十])\s*[个条项]",
-        overview,
-    ) + re.findall(r"共\s*确认\s*(?:了)?\s*([0-9]+|[一二三四五六七八九十])", overview)
+    # 确认计数独立核对：凡与"确认"（非否定）共现于邻近窗口的 N 个/条/项，
+    # 其 N 必须 == 真实 Confirmed 桶数（窗口双向：确认…N 单位 / N 单位…（为|被）确认）
+    confirm_counts = []
+    for match in re.finditer(r"([0-9]+|[一二三四五六七八九十])\s*[个条项]", overview):
+        before = overview[max(0, match.start() - 8) : match.start()]
+        after = overview[match.end() : match.end() + 6]
+        if re.search(r"(?<![未不无])确认", before) or re.search(
+            r"^(?:为|被)?[^。；，,]{0,3}?(?<![未不无])确认", after
+        ):
+            confirm_counts.append(match.group(1))
     check(
-        f"确认计数表述 == 1（命中 {count_mentions}）",
-        bool(count_mentions) and all(n in ("1", "一") for n in count_mentions),
+        f"确认计数表述 == 1（命中 {confirm_counts}）",
+        bool(confirm_counts) and all(n in ("1", "一") for n in confirm_counts),
     )
 
     # 5. 附录 B 中文归因（自定义企业同步副本报告）
