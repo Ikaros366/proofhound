@@ -74,11 +74,16 @@ function route() {
   view.replaceChildren();
   document.querySelectorAll('#sidenav a').forEach((a) => {
     const nav = a.dataset.nav;
-    a.classList.toggle('active', nav === 'health' ? hash === '#/health' : hash !== '#/health');
+    const active = nav === 'list'
+      ? hash === '#/' || hash.startsWith('#/engagement/')
+      : hash === `#/${nav}`;
+    a.classList.toggle('active', active);
   });
   const m = hash.match(/^#\/engagement\/([A-Za-z0-9-]+)$/);
   if (m) renderDetail(view, m[1]);
   else if (hash === '#/health') renderHealth(view);
+  else if (hash === '#/skills') renderSkills(view);
+  else if (hash === '#/scopes') renderScopes(view);
   else renderList(view);
 }
 
@@ -103,10 +108,25 @@ function renderList(view) {
   budgetInput.placeholder = '留空 = 不限；0 = 拒绝一切 LLM 调用';
   grid.appendChild(field('token 预算（可选）', budgetInput));
 
-  const scopeInput = el('textarea');
-  scopeInput.rows = 2;
-  scopeInput.placeholder = 'scope.yaml';
-  grid.appendChild(field('scope 授权文件路径（每行一个文件名，如 scope.yaml；填路径而非文件内容）', scopeInput, 'full'));
+  const scopeSelect = el('select');
+  scopeSelect.multiple = true;
+  scopeSelect.size = 3;
+  grid.appendChild(field('scope 授权文件（多选；数据源为「授权」视图的 scopes/ 目录）', scopeSelect, 'full'));
+  // 下拉数据源：GET /api/scopes（进视图拉一次；无效文件不列为可选项）
+  api('/api/scopes').then((data) => {
+    const scopes = (data.scopes || []).filter((s) => s.valid !== false);
+    scopeSelect.replaceChildren();
+    scopes.forEach((s) => {
+      const opt = el('option', null, s.name);
+      opt.value = s.name;
+      scopeSelect.appendChild(opt);
+    });
+    if (!scopes.length) {
+      const opt = el('option', null, '（无可用 scope，请先在「授权」视图新建）');
+      opt.disabled = true;
+      scopeSelect.appendChild(opt);
+    }
+  }).catch(() => { /* 拉取失败留空：提交时后端照常校验（422/403） */ });
 
   const cookieInput = el('input');
   cookieInput.type = 'password';
@@ -158,9 +178,14 @@ function renderList(view) {
     errSlot.replaceChildren();
     const body = {
       target: targetInput.value.trim(),
-      scope_paths: scopeInput.value.split('\n').map((s) => s.trim()).filter(Boolean),
+      // 选中名映射为 scopes/ 下路径（API 契约不变）
+      scope_paths: Array.from(scopeSelect.selectedOptions).map((o) => `scopes/${o.value}`),
       autonomy_mode: selectedMode,
     };
+    if (!body.scope_paths.length) {
+      errSlot.replaceChildren(el('div', 'error-box', '请至少选择一个 scope 授权文件（可在「授权」视图新建）'));
+      return;
+    }
     const cookie = cookieInput.value;
     if (cookie.trim()) body.cookie = cookie;
     if (budgetInput.value.trim() !== '') body.budget = Number(budgetInput.value);
@@ -900,6 +925,295 @@ function renderHealth(view) {
     try { await refresh(); }
     catch (err) { gridSlot.replaceChildren(errorBox(err)); }
   });
+}
+
+// ---- ④ Skills 管理（M6a；纯 textarea 编辑，零编辑器库） ----
+
+function renderSkills(view) {
+  const listPanel = el('div', 'panel');
+  listPanel.appendChild(el('h3', null, 'Skill 列表'));
+  const listBody = el('div', null, '加载中…');
+  listPanel.appendChild(listBody);
+
+  const uploadPanel = el('div', 'panel');
+  uploadPanel.appendChild(el('h3', null, '上传 Skill（zip ≤ 1MiB，单顶层目录含 SKILL.md）'));
+  const uploadRow = el('div', 'conf-actions');
+  const fileInput = el('input');
+  fileInput.type = 'file';
+  fileInput.accept = '.zip';
+  const uploadBtn = el('button', 'primary', '上传');
+  uploadBtn.disabled = true;
+  fileInput.addEventListener('change', () => { uploadBtn.disabled = !fileInput.files.length; });
+  uploadRow.append(fileInput, uploadBtn);
+  const uploadSlot = el('div');
+  uploadPanel.append(uploadRow, uploadSlot);
+
+  const editorPanel = el('div', 'panel');
+  editorPanel.appendChild(el('h3', null, '编辑器'));
+  editorPanel.appendChild(el('div', 'hint', '点击列表行查看 / 编辑 SKILL.md 全文。'));
+
+  view.append(listPanel, uploadPanel, editorPanel);
+
+  async function refresh() {
+    const data = await api('/api/skills');
+    renderRows(data.skills || []);
+  }
+
+  function renderRows(skills) {
+    if (!skills.length) {
+      listBody.replaceChildren(el('div', 'hint', '暂无 skill。'));
+      return;
+    }
+    const table = el('table', 'data');
+    const head = el('tr');
+    ['名称', '风险', '工具', '来源', '启用', 'sha256'].forEach((h) => head.appendChild(el('th', null, h)));
+    table.appendChild(el('thead')).appendChild(head);
+    const tbody = el('tbody');
+    skills.forEach((s) => {
+      const tr = el('tr');
+      tr.appendChild(el('td', 'mono', s.name));
+      tr.appendChild(badgeCell(`badge risk-${s.risk_level}`, s.risk_level));
+      const toolsTd = el('td');
+      (s.required_tools || []).forEach((t) => {
+        const unknown = (s.unknown_tools || []).includes(t);
+        const missing = (s.missing_tools || []).includes(t);
+        const tag = el('span', unknown || missing ? 'tag warn' : 'tag', t);
+        if (unknown) tag.title = '未知工具（无命令构造器）';
+        else if (missing) tag.title = '工具未安装（tools.d 缺失）';
+        toolsTd.appendChild(tag);
+      });
+      tr.appendChild(toolsTd);
+      tr.appendChild(badgeCell(
+        s.builtin ? 'badge decision-confirm' : 'badge decision-auto',
+        s.builtin ? '内置' : '用户'
+      ));
+      tr.appendChild(el('td', null, s.enabled ? '是' : '否'));
+      const shaTd = el('td', 'mono', shortSha(s.sha256));
+      shaTd.title = s.sha256 || '';
+      tr.appendChild(shaTd);
+      tr.addEventListener('click', () => selectSkill(s.name));
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    listBody.replaceChildren(table);
+  }
+
+  async function selectSkill(name) {
+    editorPanel.replaceChildren();
+    editorPanel.appendChild(el('h3', null, `编辑 ${name}`));
+    let detail;
+    try { detail = await api(`/api/skills/${encodeURIComponent(name)}`); }
+    catch (err) { editorPanel.appendChild(errorBox(err)); return; }
+    if (detail.builtin) {
+      editorPanel.appendChild(el('div', 'hint',
+        '内置 skill 只读；保存将创建 workspace 副本（copy-on-edit），仓库文件不变。'));
+    }
+    const shaLine = el('div', 'hint', `sha256: ${detail.sha256}`);
+    editorPanel.appendChild(shaLine);
+    const ta = el('textarea', 'md-editor');
+    ta.rows = 22;
+    ta.value = detail.content;
+    editorPanel.appendChild(ta);
+    const slot = el('div');
+    const btnRow = el('div', 'conf-actions');
+    const saveBtn = el('button', 'primary', '保存');
+    const delBtn = el('button', 'danger', '删除');
+    delBtn.disabled = detail.builtin;
+    if (detail.builtin) delBtn.title = '内置 skill 禁止删除（保存将创建副本）';
+    saveBtn.addEventListener('click', async () => {
+      saveBtn.disabled = true;
+      slot.replaceChildren();
+      try {
+        const r = await api(`/api/skills/${encodeURIComponent(name)}`, {
+          method: 'PUT', body: { content: ta.value },
+        });
+        shaLine.textContent = `sha256: ${r.sha256}`;
+        detail.builtin = false;
+        detail.sha256 = r.sha256;
+        delBtn.disabled = false;
+        delBtn.title = '';
+        slot.replaceChildren(el('div', 'ok-box',
+          `已保存（sha256 ${shortSha(r.sha256)}${r.copied_from_builtin ? '，已创建 workspace 副本' : ''}）`));
+        await refresh();
+      } catch (err) {
+        slot.replaceChildren(errorBox(err)); // 校验错误原样展示
+      } finally { saveBtn.disabled = false; }
+    });
+    delBtn.addEventListener('click', async () => {
+      if (!window.confirm(`确认删除 skill？\nname: ${name}\nsha256: ${detail.sha256}`)) return;
+      slot.replaceChildren();
+      try {
+        await api(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        editorPanel.replaceChildren();
+        editorPanel.appendChild(el('h3', null, '编辑器'));
+        editorPanel.appendChild(el('div', 'ok-box', `已删除 ${name}`));
+        await refresh();
+      } catch (err) { slot.replaceChildren(errorBox(err)); }
+    });
+    btnRow.append(saveBtn, delBtn);
+    editorPanel.append(btnRow, slot);
+  }
+
+  uploadBtn.addEventListener('click', async () => {
+    const file = fileInput.files[0];
+    if (!file) return;
+    uploadBtn.disabled = true;
+    uploadSlot.replaceChildren();
+    try {
+      const resp = await fetch('/api/skills', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/zip' },
+        body: file,
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        const detail = data && data.detail;
+        throw Object.assign(
+          new Error((detail && detail.message) || `HTTP ${resp.status}`),
+          { code: detail && detail.error }
+        );
+      }
+      uploadSlot.replaceChildren(el('div', 'ok-box',
+        `已导入 ${data.name}（sha256 ${shortSha(data.sha256)}）`));
+      fileInput.value = '';
+      await refresh();
+    } catch (err) {
+      uploadSlot.replaceChildren(errorBox(err));
+    } finally { uploadBtn.disabled = !fileInput.files.length; }
+  });
+
+  refresh().catch((err) => listBody.replaceChildren(errorBox(err)));
+}
+
+// ---- ⑤ Scope 授权文件管理（M6a；同款纯 textarea 纪律） ----
+
+function renderScopes(view) {
+  const listPanel = el('div', 'panel');
+  listPanel.appendChild(el('h3', null, 'Scope 授权文件（scopes/ 目录）'));
+  const listBody = el('div', null, '加载中…');
+  listPanel.appendChild(listBody);
+
+  const createPanel = el('div', 'panel');
+  createPanel.appendChild(el('h3', null, '新建 Scope'));
+  const nameInput = el('input');
+  nameInput.type = 'text';
+  nameInput.placeholder = '文件名（如 dvwa.yaml；仅字母数字 _ . -）';
+  createPanel.appendChild(field('文件名', nameInput));
+  const createTa = el('textarea', 'md-editor');
+  createTa.rows = 6;
+  createTa.placeholder = 'networks: [127.0.0.0/8]\nports: [8080]';
+  createPanel.appendChild(field('YAML 内容（允许键：domains / networks / ports）', createTa));
+  const createBtn = el('button', 'primary', '新建');
+  const createSlot = el('div');
+  createPanel.append(createBtn, createSlot);
+
+  const editorPanel = el('div', 'panel');
+  editorPanel.appendChild(el('h3', null, '编辑器'));
+  editorPanel.appendChild(el('div', 'hint', '点击列表行查看 / 编辑 scope 全文。'));
+
+  view.append(listPanel, createPanel, editorPanel);
+
+  async function refresh() {
+    const data = await api('/api/scopes');
+    renderRows(data.scopes || []);
+  }
+
+  function renderRows(scopes) {
+    if (!scopes.length) {
+      listBody.replaceChildren(el('div', 'hint', '暂无 scope，请在下方新建。'));
+      return;
+    }
+    const table = el('table', 'data');
+    const head = el('tr');
+    ['名称', 'networks', 'ports', 'sha256'].forEach((h) => head.appendChild(el('th', null, h)));
+    table.appendChild(el('thead')).appendChild(head);
+    const tbody = el('tbody');
+    scopes.forEach((s) => {
+      const tr = el('tr');
+      tr.appendChild(el('td', 'mono', s.name));
+      if (s.valid === false) {
+        tr.classList.add('invalid-row');
+        const td = el('td', null, `无效文件：${s.error || ''}`);
+        td.colSpan = 2;
+        tr.appendChild(td);
+      } else {
+        tr.appendChild(el('td', 'mono', (s.networks || []).concat(s.domains || []).join(', ') || '—'));
+        tr.appendChild(el('td', 'mono', (s.ports || []).join(', ') || '不限'));
+      }
+      const shaTd = el('td', 'mono', shortSha(s.sha256));
+      shaTd.title = s.sha256 || '';
+      tr.appendChild(shaTd);
+      tr.addEventListener('click', () => selectScope(s.name));
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    listBody.replaceChildren(table);
+  }
+
+  async function selectScope(name) {
+    editorPanel.replaceChildren();
+    editorPanel.appendChild(el('h3', null, `编辑 ${name}`));
+    let detail;
+    try { detail = await api(`/api/scopes/${encodeURIComponent(name)}`); }
+    catch (err) { editorPanel.appendChild(errorBox(err)); return; }
+    const shaLine = el('div', 'hint', `sha256: ${detail.sha256}`);
+    editorPanel.appendChild(shaLine);
+    const ta = el('textarea', 'md-editor');
+    ta.rows = 12;
+    ta.value = detail.content;
+    editorPanel.appendChild(ta);
+    const slot = el('div');
+    const btnRow = el('div', 'conf-actions');
+    const saveBtn = el('button', 'primary', '保存');
+    const delBtn = el('button', 'danger', '删除');
+    saveBtn.addEventListener('click', async () => {
+      saveBtn.disabled = true;
+      slot.replaceChildren();
+      try {
+        const r = await api(`/api/scopes/${encodeURIComponent(name)}`, {
+          method: 'PUT', body: { content: ta.value },
+        });
+        shaLine.textContent = `sha256: ${r.sha256}`;
+        detail.sha256 = r.sha256;
+        slot.replaceChildren(el('div', 'ok-box', `已保存（sha256 ${shortSha(r.sha256)}）`));
+        await refresh();
+      } catch (err) {
+        slot.replaceChildren(errorBox(err)); // 校验错误原样展示
+      } finally { saveBtn.disabled = false; }
+    });
+    delBtn.addEventListener('click', async () => {
+      if (!window.confirm(`确认删除 scope 授权文件？\nname: ${name}\nsha256: ${detail.sha256}`)) return;
+      slot.replaceChildren();
+      try {
+        await api(`/api/scopes/${encodeURIComponent(name)}`, { method: 'DELETE' });
+        editorPanel.replaceChildren();
+        editorPanel.appendChild(el('h3', null, '编辑器'));
+        editorPanel.appendChild(el('div', 'ok-box', `已删除 ${name}`));
+        await refresh();
+      } catch (err) { slot.replaceChildren(errorBox(err)); }
+    });
+    btnRow.append(saveBtn, delBtn);
+    editorPanel.append(btnRow, slot);
+  }
+
+  createBtn.addEventListener('click', async () => {
+    createSlot.replaceChildren();
+    createBtn.disabled = true;
+    try {
+      const r = await api('/api/scopes', {
+        method: 'POST',
+        body: { name: nameInput.value.trim(), content: createTa.value },
+      });
+      createSlot.replaceChildren(el('div', 'ok-box', `已创建 ${r.name}`));
+      nameInput.value = '';
+      createTa.value = '';
+      await refresh();
+    } catch (err) {
+      createSlot.replaceChildren(errorBox(err)); // 校验错误原样展示
+    } finally { createBtn.disabled = false; }
+  });
+
+  refresh().catch((err) => listBody.replaceChildren(errorBox(err)));
 }
 
 // ---- 启动 ----

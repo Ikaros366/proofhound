@@ -25,11 +25,15 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from proofhound.autonomy import AutonomyGate, AutonomySwitchError, gate_matrix
+from proofhound.api.management import ManagementService
 from proofhound.api.models import (
     AutonomySwitchRequest,
     ConfirmationDecisionRequest,
     CreateEngagementRequest,
     ReportBuildRequest,
+    ScopeCreateRequest,
+    ScopeUpdateRequest,
+    SkillUpdateRequest,
 )
 from proofhound.api.runner import (
     ApiError,
@@ -114,6 +118,7 @@ def create_app(
         confirm_timeout=confirm_timeout,
         env_file=env_file,
     )
+    management = ManagementService(manager)  # M6a 管理面（skill/scope）
     app = FastAPI(title="ProofHound API", version="0.1.0")
     app.state.manager = manager
 
@@ -362,6 +367,58 @@ def create_app(
             cid, approved=False, operator=request.operator, note=request.note
         )
         return {"confirmation": conf.to_dict(), "engagement_id": eng.id}
+
+    # ---- M6a 管理面：skill 库管理（只读写配置文本，零命令构造） ----
+
+    @app.get("/api/skills")
+    def list_skills() -> dict:
+        """skill 列表（按请求重解析 registry：变更即热重载，无需重启）。"""
+        return {"skills": management.list_skills()}
+
+    @app.get("/api/skills/{name}")
+    def get_skill(name: str) -> dict:
+        """SKILL.md 全文 + 内置标记 + sha256（控制台编辑器数据源）。"""
+        return management.get_skill(name)
+
+    @app.post("/api/skills", status_code=201)
+    async def import_skill(request: Request) -> dict:
+        """zip 上传：单顶层目录 + 必含 SKILL.md + 防穿越 + ≤1MiB；
+        校验 all-or-nothing，拒绝即零写入。"""
+        return management.import_skill_zip(await request.body())
+
+    @app.put("/api/skills/{name}")
+    def update_skill(name: str, request: SkillUpdateRequest) -> dict:
+        """编辑 SKILL.md 全文（保存即校验）；内置 skill copy-on-edit
+        （复制实体到 workspace skills/ 再改，绝不顺符号链接写仓库）。"""
+        return management.update_skill(name, request.content)
+
+    @app.delete("/api/skills/{name}")
+    def delete_skill(name: str) -> dict:
+        """删除用户 skill；内置 skill 409。"""
+        return management.delete_skill(name)
+
+    # ---- M6a 管理面：scope 授权文件管理（仅限 workspace scopes/ 内） ----
+
+    @app.get("/api/scopes")
+    def list_scopes() -> dict:
+        """scope 列表（控制台创建任务表单下拉数据源）。"""
+        return {"scopes": management.list_scopes()}
+
+    @app.get("/api/scopes/{name}")
+    def get_scope(name: str) -> dict:
+        return management.get_scope(name)
+
+    @app.post("/api/scopes", status_code=201)
+    def create_scope(request: ScopeCreateRequest) -> dict:
+        return management.create_scope(request.name, request.content)
+
+    @app.put("/api/scopes/{name}")
+    def update_scope(name: str, request: ScopeUpdateRequest) -> dict:
+        return management.update_scope(name, request.content)
+
+    @app.delete("/api/scopes/{name}")
+    def delete_scope(name: str) -> dict:
+        return management.delete_scope(name)
 
     # ---- M5b Web 控制台静态资源（挂载于全部 API 路由之后）----
     # 纯静态零依赖（无 CDN/无构建链，完全离线可用）；前端只是本 API 的消费者，

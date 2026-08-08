@@ -97,12 +97,18 @@ def _wait_confirmation(client, rec, eng_id, timeout: float) -> dict:
 
 
 def _make_workspace(root: Path, dvwa_port: int) -> Path:
-    """演示工作区：scope.yaml + 符号链接复用仓库 templates/skills/tools.d/.env。"""
+    """演示工作区：scope.yaml + 符号链接复用仓库 templates/skills/tools.d/.env。
+
+    M6a：另写一份 scopes/scope.yaml（内容与根 scope.yaml 相同）——控制台
+    创建任务表单的 scope 下拉数据源为 GET /api/scopes（只管 scopes/ 内文件）。
+    """
     workspace = root / "workspace"
     workspace.mkdir(parents=True)
-    (workspace / "scope.yaml").write_text(
-        f"networks: [127.0.0.0/8]\nports: [{dvwa_port}]\n", encoding="utf-8"
-    )
+    scope_text = f"networks: [127.0.0.0/8]\nports: [{dvwa_port}]\n"
+    (workspace / "scope.yaml").write_text(scope_text, encoding="utf-8")
+    scopes_dir = workspace / "scopes"
+    scopes_dir.mkdir(exist_ok=True)
+    (scopes_dir / "scope.yaml").write_text(scope_text, encoding="utf-8")
     for name in ("templates", "skills", "tools.d"):
         link = workspace / name
         if not link.exists():
@@ -347,7 +353,8 @@ def stepc_cookie_leak(rec: Recorder, dvwa) -> None:
 MANUAL_STEPS = """\
 浏览器手动验收步骤（服务保持运行中）：
   1. 打开控制台首页（上方打印的地址）→ 任务列表应看到本 demo 的两个 engagement
-  2. 创建任务：填 target/scope.yaml/cookie（password 框）→ 创建并启动 → 自动跳详情
+  2. 创建任务：填 target、scope 下拉多选（数据源 scopes/，demo 已备 scope.yaml）、
+     cookie（password 框）→ 创建并启动 → 自动跳详情
   3. 详情页：状态条阶段徽标滚动；审计流着色滚动（command_executed 显脱敏命令）
   4. L2 阻塞时：确认队列面板置顶警示 + 倒计时 → 填 operator 批准 → Finding 变 Confirmed
   5. 展开 Finding → 证据包查看器：点文件名看全文（行号/锚点高亮/sha256）

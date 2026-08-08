@@ -9,7 +9,10 @@
 - M2c：LLM 调用经 :class:`~proofhound.llm.router.ModelRouter` 走 T1 档
   （计量 + 预算硬闸在路由层）；规划前先做上下文治理（core/context.py）：
   Signal 摘要超限确定性压缩（记 context_compressed），prompt 超字符硬
-  上限抛 :class:`ContextOverflowError`（记 context_overflow，禁静默截断）。
+  上限抛 :class:`ContextOverflowError`（记 context_overflow，禁静默截断）；
+- M6a：schema+语义校验失败经 :func:`~proofhound.llm.repair.complete_structured`
+  携带错误反馈修复重试一次（记 llm_repair_attempt）；二次仍失败走原
+  plan_rejected 语义，预算硬闸覆盖重试。
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from proofhound.core.context import (
     messages_chars,
 )
 from proofhound.core.plan import Plan, PlanValidationError, parse_plan
+from proofhound.llm.repair import complete_structured
 from proofhound.llm.router import Tier, ensure_router
 from proofhound.skills.registry import Skill, SkillRegistry
 from proofhound.tools.build import params_schema
@@ -104,10 +108,18 @@ class Planner:
         if chars > self.context_policy.max_chars:
             # 审计由编排器捕获后统一记录（带 node_id），此处不重复记
             raise ContextOverflowError(chars=chars, limit=self.context_policy.max_chars)
-        raw = self.router.complete(Tier.T1, messages)
         try:
-            plan = parse_plan(raw)
-            self._validate_semantics(plan)
+            # M6a：校验失败携带错误反馈修复重试一次；二次仍失败抛
+            # PlanValidationError 走原 plan_rejected 语义
+            plan = complete_structured(
+                self.router,
+                Tier.T1,
+                messages,
+                self._parse_and_validate,
+                audit=self.audit,
+                caller="planner",
+                max_chars=self.context_policy.max_chars,
+            )
         except PlanValidationError as exc:
             self._audit("plan_rejected", skill=skill.name, reason=str(exc)[:500])
             raise
@@ -117,6 +129,12 @@ class Planner:
             actions=len(plan.actions),
             action_kinds=[a.action for a in plan.actions],
         )
+        return plan
+
+    def _parse_and_validate(self, raw: str) -> Plan:
+        """schema + 语义双层校验（M6a：作为修复重试助手的整体校验可调用）。"""
+        plan = parse_plan(raw)
+        self._validate_semantics(plan)
         return plan
 
     def _validate_semantics(self, plan: Plan) -> None:

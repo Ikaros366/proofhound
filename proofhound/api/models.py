@@ -72,3 +72,22 @@ class ReportBuildRequest(BaseModel):
 
     template: str | None = None  # 模板文件名/相对路径，缺省 default_template.docx
     narrative: bool = False
+
+
+class SkillUpdateRequest(BaseModel):
+    """编辑 skill（M6a）：SKILL.md 全文，保存即校验（非法 422 零写入）。"""
+
+    content: str = Field(min_length=1)
+
+
+class ScopeCreateRequest(BaseModel):
+    """新建 scope（M6a）：文件名（白名单字符）+ YAML 全文。"""
+
+    name: str = Field(min_length=1)
+    content: str = Field(min_length=1)
+
+
+class ScopeUpdateRequest(BaseModel):
+    """编辑 scope（M6a）：YAML 全文，保存即校验（非法 422 零写入）。"""
+
+    content: str = Field(min_length=1)

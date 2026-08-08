@@ -12,7 +12,10 @@
   :class:`VerifierError`——**非法 verdict 拒收**，由编排层 fail-closed
   处理（Finding 不得因此晋级 Confirmed）；本刀不收 downgrade；
 - 每次裁定落 ``Finding.verifier`` 并记审计 ``verifier_verdict``；
-  预算超限（:class:`BudgetExceededError`）不捕获，向上抛给编排层。
+  预算超限（:class:`BudgetExceededError`）不捕获，向上抛给编排层；
+- M6a：输出非法经 :func:`~proofhound.llm.repair.complete_structured`
+  携带错误反馈修复重试一次（记 llm_repair_attempt）；二次仍失败走原
+  VerifierError fail-closed 语义，预算硬闸覆盖重试。
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from pydantic import BaseModel, Field, ValidationError
 from proofhound.compliance.audit import AuditLog
 from proofhound.core.context import ContextOverflowError, ContextPolicy, messages_chars
 from proofhound.findings.finding import Finding, VerifierVerdict
+from proofhound.llm.repair import complete_structured
 from proofhound.llm.router import ModelRouter, Tier
 
 SYSTEM_PROMPT = """\
@@ -83,8 +87,15 @@ class Verifier:
         if chars > self.context_policy.max_chars:
             raise ContextOverflowError(chars=chars, limit=self.context_policy.max_chars)
 
-        raw = self.router.complete(Tier.T2, messages)
-        verdict = self._parse_verdict(raw)
+        verdict = complete_structured(
+            self.router,
+            Tier.T2,
+            messages,
+            self._parse_verdict,
+            audit=self.audit,
+            caller="verifier",
+            max_chars=self.context_policy.max_chars,
+        )
         model = self._t2_model_name()
         result = VerifierVerdict(
             model=model, verdict=verdict.verdict, reason=verdict.reason

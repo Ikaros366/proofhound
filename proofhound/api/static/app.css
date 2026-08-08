@@ -363,6 +363,17 @@ table.data tbody tr:hover { background: var(--panel-alt); }
 .ev-color-report_built      { color: var(--green); }
 .ev-color-engagement_created, .ev-color-engagement_failed { color: var(--orange); }
 
+/* ---- M6a 管理面（技能 / 授权视图） ---- */
+
+.tag.warn { color: var(--yellow); border-color: var(--yellow); }
+textarea.md-editor {
+  width: 100%;
+  margin: 8px 0;
+  line-height: 1.5;
+  font-family: var(--mono);
+}
+tr.invalid-row td { color: #ffa198; }
+
 /* ---- 健康页 ---- */
 
 .gate-table td, .gate-table th { text-align: center; }

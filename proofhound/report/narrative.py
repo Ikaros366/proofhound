@@ -20,7 +20,11 @@
 - 每段落记审计 ``narrative_generated{finding_id|section, model, tokens}``
   （单次调用产出全部段落，tokens 为该次调用的总量，各段事件同值；逐次
   调用计量以路由层 ``llm_call`` 审计为准）；
-- 预算超限（:class:`BudgetExceededError`）不捕获，向上抛。
+- 预算超限（:class:`BudgetExceededError`）不捕获，向上抛；
+- M6a：输出非法（坏 JSON/schema/无锚）经
+  :func:`~proofhound.llm.repair.complete_structured` 携带错误反馈修复
+  重试一次（记 llm_repair_attempt，重试 token 计入 tokens 统计）；二次
+  仍失败走原 NarrativeError 全量拒收零落盘语义，预算硬闸覆盖重试。
 """
 
 from __future__ import annotations
@@ -40,6 +44,7 @@ from proofhound.findings.finding import (
     FindingStore,
     NarrativeParts,
 )
+from proofhound.llm.repair import complete_structured
 from proofhound.llm.router import ModelRouter, Tier
 from proofhound.report.data import SECTION_KEYS, SECTIONS_FILE
 
@@ -127,14 +132,21 @@ class NarrativeGenerator:
 
         tracker = getattr(self.router, "tracker", None)
         before = len(tracker.records) if tracker is not None else 0
-        raw = self.router.complete(Tier.T1, messages)  # 预算硬闸在路由层
+        # 预算硬闸在路由层（M6a：含修复重试那次调用；重试 token 计入下方差值）
+        paragraphs = complete_structured(
+            self.router,
+            Tier.T1,
+            messages,
+            lambda raw: self._parse_paragraphs(raw, allowed_keys),
+            audit=self.audit,
+            caller="narrative",
+            max_chars=self.context_policy.max_chars,
+        )
         tokens: int | None = None
         if tracker is not None:
             used = sum(r.total_tokens for r in tracker.records[before:])
             tokens = used or None
         model = self._t1_model_name()
-
-        paragraphs = self._parse_paragraphs(raw, allowed_keys)
 
         # 全部校验通过后一次性落盘（无部分结果）
         findings_by_id = {f.id: f for f in findings}

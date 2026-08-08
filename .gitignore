@@ -8,6 +8,10 @@ evidence/*
 # API engagement 运行目录（M5a，含审计/证据/会话凭据）
 engagements/
 
+# 管理面运行时产物（M6a，--workspace . 时落仓库根）
+management.jsonl
+/scopes/
+
 # 工具安装产物与版本快照（运行时状态）
 tools.d/*
 !tools.d/.gitkeep

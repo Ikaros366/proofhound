@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """种子 Finding 工具（M3b）：手动创建测试用 Hypothesis。
 
+**已退役标记（deprecated，M6a 注记）**：M3d 起发现已自动化（katana 爬参
+→ triage 自动产出 sqli Hypothesis，`scripts/demo_discovery_dvwa.py` 零种子
+全链路）。本脚本保留可用，但仅供旧演示复现 verify 路径
+（`scripts/demo_verify_dvwa.py` 仍依赖它播种正/反例），新流程请勿再用它
+作为发现入口。
+
 LLM triage 未做（M3 后续切片），verify 阶段的输入 Hypothesis 由本工具
 手工播种替代：建 SIGNAL → ``transition(HYPOTHESIS, actor="seed")`` →
 findings.jsonl 快照追加 → 组装证据包，审计落 ``<evidence_dir>/audit.jsonl``。

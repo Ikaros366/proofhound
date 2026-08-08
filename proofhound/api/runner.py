@@ -684,6 +684,12 @@ class EngagementManager:
         self.workspace_root = Path(workspace_root).resolve()
         self.engagements_dir = self.workspace_root / "engagements"
         self.templates_dir = self.workspace_root / "templates"
+        # M6a 管理面：skills/ 与 scopes/ 约定目录 + workspace 级管理审计通道
+        # （management.jsonl，append-only，skill/scope 变更全进它）
+        self.skills_dir = self.workspace_root / "skills"
+        self.scopes_dir = self.workspace_root / "scopes"
+        self.scopes_dir.mkdir(exist_ok=True)  # 约定目录：不存在则创建
+        self.management_audit = AuditLog(self.workspace_root / "management.jsonl")
         self.env_file = (
             Path(env_file).resolve()
             if env_file is not None
