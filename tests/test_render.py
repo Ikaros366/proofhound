@@ -396,3 +396,60 @@ def test_cvss_line_conditional_render(report_evidence_dir, default_template, tmp
     assert cvss_lines == [
         "CVSS：9.8（CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H）"
     ]
+
+
+def test_enterprise_cvss_line(report_evidence_dir, tmp_path):
+    """M6b：自定义企业模板同步 CVSS 条件行——带分 Confirmed 渲染，无分不出现。"""
+    import json
+
+    from proofhound.findings.finding import Finding, FindingStore, NarrativeParts
+
+    store = FindingStore(report_evidence_dir / "findings.jsonl")
+    store.append(  # M6b 新数据：Confirmed 带向量 + 代码算分
+        Finding(
+            id="F-2026-0010",
+            state="confirmed",
+            vuln_type="sqli",
+            severity="medium",
+            asset="http://127.0.0.1:9/app?q=10",
+            title="sqli 标题",
+            dedup_key="sha256:cvss10",
+            cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N",
+            cvss_score=4.3,
+            created_at="2026-08-07T00:00:00.000+00:00",
+            updated_at="2026-08-07T00:00:00.000+00:00",
+        )
+    )
+    # 自定义企业模板直接引用 narrative_parts.*（StrictUndefined）：confirmed 需叙述
+    for fid in ("F-2026-0001", "F-2026-0005", "F-2026-0010"):
+        finding = store.get(fid)
+        finding.narrative_parts = NarrativeParts(
+            description="描述。", impact="危害。", remediation="建议。"
+        )
+        store.append(finding)
+    (report_evidence_dir / "narrative_sections.json").write_text(
+        json.dumps({"overview": "概述。", "remediation": "建议。"}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (report_evidence_dir / "engagement.json").write_text(
+        json.dumps(
+            {
+                "target": "http://127.0.0.1:9",
+                "scope": "127.0.0.0/8",
+                "started_at": "2026-08-07T01:00:00.000+00:00",
+                "finished_at": "2026-08-09T02:00:00.000+00:00",
+                "company_name": "某某单位",
+                "system_name": "自定义企业演示系统",
+                "report_date": "2026年8月",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    context = build_context(report_evidence_dir).as_template_context()
+    out = render_docx(context, ENTERPRISE_TEMPLATE_PATH, tmp_path / "enterprise.docx")
+    paras = _paragraph_texts(Document(str(out)))
+    # 仅带分的 F-2026-0010 渲染；另两条无分 confirmed 不出现该行
+    assert [p for p in paras if p.startswith("CVSS：")] == [
+        "CVSS：4.3（CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N）"
+    ]

@@ -208,6 +208,19 @@ def main() -> int:
         h4 == expected_h4,
     )
 
+    # 3.2b M6b：CVSS 条件行——带分 Confirmed 逐条渲染（分数+向量原文），无分不出现
+    scored = [
+        f for f in context["confirmed_findings"] if f["cvss_score"] is not None
+    ]
+    expected_cvss = [
+        f"CVSS：{f['cvss_score']}（{f['cvss_vector']}）" for f in scored
+    ]
+    cvss_lines = [p for p in paras if p.startswith("CVSS：")]
+    check(
+        f"CVSS 条件行逐条渲染（{len(scored)} 条带分 Confirmed）",
+        cvss_lines == expected_cvss,
+    )
+
     # 3.3 三段叙述槽位逐条在报告对应段
     parts_ok = all(
         f.narrative_parts
