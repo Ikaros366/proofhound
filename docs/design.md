@@ -468,3 +468,5 @@ GitHub 对双用途安全工具有成熟生态（Metasploit、sqlmap、nuclei、
 - **API 安全**（M5a）：确认队列持久化（confirmations.jsonl 追加、重启可恢复）+ operator 审计（action_approved/action_rejected/autonomy_mode_changed）已落地；API 默认只绑 localhost，发布前复查暴露面与认证缺口。
 - **社区飞轮**：引擎与 skill 库分仓（`proofhound` + `proofhound-skills`），参照 nuclei-templates 模式接受社区贡献 verify skill——skill 生态是项目的长期护城河。
 - **发布节奏**：M3 验证层跑通 + DVWA/XBEN 靶场 demo 后再公开发布；渠道 GitHub + 安全社区。
+
+> **M7 落地注记**（2026-08-09，开源准备）：① 协议定 Apache-2.0（LICENSE 全文入库，pyproject `license = "Apache-2.0"` SPDX 对齐）；② 仓库卫生——README（定位 + 法律免责声明前置 + 十分钟复现 + 工具/skill/模板/安全模型指南）、SECURITY.md（GitHub Security Advisories 渠道 + 信任模型 + 无认证部署警告）、CONTRIBUTING.md 简版、.env.example；③ 客户报告模板清除——git filter-repo 将模板二进制从全部历史抹除、全历史文本引用改写为中性表述（"自定义企业模板"），提交信息同步清洗，模板本机保留于 `templates/custom_enterprise_template.docx`（.gitignore 排除，相关测试/演示缺失自动 skip，公开/本机两态各自全绿）；④ gitleaks 全历史扫描 + 人工密钥复核（结论：零泄漏，.env/evidence/engagements 从未入库）；⑤ 演示 GIF（docs/demo.gif）嵌入 README；⑥ **分仓决策：proofhound-skills 本里程碑不拆**——skill 随主仓库发布，社区成形后再行拆分（§11.3 社区飞轮条目目标不变，仅节奏后移）；⑦ 打 v0.1.0 标签后公开。
