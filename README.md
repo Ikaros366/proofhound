@@ -42,14 +42,14 @@ python3.12 -m venv .venv
 cp .env.example .env
 vi .env            # 填 PROOFHOUND_T1_* 与 PROOFHOUND_T2_*
 
-# 3. 起 DVWA 靶场容器
+# 3. 起 DVWA 靶场容器（同名旧容器先清理：docker rm -f dvwa 2>/dev/null）
 docker run -d --name dvwa -p 8080:80 vulnerables/web-dvwa
 
 # 4. 写 scope 授权文件（无授权不启动；scope 目录本机私有、不入库）
 mkdir -p scopes
 printf 'networks: [127.0.0.0/8]\nports: [8080]\n' > scopes/dvwa.yaml
 
-# 5. 起本机控制台（只绑 127.0.0.1）
+# 5. 起本机控制台（只绑 127.0.0.1；8000 被占用时换 --port 8001，浏览器地址相应替换）
 .venv/bin/python -m proofhound.api --workspace . --port 8000
 ```
 
