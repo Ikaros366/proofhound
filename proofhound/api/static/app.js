@@ -34,7 +34,7 @@ const FINDING_STATE_LABEL = {
 const SEVERITY_LABEL = { critical: '严重', high: '高', medium: '中', low: '低', info: '提示' };
 const FINDING_STATE_ORDER = { confirmed: 0, reproduced: 1, hypothesis: 2, signal: 3, rejected: 4 };
 const SEVERITY_ORDER = { critical: 0, high: 1, medium: 2, low: 3, info: 4 };
-const FALLBACK_TEMPLATES = ['default_template.docx', 'custom_enterprise_template.docx'];
+const FALLBACK_TEMPLATES = ['default_template.docx'];
 
 let poller = null;
 let confirmTimeoutSec = 300; // 启动时从 /api/health 取真实值，取不到回退 300

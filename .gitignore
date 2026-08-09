@@ -16,6 +16,9 @@ management.jsonl
 tools.d/*
 !tools.d/.gitkeep
 
+# 私有企业模板（用户本机保留不入库；缺失时 enterprise 测试/演示自动 skip）
+templates/custom_enterprise_template.docx
+
 # Python
 __pycache__/
 *.py[cod]

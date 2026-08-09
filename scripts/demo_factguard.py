@@ -104,6 +104,11 @@ def main() -> int:
     parser.add_argument("--env-file", default=str(REPO_ROOT / ".env"))
     args = parser.parse_args()
 
+    if not ENTERPRISE_TEMPLATE_PATH.exists():
+        print("[skip] 企业模板缺失（公开仓库形态），跳过 factguard 演示："
+              f"{ENTERPRISE_TEMPLATE_PATH}")
+        return 0
+
     eng = Path(args.engagement)
     if not (eng / "findings.jsonl").is_file():
         print(f"[错误] engagement 无 findings.jsonl: {eng}", file=sys.stderr)

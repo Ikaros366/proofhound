@@ -271,6 +271,9 @@ def _flow_section_texts(doc: Document) -> list[str]:
     return [p.text for p in paras[start:end]]
 
 
+@pytest.mark.skipif(
+    not ENTERPRISE_TEMPLATE_PATH.exists(), reason="企业模板缺失（公开仓库形态）"
+)
 def test_enterprise_template_renders(report_evidence_dir, tmp_path):
     """M4.5 验收：自定义企业模板渲染读回（封面/时间/风险项/附录 A B/流程章）。"""
     import json
@@ -398,6 +401,9 @@ def test_cvss_line_conditional_render(report_evidence_dir, default_template, tmp
     ]
 
 
+@pytest.mark.skipif(
+    not ENTERPRISE_TEMPLATE_PATH.exists(), reason="企业模板缺失（公开仓库形态）"
+)
 def test_enterprise_cvss_line(report_evidence_dir, tmp_path):
     """M6b：自定义企业模板同步 CVSS 条件行——带分 Confirmed 渲染，无分不出现。"""
     import json

@@ -128,6 +128,11 @@ def main() -> int:
     parser.add_argument("--env-file", default=str(REPO_ROOT / ".env"))
     args = parser.parse_args()
 
+    if not ENTERPRISE_TEMPLATE_PATH.exists():
+        print("[skip] 企业模板缺失（公开仓库形态），跳过自定义企业模板演示："
+              f"{ENTERPRISE_TEMPLATE_PATH}")
+        return 0
+
     if args.dir:
         src = Path(args.dir)
     else:
