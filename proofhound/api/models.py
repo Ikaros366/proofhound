@@ -41,11 +41,12 @@ class CreateEngagementRequest(BaseModel):
     target: str = Field(min_length=1)  # 单目标 URL/IP/域名（构造器仅支持单目标）
     scope_paths: list[str] = Field(min_length=1)  # scope YAML，相对 workspace 或绝对路径
     cookie: str | None = None  # 可选预置会话 Cookie 头（k=v; k=v 形式）
+    reference_cookie: str | None = None  # M8c：可选第二身份会话（reference/victim，verify-idor 用）
     autonomy_mode: AutonomyMode = AutonomyMode.SEMI_AUTO  # 默认半自动（§5.9.2）
     budget: int | None = Field(default=None, ge=0)  # Run 级 token 预算；0 = 拒绝一切 LLM 调用
     extras: dict[str, str] | None = None  # 报告元信息额外键（M4.5 extras 透传：company_name 等）
 
-    @field_validator("cookie")
+    @field_validator("cookie", "reference_cookie")
     @classmethod
     def _cookie_parseable(cls, value: str | None) -> str | None:
         if value is not None:

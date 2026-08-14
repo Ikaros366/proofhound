@@ -83,8 +83,11 @@ def test_hinted_param_creates_sqli_hypothesis(env):
     )
     findings = orch.run_triage_phase()
 
-    assert len(findings) == 1  # id 命中；Submit 非启发式键不建
-    finding = findings[0]
+    # id 命中 sqli 表；M8c 起 id 同中 idor 表 → 同产 sqli+idor（设计行为），
+    # Submit 非启发式键不建；dedup 按 vuln_type 分量区分互不合并
+    assert len(findings) == 2
+    by_type = {f.vuln_type: f for f in findings}
+    finding = by_type["sqli"]
     assert finding.state is FindingState.HYPOTHESIS
     assert finding.vuln_type == "sqli"
     assert finding.param == "id"
@@ -92,9 +95,17 @@ def test_hinted_param_creates_sqli_hypothesis(env):
     assert finding.evidence_kinds == ["crawl-endpoint"]
     assert finding.asset == f"{BASE}/vulnerabilities/sqli/?id=1&Submit=Submit"
     assert finding.source_signal_refs == [f"{raw}#L6"]
+    idor = by_type["idor"]  # M8c：同参数键同产的 idor 候选同构
+    assert idor.state is FindingState.HYPOTHESIS
+    assert idor.param == "id"
+    assert idor.severity == "medium"
+    assert idor.evidence_kinds == ["crawl-endpoint"]
+    assert idor.asset == finding.asset
+    assert idor.source_signal_refs == [f"{raw}#L6"]
+    assert idor.dedup_key != finding.dedup_key
     summary = _summary(audit)
-    assert summary["created"] == 1
-    assert summary["created_by_type"] == {"sqli": 1}
+    assert summary["created"] == 2
+    assert summary["created_by_type"] == {"sqli": 1, "idor": 1}
     assert summary["kept_signal"] == 0
     assert llm.calls == 0
 
@@ -125,17 +136,19 @@ def test_dedup_param_dimension(env):
 
     store = FindingStore(evidence_dir / "findings.jsonl")
     findings = store.load_all()
-    assert len(findings) == 2
-    by_param = {f.param: f for f in findings}
-    assert set(by_param) == {"id", "page"}
+    # M8c：id 同中 idor 表 → sqli:id、sqli:page、idor:id 三条（idor:id 与
+    # sqli:id 同 param 不同 vuln_type，dedup 按 vuln_type 分量区分）
+    assert len(findings) == 3
+    by_key = {(f.vuln_type, f.param): f for f in findings}
+    assert set(by_key) == {("sqli", "id"), ("sqli", "page"), ("idor", "id")}
     for finding in findings:
         assert finding.source_signal_refs == [f"{raw}#L1", f"{raw}#L2"]
     dedup_events = [e for e in audit.read_all() if e["event"] == "finding_deduplicated"]
-    assert len(dedup_events) == 2
+    assert len(dedup_events) == 3
     summary = _summary(audit)
-    assert summary["created"] == 2
-    assert summary["merged"] == 2
-    assert summary["merged_by_type"] == {"sqli": 2}
+    assert summary["created"] == 3
+    assert summary["merged"] == 3
+    assert summary["merged_by_type"] == {"sqli": 2, "idor": 1}
 
 
 def test_out_of_scope_dropped(env):
@@ -164,22 +177,33 @@ def test_sqli_cap_20(env):
     orch.run_triage_phase()
 
     store = FindingStore(evidence_dir / "findings.jsonl")
-    assert len(store.load_all()) == 20
+    # M8c：同批 id 键另产 idor 候选（独立上限 10，与 sqli 互不挤占）
+    findings = store.load_all()
+    assert sum(1 for f in findings if f.vuln_type == "sqli") == 20
+    assert sum(1 for f in findings if f.vuln_type == "idor") == 10
     capped = [e for e in audit.read_all() if e["event"] == "triage_capped"]
-    assert len(capped) == 1
-    assert capped[0]["limit"] == 20
-    assert capped[0]["dropped"] == 5
-    assert _summary(audit)["created"] == 20
+    assert len(capped) == 2  # sqli 与 idor 各自独立记一条
+    by_type = {e["vuln_type"]: e for e in capped}
+    assert by_type["sqli"]["limit"] == 20
+    assert by_type["sqli"]["dropped"] == 5
+    assert by_type["idor"]["limit"] == 10
+    assert by_type["idor"]["dropped"] == 15
+    assert _summary(audit)["created"] == 30
 
-    orch.run_triage_phase()  # 重跑：已建 20 条幂等跳过；首轮被丢弃的 5 条
-    # 确定性重判并再次丢弃（建侧幂等：findings 恒 20 条，不重复建）
-    assert len(store.load_all()) == 20
+    orch.run_triage_phase()  # 重跑：已建条幂等跳过；首轮被丢弃的候选
+    # 确定性重判并再次丢弃（建侧幂等：findings 恒 30 条，不重复建）
+    findings = store.load_all()
+    assert sum(1 for f in findings if f.vuln_type == "sqli") == 20
+    assert sum(1 for f in findings if f.vuln_type == "idor") == 10
     summaries = [e for e in audit.read_all() if e["event"] == "triage_completed"]
     assert summaries[1]["created"] == 0
     assert summaries[1]["merged"] == 0
     capped = [e for e in audit.read_all() if e["event"] == "triage_capped"]
-    assert len(capped) == 2  # 首轮 + 重跑各记一次，dropped 均为 5
-    assert all(e["dropped"] == 5 for e in capped)
+    assert len(capped) == 4  # 首轮 + 重跑各按类型记一次，dropped 不变
+    assert sum(1 for e in capped if e["vuln_type"] == "sqli") == 2
+    assert sum(1 for e in capped if e["vuln_type"] == "idor") == 2
+    assert all(e["dropped"] == 5 for e in capped if e["vuln_type"] == "sqli")
+    assert all(e["dropped"] == 15 for e in capped if e["vuln_type"] == "idor")
 
 
 def test_runner_without_scope_skips_check(tmp_path, make_skill_dir):
@@ -200,5 +224,6 @@ def test_runner_without_scope_skips_check(tmp_path, make_skill_dir):
         evidence_dir=evidence_dir,
     )
     findings = orch.run_triage_phase()
-    assert len(findings) == 1
-    assert findings[0].vuln_type == "sqli"
+    # M8c：id 同中 idor 表 → 同产 sqli+idor
+    assert len(findings) == 2
+    assert {f.vuln_type for f in findings} == {"sqli", "idor"}

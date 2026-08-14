@@ -55,6 +55,52 @@ def test_short_cookie_value_no_collateral_damage():
     assert "security=low" not in redacted
 
 
+# ---- M8c：双会话（reference/victim 第二身份）----
+
+
+def test_reference_session_secrets_all_covered():
+    """脱敏是两个会话都要：reference 会话全部秘密形态均在 secret_values()。"""
+    dual = SessionConfig(
+        cookies={"PHPSESSID": "aaaaaaaaaaaaaaaa"},
+        headers={"Authorization": "Bearer tok-attacker-1"},
+        reference=SessionConfig(
+            cookies={"phsess": "bbbbbbbbbbbbbbbb"},
+            headers={"X-Api-Key": "victim-key-999"},
+        ),
+    )
+    values = dual.secret_values()
+    # 主会话五形态
+    assert "PHPSESSID=aaaaaaaaaaaaaaaa" in values
+    assert "aaaaaaaaaaaaaaaa" in values
+    assert "Authorization: Bearer tok-attacker-1" in values
+    assert "Bearer tok-attacker-1" in values
+    # reference 会话五形态（完整 Cookie 头/k=v 对/长裸值/头对/头裸值）
+    assert "phsess=bbbbbbbbbbbbbbbb" in values
+    assert "bbbbbbbbbbbbbbbb" in values
+    assert "X-Api-Key: victim-key-999" in values
+    assert "victim-key-999" in values
+    # 两会话 Cookie 头渲染不串：cookie_header() 仅主会话
+    assert dual.cookie_header() == "PHPSESSID=aaaaaaaaaaaaaaaa"
+    redacted = redact_text(
+        "Cookie: phsess=bbbbbbbbbbbbbbbb / X-Api-Key: victim-key-999", values
+    )
+    assert "bbbbbbbbbbbbbbbb" not in redacted
+    assert "victim-key-999" not in redacted
+
+
+def test_no_reference_session_values_unchanged():
+    """reference=None（缺省）时与单会话模型逐字节等价（回归锁）。"""
+    single = SessionConfig(
+        cookies={"PHPSESSID": "df6a4b9c0e1f2a3b4c5d6e7f890abcde", "security": "low"},
+        headers={"Authorization": "Bearer tok-secret-123"},
+    )
+    assert single.reference is None
+    assert single.secret_values() == SESSION.secret_values()
+    # 旧 session.json（无 reference 键）回放兼容
+    legacy = SessionConfig(**{"cookies": {"a": "b"}})
+    assert legacy.reference is None
+
+
 def test_secret_marker_is_sha256_prefix8():
     marker = secret_marker(COOKIE)
     assert marker.startswith("sha256:")

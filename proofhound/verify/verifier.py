@@ -47,7 +47,11 @@ SYSTEM_PROMPT = """\
 若摘要不足以支撑结论，一律判 reject 并在 reason 说明缺什么。
 确认手段语义：sqlmap-confirmed = sqlmap 明确判定注入点；browser-confirmed =
 无头浏览器（playwright chromium）canary 探针捕获 payload 执行事件——XSS 的
-唯一认可确认手段，仅"响应反射输入"不得判 confirm。
+唯一认可确认手段，仅"响应反射输入"不得判 confirm。dual-session-confirmed =
+双会话属性对比：身份 A（低权限）会话与身份 B（reference/victim，对象属主）
+会话请求同 URL，判定 JSON 中相似度/键重叠达写死阈值且属性违反成立——IDOR 的
+唯一认可确认手段，仅单会话异常响应（无双会话对照）不得判 confirm；复核要点：
+B 基准是否成立（2xx 实质数据）、判定数值是否达阈值、对象是否确属 B 私有。
 
 CVSS 评分职责（仅 confirm 时）：你必须同时给出 cvss_vector（CVSS v3.1 base 向量，
 恰好包含 8 个指标，形如 CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H）与

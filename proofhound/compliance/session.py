@@ -12,6 +12,9 @@
   stdout 回显 ``Cookie:`` 请求头，凭据原文随证据包外发不可接受；脱敏在
   落盘前完成，审计中的输出哈希与落盘内容一致（证据链不断裂）。非会话类
   秘密（工具自行打印的 token 等）不在其列，属已知限制。
+- M8c 双会话：``SessionConfig.reference`` 可选第二身份会话
+  （reference/victim），``secret_values()`` 递归覆盖两个会话的全部秘密
+  值——脱敏口子不变，verify-idor 双会话属性验证的两份凭据同纪律脱敏。
 """
 
 from __future__ import annotations
@@ -25,29 +28,41 @@ MIN_SECRET_LEN = 8
 
 
 class SessionConfig(BaseModel):
-    """预置会话：Cookie 键值对 + 额外请求头（如 Authorization）。"""
+    """预置会话：Cookie 键值对 + 额外请求头（如 Authorization）。
+
+    M8c 起支持可选第二身份会话 ``reference``（reference/victim 身份，
+    字段与主会话同构），供 verify-idor 双会话属性验证使用；缺省 None
+    时与单会话模型逐字节等价，现有全部链路零影响。
+    """
 
     cookies: dict[str, str] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
+    reference: SessionConfig | None = None
 
     def cookie_header(self) -> str:
         """渲染 Cookie 请求头值：``k1=v1; k2=v2``（无 cookie 时为空串）。"""
         return "; ".join(f"{k}={v}" for k, v in self.cookies.items())
 
     def secret_values(self) -> list[str]:
-        """需要脱敏的精确子串清单（空串剔除）。
+        """需要脱敏的精确子串清单（空串剔除，覆盖主会话与第二身份会话）。
 
         收录形态：渲染后的完整 Cookie 头、每个 ``k=v`` 对、每个 ``k: v``
         请求头对——覆盖工具输出的常见回显形态；裸值仅当其长度 ≥ 8 才收录
         （实靶教训：`security=low` 的裸值 ``low`` 会把 "fol**low**ing"
         这类正常单词替换坏，短值只经 ``k=v`` 对形态脱敏，防 collateral
         damage 破坏证据文本与解析锚点）。
+
+        脱敏是两个会话都要（红线 5）：``reference`` 存在时递归并入其全部
+        秘密值——沙箱 runner、浏览器验证器、编排层证据落盘均经本方法一个
+        口子取脱敏清单，双会话凭据同纪律覆盖。
         """
         values = [self.cookie_header()]
         values.extend(f"{k}={v}" for k, v in self.cookies.items())
         values.extend(v for v in self.cookies.values() if len(v) >= MIN_SECRET_LEN)
         values.extend(f"{k}: {v}" for k, v in self.headers.items())
         values.extend(v for v in self.headers.values() if len(v) >= MIN_SECRET_LEN)
+        if self.reference is not None:
+            values.extend(self.reference.secret_values())
         return [v for v in values if v]
 
 

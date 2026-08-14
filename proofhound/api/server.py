@@ -86,6 +86,7 @@ def _engagement_summary(eng: Engagement) -> dict:
         "autonomy_mode": eng.current_mode().value,
         "created_at": eng.created_at,
         "with_session": eng.with_session,
+        "with_reference_session": eng.with_reference_session,  # M8c
         "findings": _findings_counts(eng),
     }
 

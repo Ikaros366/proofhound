@@ -219,12 +219,18 @@ def test_forms_share_sqli_cap_with_get_param(triage_env):
     orch.run_triage_phase()
 
     store = FindingStore(evidence_dir / "findings.jsonl")
-    assert len(store.load_all()) == 20  # 12 get_param + 8 form_page
+    # sqli 12 get_param + 8 form_page = 20 满；M8c：get_param 的 id 键另产
+    # idor 候选（独立上限 10，与 sqli 共享计数器无涉）
+    findings = store.load_all()
+    assert sum(1 for f in findings if f.vuln_type == "sqli") == 20
+    assert sum(1 for f in findings if f.vuln_type == "idor") == 10
     capped = [e for e in audit.read_all() if e["event"] == "triage_capped"]
-    assert len(capped) == 1
-    assert capped[0]["dropped"] == 5
+    assert len(capped) == 2  # sqli 与 idor 各自独立记一条
+    by_type = {e["vuln_type"]: e for e in capped}
+    assert by_type["sqli"]["dropped"] == 5
+    assert by_type["idor"]["dropped"] == 2  # 12 条 get_param 的 idor 候选建 10 丢 2
     summary = _summary(audit)
-    assert summary["created_by_source"] == {"get_param": 12, "form_page": 8}
+    assert summary["created_by_source"] == {"get_param": 22, "form_page": 8}
 
 
 def test_forms_out_of_scope_dropped(triage_env):

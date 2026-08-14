@@ -28,6 +28,21 @@
 4. **模型按任务分级**：解析/润色用廉价模型，漏洞假设与 Verifier 用前沿模型；Verifier 与发现端必须用不同模型。
 5. **授权前置**：scope 强制校验、预算帽、append-only 审计日志在任何自治模式下都不可绕过。
 
+## 定位与边界
+
+**ProofHound 不是又一个漏洞扫描器。** 扫描器输出的是"可能存在"——数千条特征签名筛出的 Potential 列表，真假交人工复核；ProofHound 输出的是"已行为确认 + 证据链"——每条 Confirmed 都经行为复现、证据门与独立模型对抗终审，附带可离线调出的完整证据包。
+
+当前的刻意取舍：
+
+| 维度 | ProofHound | 传统扫描器 |
+|---|---|---|
+| 漏洞类型覆盖 | 少而精：只做能行为确认的类型（当前 SQL 注入、XSS、IDOR/水平越权三条验证切片） | 数千条特征签名，广而浅 |
+| 输出语义 | Confirmed 即铁证：行为验证 + 证据链 + Verifier 终审 + CVSS 代码算分 | Potential 待人工，误报率自担 |
+| 发现面 | Web 应用层（katana 爬行带参端点 + POST 表单页） | 主机/端口/服务/全协议 |
+| 误报治理 | 多道闸：triage 启发式宁漏勿滥 → 行为验证 → 证据门 → Verifier 对抗校验 | 主要靠特征精度 |
+
+覆盖广度沿路线图渐进扩展，但纪律不变：**新漏洞类型必须先过"能否行为确认"这一关**——不能行为确认的宁可不做，绝不为凑覆盖率引入"疑似即确认"的降级路径。
+
 ## Quickstart：十分钟复现（DVWA 全流程）
 
 目标：全新机器从零 → DVWA 靶场 → 创建任务 → 批准 L2 → Confirmed → 出报告。
@@ -166,9 +181,9 @@ tools.d/dirsearch/
 
 ## 路线图与已知限制
 
-已完成：M1 工具底座（manifest/安装器/沙箱/scope/审计）→ M2 Skill 系统 + 编排器 + 模型路由预算 → M3 Finding 生命周期 + 证据门 + Verifier + verify-sqli 垂直切片 + katana 发现自动化 → M4 报告引擎 + 模板适配 → M5 Web API + 自主模式闸门 + 本地控制台 → M6 稳定性加固 + 管理面 + CVSS 真实化 + 叙事事实守卫。M7 开源准备即本仓库当前形态。待做：PDF 报告管线、verify-xss/verify-lfi、LLM triage、成本仪表盘、MCP 暴露、持续监测。
+已完成：M1 工具底座（manifest/安装器/沙箱/scope/审计）→ M2 Skill 系统 + 编排器 + 模型路由预算 → M3 Finding 生命周期 + 证据门 + Verifier + verify-sqli 垂直切片 + katana 发现自动化 → M4 报告引擎 + 模板适配 → M5 Web API + 自主模式闸门 + 本地控制台 → M6 稳定性加固 + 管理面 + CVSS 真实化 + 叙事事实守卫。M7 开源准备即本仓库当前形态；M8 验证场景扩展进行中：已完成 POST 表单发现自动化、verify-xss（浏览器 canary 行为确认）、verify-idor（双会话属性验证）。待做：PDF 报告管线、verify-lfi、垂直越权/多步业务流验证、stored/DOM 型 XSS、LLM triage、成本仪表盘、MCP 暴露、持续监测。
 
-已知限制摘要（完整清单见 [AGENTS.md](AGENTS.md)「已知限制」）：行为验证仅 sqli 一条垂直切片；发现自动化仅覆盖 GET 查询参数端点；API 无认证；沙箱出口白名单仅覆盖 HTTP(S)；控制台为轮询无 WebSocket；报告仅 docx。
+已知限制摘要（完整清单见 [AGENTS.md](AGENTS.md)「已知限制」）：行为验证为 sqli/xss/IDOR 三条垂直切片（各有限定场景——sqli 覆盖 GET 参数与 POST 表单、XSS 仅 reflected/GET、IDOR 仅水平越权 GET 对象且需双身份会话）；发现自动化覆盖 GET 查询参数端点与 POST 表单页；API 无认证；沙箱出口白名单仅覆盖 HTTP(S)；控制台为轮询无 WebSocket；报告仅 docx。
 
 ## 贡献
 

@@ -31,7 +31,7 @@ class GateRequirement:
 
 
 # 证据门矩阵（§5.4.2 表的代码化；sqli 落自 M3b，xss 落自 M8b，
-# 其余类型随 verify-* skill 扩展）
+# idor 落自 M8c，其余类型随 verify-* skill 扩展）
 GATE_MATRIX: dict[str, GateRequirement] = {
     "sqli": GateRequirement(
         methods=frozenset({"sqlmap-confirmed", "boolean-diff", "time-blind-diff"}),
@@ -40,6 +40,11 @@ GATE_MATRIX: dict[str, GateRequirement] = {
     # M8b：XSS 唯一认可确认手段 = 无头浏览器 canary 执行事件（反射不算证据）
     "xss": GateRequirement(
         methods=frozenset({"browser-confirmed"}),
+        behavioral_kinds=frozenset({BEHAVIORAL_EVIDENCE_KIND}),
+    ),
+    # M8c：IDOR 唯一认可确认手段 = 双会话属性违反（单会话异常响应不确认）
+    "idor": GateRequirement(
+        methods=frozenset({"dual-session-confirmed"}),
         behavioral_kinds=frozenset({BEHAVIORAL_EVIDENCE_KIND}),
     ),
 }

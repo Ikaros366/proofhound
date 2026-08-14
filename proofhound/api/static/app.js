@@ -134,6 +134,14 @@ function renderList(view) {
   cookieInput.placeholder = 'k=v; k=v（可选预置会话；提交后界面不再出现）';
   grid.appendChild(field('会话 Cookie（可选）', cookieInput, 'full'));
 
+  // M8c：第二身份会话（reference/victim），verify-idor 双会话属性验证用；
+  // 不传 = 单会话（现有行为不变），同主 cookie 纪律（提交即清、零存储）
+  const refCookieInput = el('input');
+  refCookieInput.type = 'password';
+  refCookieInput.autocomplete = 'off';
+  refCookieInput.placeholder = 'k=v; k=v（可选第二身份，IDOR 双会话验证；提交后界面不再出现）';
+  grid.appendChild(field('第二身份会话 Cookie（可选）', refCookieInput, 'full'));
+
   // 报告 extras（可选，写 engagement.json 透传进模板；自定义企业模板封面三件套）
   const extrasInputs = [
     ['company_name', '单位名称（可选）', '报告 extras：company_name'],
@@ -201,6 +209,8 @@ function renderList(view) {
     }
     const cookie = cookieInput.value;
     if (cookie.trim()) body.cookie = cookie;
+    const refCookie = refCookieInput.value;
+    if (refCookie.trim()) body.reference_cookie = refCookie;
     const extras = {};
     extrasInputs.forEach(([key, input]) => {
       if (input.value.trim()) extras[key] = input.value.trim();
@@ -209,6 +219,7 @@ function renderList(view) {
     if (budgetInput.value.trim() !== '') body.budget = Number(budgetInput.value);
     // cookie 纪律：提交后立即清空，不缓存、不回显、不写任何存储
     cookieInput.value = '';
+    refCookieInput.value = '';
     submitBtn.disabled = true;
     try {
       const eng = await api('/api/engagements', { method: 'POST', body });

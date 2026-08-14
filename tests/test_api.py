@@ -499,6 +499,94 @@ def test_malformed_cookie_rejected_422(client):
     assert resp.status_code == 422
 
 
+# ---- M8c：第二身份会话（reference/victim） ----
+
+REF_COOKIE_VALUE = "a1b2c3d4e5f60718"
+
+
+def test_reference_cookie_stored_and_never_in_response(client, workspace):
+    """reference_cookie：写 session.json reference 结构（0600），永不进任何响应体。"""
+    eng_id = _create(
+        client,
+        cookie=f"PHPSESSID={COOKIE_VALUE}",
+        reference_cookie=f"phsess={REF_COOKIE_VALUE}",
+    )
+    detail = client.get(f"/api/engagements/{eng_id}")
+    assert detail.json()["with_session"] is True
+    assert detail.json()["with_reference_session"] is True
+    assert REF_COOKIE_VALUE not in detail.text
+    listing = client.get("/api/engagements")
+    assert REF_COOKIE_VALUE not in listing.text
+    # session.json：reference 嵌套结构 + 0600
+    session_path = _eng_dir(workspace, eng_id) / "session.json"
+    assert stat.S_IMODE(session_path.stat().st_mode) == 0o600
+    data = json.loads(session_path.read_text(encoding="utf-8"))
+    assert data["cookies"] == {"PHPSESSID": COOKIE_VALUE}
+    assert data["reference"] == {"cookies": {"phsess": REF_COOKIE_VALUE}}
+    # 跑完全程：审计只记布尔标记，无凭据原文
+    _run_unattended_to_done(client, eng_id)
+    audit = client.get(f"/api/engagements/{eng_id}/audit")
+    assert REF_COOKIE_VALUE not in audit.text
+    assert COOKIE_VALUE not in audit.text
+    assert "with_reference_session" in audit.text
+
+
+def test_without_reference_cookie_behaves_as_before(client, workspace):
+    """不传 reference_cookie = 单会话（现有行为不变，session.json 无 reference 键）。"""
+    eng_id = _create(client, cookie=f"PHPSESSID={COOKIE_VALUE}")
+    detail = client.get(f"/api/engagements/{eng_id}")
+    assert detail.json()["with_session"] is True
+    assert detail.json()["with_reference_session"] is False
+    data = json.loads(
+        (_eng_dir(workspace, eng_id) / "session.json").read_text(encoding="utf-8")
+    )
+    assert "reference" not in data
+
+
+def test_malformed_reference_cookie_rejected_422(client, workspace):
+    """畸形 reference_cookie 同样 422 且零副作用（不建任何目录）。"""
+    resp = client.post(
+        "/api/engagements",
+        json={
+            "target": "http://127.0.0.1:8080",
+            "scope_paths": ["scope.yaml"],
+            "reference_cookie": "not-a-cookie",
+        },
+    )
+    assert resp.status_code == 422
+    engagements_dir = workspace / "engagements"
+    assert not engagements_dir.exists() or not list(engagements_dir.iterdir())
+
+
+def test_load_session_builds_nested_reference(tmp_path):
+    """_load_session：reference 键构造嵌套 SessionConfig；旧格式兼容 None。"""
+    from types import SimpleNamespace
+
+    from proofhound.api.runner import EngagementManager
+
+    (tmp_path / "session.json").write_text(
+        json.dumps(
+            {
+                "cookies": {"PHPSESSID": "x" * 16},
+                "reference": {"cookies": {"phsess": "y" * 16}},
+            }
+        ),
+        encoding="utf-8",
+    )
+    session = EngagementManager._load_session(SimpleNamespace(dir=tmp_path))
+    assert session.cookies == {"PHPSESSID": "x" * 16}
+    assert session.reference is not None
+    assert session.reference.cookies == {"phsess": "y" * 16}
+    # 两会话秘密值均被脱敏清单覆盖
+    assert "y" * 16 in session.secret_values()
+    # 旧格式（无 reference 键）回放兼容
+    (tmp_path / "session.json").write_text(
+        json.dumps({"cookies": {"a": "b"}}), encoding="utf-8"
+    )
+    session = EngagementManager._load_session(SimpleNamespace(dir=tmp_path))
+    assert session.reference is None
+
+
 def test_extras_written_to_engagement_json(client, workspace):
     """报告 extras（M4.5 透传）：创建时写入 engagement.json，审计记键名。"""
     eng_id = _create(

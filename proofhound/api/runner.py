@@ -235,6 +235,8 @@ class Engagement:
         self.budget: int | None = meta.get("budget")
         self.created_at: str = meta["created_at"]
         self.with_session: bool = bool(meta.get("with_session"))
+        # M8c：第二身份会话（reference/victim）是否配置（值永不进响应体）
+        self.with_reference_session: bool = bool(meta.get("with_reference_session"))
         self._mode = AutonomyMode(meta["autonomy_mode"])
         self._state = EngagementState(meta["state"])
         self._lock = threading.RLock()
@@ -282,6 +284,7 @@ class Engagement:
             "state": self._state.value,
             "created_at": self.created_at,
             "with_session": self.with_session,
+            "with_reference_session": self.with_reference_session,
         }
         (self.dir / "api.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -588,6 +591,9 @@ class OrchestratorPhases:
     verify-xss），供 EngagementRunner 逐 skill 过闸（沿用 scan_skills 的
     getattr 回退先例）；verify-xss 未注册/未启用则跳过并记审计
     ``verify_skill_skipped``（XSS 浏览器验证是增强项，缺失不阻塞主链路）。
+
+    M8c：``verify_skills`` 增第三槽位 verify-idor（IDOR 双会话属性验证），
+    未注册/未启用同样记 ``verify_skill_skipped`` 跳过（增强项不阻塞主链路）。
     """
 
     def __init__(
@@ -599,6 +605,7 @@ class OrchestratorPhases:
         verify_skill: str = "verify-sqli",
         crawl_skill: str = "recon-crawl",
         verify_xss_skill: str = "verify-xss",
+        verify_idor_skill: str = "verify-idor",
     ):
         self._orch = orchestrator
         self.scan_skill = scan_skill
@@ -632,6 +639,17 @@ class OrchestratorPhases:
             )
         else:
             self.verify_skills.append((verify_xss_skill, xss.manifest.risk_level))
+        # M8c：第三 verify skill 槽位（IDOR 双会话验证是增强项，缺失不阻塞主链路）
+        idor = registry.get(verify_idor_skill)
+        if idor is None or not idor.enabled:
+            reason = "skill 未注册" if idor is None else "skill 未启用"
+            orchestrator.audit.record(
+                "verify_skill_skipped",
+                skill=verify_idor_skill,
+                reason=f"{reason}，跳过 IDOR 双会话验证",
+            )
+        else:
+            self.verify_skills.append((verify_idor_skill, idor.manifest.risk_level))
 
     def scan(self, targets: list[str]) -> None:
         self._orch.run_scan_phase(targets, skill_name=self.scan_skill)
@@ -815,7 +833,18 @@ class EngagementManager:
         if not session_path.is_file():
             return None
         data = json.loads(session_path.read_text(encoding="utf-8"))
-        return SessionConfig(cookies=data.get("cookies", {}))
+        reference = None
+        raw_reference = data.get("reference")  # M8c：第二身份会话（可无）
+        if isinstance(raw_reference, dict):
+            reference = SessionConfig(
+                cookies=raw_reference.get("cookies", {}),
+                headers=raw_reference.get("headers", {}),
+            )
+        return SessionConfig(
+            cookies=data.get("cookies", {}),
+            headers=data.get("headers", {}),
+            reference=reference,
+        )
 
     # ---- engagement CRUD ----
 
@@ -828,17 +857,20 @@ class EngagementManager:
         directory.mkdir(parents=True)
         created_at = _utc_now()
 
-        if request.cookie is not None:
+        if request.cookie is not None or request.reference_cookie is not None:
             from proofhound.api.models import parse_cookie
 
+            session_data: dict = {}
+            if request.cookie is not None:
+                session_data["cookies"] = parse_cookie(request.cookie)
+            if request.reference_cookie is not None:
+                # M8c：第二身份会话（reference/victim，verify-idor 双会话验证用）
+                session_data["reference"] = {
+                    "cookies": parse_cookie(request.reference_cookie)
+                }
             session_path = directory / "session.json"
             session_path.write_text(
-                json.dumps(
-                    {"cookies": parse_cookie(request.cookie)},
-                    ensure_ascii=False,
-                    indent=2,
-                )
-                + "\n",
+                json.dumps(session_data, ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
             )
             session_path.chmod(0o600)  # 凭据文件 0600
@@ -852,6 +884,7 @@ class EngagementManager:
             "state": EngagementState.CREATED.value,
             "created_at": created_at,
             "with_session": request.cookie is not None,
+            "with_reference_session": request.reference_cookie is not None,  # M8c
         }
         eng = Engagement(self, directory, meta)
         eng._persist()
@@ -882,6 +915,7 @@ class EngagementManager:
             autonomy_mode=meta["autonomy_mode"],
             budget=request.budget,
             with_session=meta["with_session"],
+            with_reference_session=meta["with_reference_session"],  # M8c
             extras=sorted(request.extras or {}),  # 只记键名
         )
         with self._lock:

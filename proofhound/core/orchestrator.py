@@ -18,6 +18,13 @@ tools/build.py 拼装 argv（红线 1：LLM 不碰命令）→ SandboxRunner 执
   ``triage_capped`` 计数），verify 阶段新增 ``_verify_xss``——无头
   Chromium canary 探针行为确认（``verify/browser.py``，first-party
   验证器），method=browser-confirmed 过证据门 + Verifier 终审；
+  M8c 再扩展：param-endpoint 再按 ``_IDOR_PARAM_HINTS`` 展开 idor
+  候选（独立上限 10、独立 ``triage_capped``），verify 阶段新增
+  ``_verify_idor``——双会话属性验证（``verify/idor.py``，first-party
+  纯 stdlib 验证器）：B（reference/victim）会话基准 → A 会话对比 →
+  确定性属性判定（相似度/键重叠写死阈值），method=dual-session-confirmed
+  过证据门 + Verifier 终审；第二身份会话挂
+  ``SessionConfig.reference``，脱敏递归覆盖两会话；
 - 失败预算：同类失败默认上限 2 次，命中置 blocked 并升级（task_blocked）；
   验证码/锁定一次即硬阻塞；scope 拒绝与命令构造失败视为规划缺陷，
   直接 failed、不重试；
@@ -41,7 +48,7 @@ from pydantic import ValidationError
 
 from proofhound.compliance.audit import AuditLog
 from proofhound.compliance.scope import check_scope
-from proofhound.compliance.session import SessionConfig, secret_marker
+from proofhound.compliance.session import SessionConfig, redact_bytes, secret_marker
 from proofhound.findings.dedup import compute_dedup_key
 from proofhound.findings.evidence import assemble_evidence_pack
 from proofhound.findings.finding import (
@@ -82,6 +89,10 @@ from proofhound.verify.cvss import base_score as cvss_base_score
 from proofhound.verify.cvss import severity_for_score
 from proofhound.verify.gate import BEHAVIORAL_EVIDENCE_KIND
 from proofhound.verify.gate import check as gate_check
+from proofhound.verify.idor import fetch as idor_fetch_default
+from proofhound.verify.idor import has_substance as idor_has_substance
+from proofhound.verify.idor import judge as idor_judge
+from proofhound.verify.idor import judgment_dict as idor_judgment_dict
 from proofhound.verify.verifier import Verifier, VerifierError
 
 _OUTPUT_SAMPLE_LIMIT = 4096  # 失败分类的输出采样上限（字节）
@@ -116,6 +127,20 @@ _XSS_PARAM_HINTS = frozenset(
 
 # M8b：每 engagement 新建 xss Hypothesis 上限（独立计数、独立 triage_capped 事件）
 _TRIAGE_XSS_CAP = 10
+
+# M8c：param-endpoint → idor 假设的参数键启发式（保守表：对象标识类键名；
+# 与 _SQLI_PARAM_HINTS 有交集——交集参数会同产 sqli+idor 候选，dedup 按
+# vuln_type 分量区分互不合并，各自消耗一次 L2 确认；刻意不收 name 等泛化键，
+# 收窄爆炸半径）
+_IDOR_PARAM_HINTS = frozenset(
+    {
+        "id", "uid", "user", "userid", "user_id", "account", "order",
+        "invoice", "doc", "document", "record", "file",
+    }
+)
+
+# M8c：每 engagement 新建 idor Hypothesis 上限（独立计数、独立 triage_capped 事件）
+_TRIAGE_IDOR_CAP = 10
 
 # param-endpoint 候选的证据种类标签（爬行发现的带参端点，非行为证据）
 CRAWL_ENDPOINT_EVIDENCE_KIND = "crawl-endpoint"
@@ -206,6 +231,20 @@ def _triage_candidates(signal: Signal) -> list[_TriageCandidate]:
             for key in keys
             if key in _XSS_PARAM_HINTS
         )
+        # M8c：同一份 query 键再按 IDOR 提示表展开 idor 候选（与 sqli 表
+        # 交集参数同产是设计行为——id 类键既可能注入也可能越权，各自经
+        # 独立 verify skill 行为验证）
+        candidates.extend(
+            _TriageCandidate(
+                vuln_type="idor",
+                param=key,
+                severity="medium",
+                evidence_kind=CRAWL_ENDPOINT_EVIDENCE_KIND,
+                source="get_param",
+            )
+            for key in keys
+            if key in _IDOR_PARAM_HINTS
+        )
         return candidates
     if signal.kind == "form_page":
         # M8a：表单字段名命中提示表 → 每字段一条候选（dedup 带 param 分量）；
@@ -281,6 +320,7 @@ class Orchestrator:
         context_policy: ContextPolicy | None = None,
         tool_images: dict | None = None,
         browser_factory=None,
+        idor_fetch=None,
     ):
         # llm 接受 ModelRouter（M2c 推荐：选路/计量/预算硬闸在路由层）；
         # 旧式单模型客户端由 Planner 自动包装适配（不计量）。
@@ -303,6 +343,9 @@ class Orchestrator:
         # _verify_xss 懒建真实 BrowserVerifier 并缓存于 self._browser）
         self.browser_factory = browser_factory
         self._browser = None
+        # M8c：verify-idor 的取数注入口子（测试给罐头 fetch；None 时用
+        # verify/idor.py 的真实 stdlib fetch）
+        self._idor_fetch = idor_fetch if idor_fetch is not None else idor_fetch_default
 
     def run_scan_phase(self, targets: list[str], *, skill_name: str = "web-scan") -> TaskNode:
         """跑 scan 阶段：每目标一个子任务并行，返回阶段节点（含整棵树）。"""
@@ -355,6 +398,10 @@ class Orchestrator:
         M8b：param-endpoint 另按 ``_XSS_PARAM_HINTS`` 展开 xss 候选
         （两表交集参数同产两类候选，dedup 按 vuln_type 分量区分）；
         xss 独立上限 ``_TRIAGE_XSS_CAP`` 与独立 ``triage_capped`` 事件。
+
+        M8c：param-endpoint 再按 ``_IDOR_PARAM_HINTS`` 展开 idor 候选
+        （对象标识类键名保守表；与 sqli 表交集参数同产是设计行为）；
+        idor 独立上限 ``_TRIAGE_IDOR_CAP`` 与独立 ``triage_capped`` 事件。
         """
         store = FindingStore(self.evidence_dir / "findings.jsonl")
         signals, skipped = self._load_phase_signals()
@@ -362,6 +409,7 @@ class Orchestrator:
         existing_all = store.load_all()
         sqli_existing = sum(1 for f in existing_all if f.vuln_type == "sqli")
         xss_existing = sum(1 for f in existing_all if f.vuln_type == "xss")  # M8b
+        idor_existing = sum(1 for f in existing_all if f.vuln_type == "idor")  # M8c
         findings: list[Finding] = []
         created = merged = kept = 0
         capped_by_type: dict[str, int] = {}  # M8b：按 vuln_type 分立 triage_capped
@@ -422,6 +470,10 @@ class Orchestrator:
                     # M8b：xss 独立上限（与 sqli 互不挤占）
                     capped_by_type["xss"] = capped_by_type.get("xss", 0) + 1
                     continue
+                if cand.vuln_type == "idor" and idor_existing >= _TRIAGE_IDOR_CAP:
+                    # M8c：idor 独立上限（与 sqli/xss 互不挤占）
+                    capped_by_type["idor"] = capped_by_type.get("idor", 0) + 1
+                    continue
                 finding = Finding(
                     id=store.next_id(),
                     state=FindingState.SIGNAL,
@@ -455,12 +507,18 @@ class Orchestrator:
                     sqli_existing += 1
                 if cand.vuln_type == "xss":
                     xss_existing += 1
+                if cand.vuln_type == "idor":
+                    idor_existing += 1
                 signal_mapped = True
                 findings.append(finding)
             if not signal_mapped:
                 kept += 1
-        # M8b：triage_capped 按 vuln_type 分立事件（sqli/xss 各自上限各自记）
-        for vuln_type, limit in (("sqli", _TRIAGE_SQLI_CAP), ("xss", _TRIAGE_XSS_CAP)):
+        # M8b/M8c：triage_capped 按 vuln_type 分立事件（各自上限各自记）
+        for vuln_type, limit in (
+            ("sqli", _TRIAGE_SQLI_CAP),
+            ("xss", _TRIAGE_XSS_CAP),
+            ("idor", _TRIAGE_IDOR_CAP),
+        ):
             dropped = capped_by_type.get(vuln_type, 0)
             if dropped:
                 self.audit.record(
@@ -506,6 +564,8 @@ class Orchestrator:
             "verify-sqli": (frozenset({"sqli"}), self._verify_sqli),
             # M8b：无头浏览器 canary 行为确认（XSS 唯一确认门径）
             "verify-xss": (frozenset({"xss"}), self._verify_xss),
+            # M8c：双会话属性验证（IDOR 唯一确认门径）
+            "verify-idor": (frozenset({"idor"}), self._verify_idor),
         }
 
     def verify_skill_coverage(self, skill_name: str = "verify-sqli") -> frozenset[str]:
@@ -921,6 +981,196 @@ class Orchestrator:
 
         # 6. 证据门 → Verifier 终审 → 终态（与 verify-sqli 同一收尾）
         return self._gate_and_review(finding, skill, store)
+
+    def _verify_idor(self, finding: Finding, skill, store: FindingStore) -> str:
+        """verify-idor SOP（skills/verify-idor/SKILL.md）的确定性执行（M8c）。
+
+        确认铁律：**仅双会话属性违反可确认**——B（reference/victim，对象
+        属主）会话基准成立（2xx 实质数据）且 A（主会话，低权限身份）会话
+        同 URL 请求获得等价响应（正文相似度/JSON 键重叠达写死阈值）；
+        单会话异常响应永远不是证据。判定不成立（A 被 403/404/重定向登录页
+        /数据不相似）→ rejected；网络错误、B 基准不成立等覆盖不全形态 →
+        blocked（不驳回，fail-closed）。请求构造与属性判定全是确定性代码
+        （红线 1），唯一 LLM 调用是收尾的 Verifier 终审。
+        """
+        session = self._session()
+        if session is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="scope 未配置预置会话（session），idor 验证需要身份 A 会话",
+            )
+            return "blocked"
+        reference = session.reference
+        if reference is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=(
+                    "idor 验证需要配置第二身份会话（reference/victim）："
+                    "缺第二会话无法做双会话属性对比（fail-closed）"
+                ),
+            )
+            return "blocked"
+        scope = getattr(self.runner, "scope", None)
+        if scope is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="runner 未挂 scope，idor 验证缺 scope 防线（fail-closed）",
+            )
+            return "blocked"
+        url = finding.asset
+        decision = check_scope(scope, [url])  # 红线 5：请求任何 URL 前过 scope
+        if not decision.allowed:
+            self.audit.record(
+                "verify_scope_rejected",
+                finding_id=finding.id,
+                violations=decision.violations,
+            )
+            return "blocked"
+        # 脱敏清单递归覆盖两个会话（M8c：脱敏是两个会话都要）
+        secrets = session.secret_values()
+
+        # 1. B 会话基准请求（reference/victim，对象属主；每次请求按次记审计）
+        resp_b = self._idor_fetch(url, reference)
+        self.audit.record(
+            "idor_probe_attempt",
+            finding_id=finding.id,
+            role="reference",
+            status=resp_b.status,
+            error=resp_b.error is not None,
+        )
+        b_path = self._idor_write_response(finding.id, "b", resp_b, secrets)
+        if resp_b.error is not None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=f"B 基准请求失败（覆盖不全，不驳回）: {resp_b.error}",
+            )
+            return "blocked"
+        if not idor_has_substance(resp_b):
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=(
+                    f"B 基准不成立（状态 {resp_b.status} 或无实质数据；"
+                    "属性不可测，覆盖不全不驳回）"
+                ),
+            )
+            return "blocked"
+
+        # 2. A 会话对比请求（主会话，低权限身份）
+        resp_a = self._idor_fetch(url, session)
+        self.audit.record(
+            "idor_probe_attempt",
+            finding_id=finding.id,
+            role="attacker",
+            status=resp_a.status,
+            error=resp_a.error is not None,
+        )
+        a_path = self._idor_write_response(finding.id, "a", resp_a, secrets)
+        if resp_a.error is not None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=f"A 对比请求失败（覆盖不全，不驳回）: {resp_a.error}",
+            )
+            return "blocked"
+
+        # 3. 确定性属性判定（阈值写死；判定依据全量结构化落盘）
+        judgment = idor_judge(resp_b, resp_a)
+        j_path = self.evidence_dir / f"idor_{finding.id}_judgment.json"
+        j_path.write_bytes(
+            redact_bytes(
+                (
+                    json.dumps(
+                        idor_judgment_dict(finding.id, url, judgment),
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+                secrets,
+            )
+        )
+        overlap_text = (
+            "—" if judgment.json_overlap is None else f"{judgment.json_overlap:.3f}"
+        )
+        if not judgment.violation:
+            finding.transition(
+                FindingState.REJECTED,
+                actor=skill.name,
+                reason=(
+                    f"双会话属性判定不成立：A 会话 {resp_a.status}，"
+                    f"与 B 基准正文相似度 {judgment.similarity:.3f}、"
+                    f"JSON 键重叠 {overlap_text}，未达属性违反阈值"
+                ),
+            )
+            store.append(finding)
+            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+            return "rejected"
+
+        # 4. 属性违反成立：证据入包（behavioral + dual-session-confirmed + 四段式）
+        cookie_mark_a = secret_marker(session.cookie_header())
+        cookie_mark_b = secret_marker(reference.cookie_header())
+        finding.verification = Verification(
+            method="dual-session-confirmed",
+            evidence_refs=[str(b_path), str(a_path), str(j_path)],
+            baseline_diff=(
+                f"B 会话基准 {resp_b.status}（reference/victim，实质数据 "
+                f"{len(resp_b.body.strip())} 字节）；A 会话对比 {resp_a.status}；"
+                f"正文相似度 {judgment.similarity:.3f}（阈值 0.9）；"
+                f"JSON 键重叠 {overlap_text}（阈值 0.8）"
+            ),
+            claim=f"身份 A 可经参数 {finding.param or 'URL'} 访问身份 B 的私有对象",
+            expected=(
+                "A 会话请求同 URL 应被拒绝（403/404/重定向登录页）"
+                "或返回与 B 基准不同的数据"
+            ),
+            actual=(
+                f"A 会话获得 {resp_a.status} 且与 B 基准达到属性违反阈值"
+                f"（正文相似度 {judgment.similarity:.3f}、JSON 键重叠 "
+                f"{overlap_text}）；判定依据见 {j_path.name}"
+            ),
+            reproduction_steps=[
+                f"以身份 B 会话（reference/victim，Cookie {cookie_mark_b}）"
+                f"GET {url} → 基准 {resp_b.status}（实质数据）",
+                f"以身份 A 会话（Cookie {cookie_mark_a}）GET {url} "
+                f"→ 对比 {resp_a.status}",
+                "确定性属性判定（verify/idor.py）：正文相似度 "
+                f"{judgment.similarity:.3f}（阈值 0.9）、JSON 键重叠 "
+                f"{overlap_text}（阈值 0.8）→ 属性违反成立",
+            ],
+            verified_by=f"{skill.name}@{skill.manifest.version}",
+            verified_at=_utc_now(),
+        )
+        if BEHAVIORAL_EVIDENCE_KIND not in finding.evidence_kinds:
+            finding.evidence_kinds.append(BEHAVIORAL_EVIDENCE_KIND)
+        finding.transition(
+            FindingState.REPRODUCED,
+            actor=skill.name,
+            reason=(
+                f"双会话属性违反成立（A 会话 {resp_a.status}，"
+                f"相似度 {judgment.similarity:.3f}）"
+            ),
+        )
+        store.append(finding)
+
+        # 5. 证据门 → Verifier 终审 → 终态（与 verify-sqli/xss 同一收尾）
+        return self._gate_and_review(finding, skill, store)
+
+    def _idor_write_response(
+        self, finding_id: str, role: str, resp, secrets: list[str]
+    ) -> Path:
+        """idor 响应证据落盘（脱敏后写 evidence_dir 顶层，browser.py 同范式）。"""
+        path = self.evidence_dir / f"idor_{finding_id}_{role}_response.txt"
+        text = f"GET {resp.url}\nstatus: {resp.status}\n"
+        if resp.error is not None:
+            text += f"error: {resp.error}\n"
+        text += f"\n{resp.body}"
+        path.write_bytes(redact_bytes(text.encode("utf-8"), secrets))
+        return path
 
     def _get_browser(self, session: SessionConfig):
         """懒建/复用浏览器验证器（M8b）；不可用抛 BrowserUnavailableError。
