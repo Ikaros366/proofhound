@@ -22,3 +22,6 @@ class Signal(BaseModel):
     skill: str = Field(min_length=1)  # 产出该信号的 skill 名
     evidence_ref: str = Field(min_length=1)  # 证据文件路径#L行号，必填
     note: str | None = None
+    # M8a：仅 kind="form_page" 信号携带——页面内 POST 候选表单的字段名清单
+    #（保序去重），供 triage 启发式键名匹配；其余 kind 恒为空。
+    form_fields: list[str] = Field(default_factory=list)

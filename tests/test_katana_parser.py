@@ -68,7 +68,9 @@ def test_bad_lines_counted_fail_closed():
 
 
 def test_non_get_and_no_query_dropped():
-    """POST 端点、无 query 端点、POST 表单一律不产 Signal（不计坏行）。"""
+    """POST 端点、无 query 端点不产 Signal（不计坏行）；无 name 字段的
+    POST 表单无可测试字段，同样不产 Signal（M8a 起有 name 字段的 POST
+    表单产 form_page 信号，见 test_katana_forms.py）。"""
     text = "\n".join(
         [
             _line(
@@ -84,7 +86,7 @@ def test_non_get_and_no_query_dropped():
                 {
                     "status_code": 200,
                     "body": '<form action="/do" method="post">'
-                    '<input type="text" name="id"></form>',
+                    '<input type="text"></form>',
                 },
             ),
         ]
@@ -100,7 +102,7 @@ def test_form_synthesis_semantics():
     """分支 B：action 相对解析、fragment 剥离、method 缺省按 GET、
     button/reset 不收、跨行去重（首见锚点）。"""
     body = (
-        '<form action="search.php#frag">'
+        '<form method="get" action="search.php#frag">'
         '<input type="text" name="q">'
         '<input type="hidden" name="page" value="2">'
         '<input type="button" name="ignoreme">'

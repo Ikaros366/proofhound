@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import re
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from proofhound.compliance.session import SessionConfig
 
@@ -87,15 +87,20 @@ class SqlmapParams(BaseModel):
     """sqlmap 注入确认参数（对应 skills/verify-sqli SOP，L2 利用验证）。
 
     level/risk 设硬上限（3/2）：防规划或配置失误导致测试面失控；
-    ``--batch``（禁交互）与 ``--flush-session``（禁陈旧缓存）恒由构造器
+    ``--batch``（禁交互）与 ``--flush-session``（禁陈旧会话缓存）恒由构造器
     强制，不接受参数覆盖。
+
+    M8a：``forms=True`` 为 POST 表单页模式——sqlmap 自行解析页面内表单
+    并测试其字段，**与 ``param`` 互斥**（不指定 ``-p``），且构造器永不产
+    ``--data``（不手拼请求体，表单字段由目标页面自身决定）。
     """
 
-    url: str = Field(min_length=1)  # 含注入参数的完整 URL（GET）
+    url: str = Field(min_length=1)  # 含注入参数的完整 URL（GET）或表单页 URL（forms）
     param: str | None = None  # 指定测试参数（-p），缺省测全部
     with_session: bool = False  # 注入预置会话（--cookie）
     level: int = Field(default=1, ge=1, le=3)
     risk: int = Field(default=1, ge=1, le=2)
+    forms: bool = False  # M8a：POST 表单页模式（--forms；与 param 互斥）
 
     @field_validator("url")
     @classmethod
@@ -119,6 +124,12 @@ class SqlmapParams(BaseModel):
             raise ValueError("param 只允许字母数字与 _ . -")
         return value
 
+    @model_validator(mode="after")
+    def _forms_excludes_param(self) -> "SqlmapParams":
+        if self.forms and self.param is not None:
+            raise ValueError("forms 模式与 param 互斥（--forms 自解析表单，不指定 -p）")
+        return self
+
 
 def _build_sqlmap(
     params: dict,
@@ -132,7 +143,10 @@ def _build_sqlmap(
         argv += ["--proxy", egress_proxy_url]
     if p.with_session:
         argv += ["--cookie", _require_session(True, session).cookie_header()]
-    if p.param:
+    if p.forms:
+        # M8a：POST 表单页模式——sqlmap 自解析页面内表单；永不手拼 --data
+        argv.append("--forms")
+    elif p.param:
         argv += ["-p", p.param]
     argv += [
         "--level", str(p.level),

@@ -71,8 +71,16 @@ Confirmed**——Confirmed 必须经 verify-* skill 产出（职责隔离规则�
 - **param-endpoint**：katana JSONL 输出中 method 为 GET 且 URL 含非空
   query 的端点，逐条产 Signal（asset=完整 URL，evidence_ref=落盘
   JSONL 路径 + 行号）；POST、无 query、非端点记录不产 Signal。
-- 带参端点只是**候选**（红线 2）：是否可注入由 triage 启发式与 verify-*
-  行为验证判定，本 skill 不做任何注入尝试。
+- **form_page**（M8a）：响应体内含 POST 候选表单的页面，每页产一条
+  Signal（asset=**页面 URL 本身**，不拼参数；字段名并集存
+  `form_fields`）。合格规则：method 显式 post（大小写不敏感）且 ≥1 个
+  有 name 的 input|select|textarea 字段；或 method 缺省 + 非空 action +
+  有 name 的密码/文本字段。**同源防线**：action 解析后须与页面同
+  scheme/host/port（空 action=页面自身），跨域表单一律不产——forms
+  模式 sqlmap 实际 POST 的目标是 action，跨域会脱离 `-u` 的 scope
+  校验覆盖面。
+- 带参端点与表单页都只是**候选**（红线 2）：是否可注入由 triage 启发式
+  与 verify-* 行为验证判定，本 skill 不做任何注入尝试。
 - 每条 Signal 必须携带 evidence_ref；无证据不入库。
 
 ## 停下来请示人工（硬阻塞，不自动攻克）

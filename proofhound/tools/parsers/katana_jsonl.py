@@ -18,7 +18,23 @@ Signal（POST、无 query 的记录丢弃不计坏行）；每条 Signal 的
    ——空值参数会让下游行为验证失去 baseline 可比（DVWA 实靶实测：sqlmap
    对空 id 判 "not injectable"，填 1 即确认）。
 
-同一合成/发现 URL 跨行去重（首见行号锚点），输出顺序确定。
+M8a（POST 表单发现）：除分支 B 外，从 ``response.body`` 识别 POST 候选
+表单，产 ``kind="form_page"`` Signal——asset 为**页面 URL 本身**（不拼
+参数，forms 模式验证由 sqlmap 自行解析页面内表单），字段名清单存
+``form_fields``（供 triage 启发式键名匹配）。合格表单规则：
+
+- 规则 A：method 显式为 post（大小写不敏感）且 ≥1 个有 name 的
+  input|select|textarea 字段（button/reset/file/image 不收）；
+- 规则 B：method **缺省**、action 非空且含有 name 的密码/文本字段
+  （登录类表单常缺省 method，密码/文本字段是 POST 意图信号）；
+- **同源防线（fail-closed）**：两规则均要求 action 解析后与页面同源
+  （scheme/host/port 一致，空 action = 页面自身）。forms 模式 sqlmap
+  实际 POST 的目标是表单 action——跨域 action 会脱离 ``-u`` 的 scope
+  校验覆盖面，故跨域表单一律不产候选；同页多个合格表单字段名并集进
+  一条信号。
+
+去重键为 ``(kind, asset)``：同一 URL 的 param-endpoint 与 form_page 是
+两类信号、都保留；同类同 URL 跨行去重（首见行号锚点），输出顺序确定。
 """
 
 from __future__ import annotations
@@ -33,57 +49,80 @@ from proofhound.findings.signal import Signal
 # 下游 triage 启发式键名与 scope 校验做过滤）
 _NON_SUBMIT_INPUT_TYPES = frozenset({"button", "reset", "file", "image"})
 
+# M8a 规则 B 判定：有 name 且为密码/文本类的 input type（type 缺省按 text）
+_TEXT_PASSWORD_INPUT_TYPES = frozenset({"text", "password"})
 
-class _GetFormExtractor(HTMLParser):
-    """从 HTML 提取 GET 表单（action + 字段名/值），零依赖确定性解析。"""
+
+class _FormExtractor(HTMLParser):
+    """从 HTML 提取全部表单（method/action/字段名值），零依赖确定性解析。"""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
-        self.forms: list[dict] = []  # [{"action": str, "fields": [(name, value)]}]
-        self._mode: str | None = None  # None | "get" | "post"
+        # [{"method": str|None（原始值小写，缺省 None）, "action": str,
+        #   "fields": [(name, value)], "has_text_or_password": bool}]
+        self.forms: list[dict] = []
+        self._open = False  # 是否处于某个 form 内（嵌套表单按坏 HTML 忽略内层）
+        self._method: str | None = None
         self._action = ""
         self._fields: list[tuple[str, str]] = []
+        self._has_text_or_password = False
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         if tag == "form":
-            if self._mode is not None:
+            if self._open:
                 return  # 嵌套表单：按坏 HTML 忽略内层
-            method = (attrs.get("method") or "get").strip().lower()
-            self._mode = "get" if method == "get" else "post"
+            method = attrs.get("method")
+            self._method = method.strip().lower() if method else None
             self._action = attrs.get("action") or ""
             self._fields = []
+            self._has_text_or_password = False
+            self._open = True
             return
-        if self._mode != "get" or tag not in ("input", "select", "textarea"):
+        if not self._open or tag not in ("input", "select", "textarea"):
             return
-        if tag == "input" and (attrs.get("type") or "text").strip().lower() in (
-            _NON_SUBMIT_INPUT_TYPES
-        ):
+        input_type = (
+            (attrs.get("type") or "text").strip().lower() if tag == "input" else ""
+        )
+        if tag == "input" and input_type in _NON_SUBMIT_INPUT_TYPES:
             return
         name = attrs.get("name")
         if name:
             # 无 value 字段填占位 "1"：空值会让下游行为验证失去 baseline 可比
             self._fields.append((name, attrs.get("value") or "1"))
+            if input_type in _TEXT_PASSWORD_INPUT_TYPES:
+                self._has_text_or_password = True
 
     def handle_endtag(self, tag):
-        if tag == "form" and self._mode is not None:
-            if self._mode == "get" and self._fields:
-                self.forms.append(
-                    {"action": self._action, "fields": list(self._fields)}
-                )
-            self._mode = None
+        if tag == "form" and self._open:
+            self.forms.append(
+                {
+                    "method": self._method,
+                    "action": self._action,
+                    "fields": list(self._fields),
+                    "has_text_or_password": self._has_text_or_password,
+                }
+            )
+            self._open = False
 
 
-def _extract_get_form_urls(page_url: str, body: str) -> list[str]:
-    """从页面 HTML 提取 GET 表单并合成查询 URL（保序、页内去重）。"""
-    extractor = _GetFormExtractor()
+def _extract_forms(body: str) -> list[dict]:
+    """从页面 HTML 提取全部表单；坏 HTML 不致命（表单提取是 best-effort 增强）。"""
+    extractor = _FormExtractor()
     try:
         extractor.feed(body)
         extractor.close()
     except Exception:
-        return []  # 坏 HTML 不致命：表单提取是 best-effort 增强
+        return []
+    return extractor.forms
+
+
+def _synthesize_get_form_urls(page_url: str, forms: list[dict]) -> list[str]:
+    """分支 B：GET 表单（method 缺省按 GET）合成查询 URL（保序、页内去重）。"""
     urls: list[str] = []
-    for form in extractor.forms:
+    for form in forms:
+        if form["method"] not in (None, "get"):
+            continue
         fields = list(dict.fromkeys(form["fields"]))
         if not fields:
             continue
@@ -97,6 +136,49 @@ def _extract_get_form_urls(page_url: str, body: str) -> list[str]:
     return urls
 
 
+def _same_origin(page_url: str, action: str) -> bool:
+    """表单 action 解析后与页面同源（scheme/host/port 一致；空 action=页面自身）。
+
+    fail-closed 防线（M8a）：forms 模式下 sqlmap 实际 POST 的目标是表单
+    action——跨域 action 会脱离 ``-u``（页面 URL）的 scope 校验覆盖面，
+    故跨域表单一律不产候选。端口显式比对（``http://h`` 与 ``http://h:80``
+    视为不同源，宁漏勿放）。
+    """
+    try:
+        page = urlparse(page_url)
+        dest = urlparse(urljoin(page_url, action))
+        return (page.scheme.lower(), page.hostname, page.port) == (
+            dest.scheme.lower(),
+            dest.hostname,
+            dest.port,
+        )
+    except ValueError:
+        return False  # 非法端口等解析异常：fail-closed
+
+
+def _form_page_field_names(page_url: str, forms: list[dict]) -> list[str]:
+    """M8a：页面内 POST 候选表单的有 name 字段名并集（保序去重）。
+
+    合格表单规则 A（显式 post + 有 name 字段）/ B（method 缺省 + 非空
+    action + 密码/文本字段）见模块 docstring；两规则均要求 action 同源。
+    """
+    names: list[str] = []
+    for form in forms:
+        method = form["method"]
+        if method == "post":
+            qualified = bool(form["fields"])
+        elif method is None:
+            qualified = bool(form["action"].strip()) and form["has_text_or_password"]
+        else:
+            qualified = False
+        if not qualified or not _same_origin(page_url, form["action"]):
+            continue
+        for name, _value in form["fields"]:
+            if name not in names:
+                names.append(name)
+    return names
+
+
 def parse_katana_jsonl(
     text: str,
     *,
@@ -106,7 +188,7 @@ def parse_katana_jsonl(
 ) -> tuple[list[Signal], int]:
     """解析 katana JSONL 输出，返回 ``(signals, skipped_lines)``。"""
     signals: list[Signal] = []
-    seen: set[str] = set()  # 跨行去重（首见锚点）
+    seen: set[tuple[str, str]] = set()  # (kind, asset) 跨行去重（首见锚点）
     skipped = 0
     for lineno, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
@@ -135,13 +217,17 @@ def parse_katana_jsonl(
         assets: list[str] = []
         if request.get("method") == "GET" and urlparse(endpoint).query:
             assets.append(endpoint)  # 来源 1：直接发现的带 query GET 端点
+        form_fields: list[str] = []
         body = response.get("body") if isinstance(response, dict) else None
         if isinstance(body, str) and "<form" in body:
-            assets.extend(_extract_get_form_urls(endpoint, body))  # 分支 B
+            forms = _extract_forms(body)
+            assets.extend(_synthesize_get_form_urls(endpoint, forms))  # 分支 B
+            form_fields = _form_page_field_names(endpoint, forms)  # M8a
         for asset in assets:
-            if asset in seen:
+            key = ("param-endpoint", asset)
+            if key in seen:
                 continue
-            seen.add(asset)
+            seen.add(key)
             signals.append(
                 Signal(
                     asset=asset,
@@ -152,6 +238,23 @@ def parse_katana_jsonl(
                     source_tool=source_tool,
                     skill=skill,
                     evidence_ref=f"{evidence_path}#L{lineno}",
+                )
+            )
+        # M8a：POST 候选表单页信号（asset=页面 URL 本身，不拼参数）；
+        # 与 param-endpoint 按 (kind, asset) 分别去重，同 URL 两 kind 共存
+        if form_fields and ("form_page", endpoint) not in seen:
+            seen.add(("form_page", endpoint))
+            signals.append(
+                Signal(
+                    asset=endpoint,
+                    status_code=(
+                        status_code if isinstance(status_code, int) else None
+                    ),
+                    kind="form_page",
+                    source_tool=source_tool,
+                    skill=skill,
+                    evidence_ref=f"{evidence_path}#L{lineno}",
+                    form_fields=form_fields,
                 )
             )
     return signals, skipped

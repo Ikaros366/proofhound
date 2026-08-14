@@ -45,6 +45,10 @@ Signal/Hypothesis）。执行由编排器 `run_verify_phase()` 确定性驱动�
 
    - `--batch` 禁交互、`--flush-session` 禁陈旧缓存，由构造器强制；
    - level ≤ 3、risk ≤ 2 为构造器硬上限，不得拔高；
+   - **forms 变体（M8a）**：evidence_kinds 含 `crawl-form` 的候选（POST
+     表单页，asset 为页面裸 URL）改用 `sqlmap --forms`——sqlmap 自解析
+     页面内表单并测试其字段，**不指定 `-p`、构造器永不产 `--data`**
+     （不手拼请求体）；构造器层 forms 与 param 互斥（fail-closed）；
    - 原始输出 100% 落盘 evidence/（红线 3），凭据在审计/state/日志中
      只记 sha256 前 8 位。
 

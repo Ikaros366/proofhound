@@ -10,7 +10,10 @@ tools/build.py 拼装 argv（红线 1：LLM 不碰命令）→ SandboxRunner 执
   行为确认 → 证据门 → Verifier T2 终审 → CONFIRMED/REJECTED，唯一 LLM
   调用是 Verifier 终审）；M3d 扩展 triage：katana 爬参 Signal
   （param-endpoint）按 query 参数键启发式展开 sqli 候选（上限 20 条防
-  确认洪泛 + 建/并前 check_scope 第三层纵深）；
+  确认洪泛 + 建/并前 check_scope 第三层纵深）；M8a 再扩展：katana
+  POST 表单页 Signal（form_page）按表单字段名/页面路径提示展开 sqli
+  候选（共享同一上限），verify 阶段对 crawl-form 证据类候选走
+  ``sqlmap --forms`` 模式（不手拼 --data）；
 - 失败预算：同类失败默认上限 2 次，命中置 blocked 并升级（task_blocked）；
   验证码/锁定一次即硬阻塞；scope 拒绝与命令构造失败视为规划缺陷，
   直接 failed、不重试；
@@ -93,14 +96,23 @@ _TRIAGE_SQLI_CAP = 20
 # param-endpoint 候选的证据种类标签（爬行发现的带参端点，非行为证据）
 CRAWL_ENDPOINT_EVIDENCE_KIND = "crawl-endpoint"
 
+# M8a：form_page 候选的证据种类标签（爬行发现的 POST 表单页，非行为证据）；
+# verify 阶段据此切换 sqlmap --forms 验证模式（发现方式确定性决定验证方式）
+CRAWL_FORM_EVIDENCE_KIND = "crawl-form"
+
+# M8a：form_page 候选的页面路径提示（字段名零命中时的保守回退）：path 段
+# 小写去扩展名后精确匹配。宁漏勿滥——每条候选消耗一次 L2 确认与行为验证
+_SQLI_PATH_HINTS = frozenset({"sqli", "sql", "login", "signin", "search"})
+
 
 class _TriageCandidate(NamedTuple):
-    """一条 triage 候选；一个 Signal 可展开多条（param-endpoint 按参数键）。"""
+    """一条 triage 候选；一个 Signal 可展开多条（按参数键/表单字段名）。"""
 
     vuln_type: str
     param: str | None
     severity: str
     evidence_kind: str
+    source: str  # M8a：web_probe / get_param / form_page（triage_completed 摘要分量）
 
 
 def _query_param_keys(url: str) -> list[str]:
@@ -113,6 +125,25 @@ def _query_param_keys(url: str) -> list[str]:
     return keys
 
 
+def _form_field_names(signal: Signal) -> list[str]:
+    """form_page Signal 的字段名规范化（保序去重、小写化；空白名丢弃）。"""
+    names: list[str] = []
+    for name in signal.form_fields:
+        key = name.strip().lower()
+        if key and key not in names:
+            names.append(key)
+    return names
+
+
+def _form_page_path_hit(url: str) -> bool:
+    """页面路径提示命中：path 段（小写、去扩展名）精确匹配 _SQLI_PATH_HINTS。"""
+    for segment in urlparse(url).path.lower().split("/"):
+        stem = segment.rsplit(".", 1)[0]
+        if stem and stem in _SQLI_PATH_HINTS:
+            return True
+    return False
+
+
 def _triage_candidates(signal: Signal) -> list[_TriageCandidate]:
     """triage 规则映射：可映射返回候选列表，不可映射返回空（保持 Signal）。"""
     if signal.kind == "web-probe" and signal.status_code in _EXPOSED_STATUSES:
@@ -122,6 +153,7 @@ def _triage_candidates(signal: Signal) -> list[_TriageCandidate]:
                 param=None,
                 severity="info",
                 evidence_kind=STATUS_CODE_EVIDENCE_KIND,
+                source="web_probe",
             )
         ]
     if signal.kind == "param-endpoint":
@@ -131,10 +163,37 @@ def _triage_candidates(signal: Signal) -> list[_TriageCandidate]:
                 param=key,
                 severity="medium",
                 evidence_kind=CRAWL_ENDPOINT_EVIDENCE_KIND,
+                source="get_param",
             )
             for key in _query_param_keys(signal.asset)
             if key in _SQLI_PARAM_HINTS
         ]
+    if signal.kind == "form_page":
+        # M8a：表单字段名命中提示表 → 每字段一条候选（dedup 带 param 分量）；
+        # 零命中回退页面路径提示（param=None）；都不命中保持 Signal
+        hits = [name for name in _form_field_names(signal) if name in _SQLI_PARAM_HINTS]
+        if hits:
+            return [
+                _TriageCandidate(
+                    vuln_type="sqli",
+                    param=name,
+                    severity="medium",
+                    evidence_kind=CRAWL_FORM_EVIDENCE_KIND,
+                    source="form_page",
+                )
+                for name in hits
+            ]
+        if _form_page_path_hit(signal.asset):
+            return [
+                _TriageCandidate(
+                    vuln_type="sqli",
+                    param=None,
+                    severity="medium",
+                    evidence_kind=CRAWL_FORM_EVIDENCE_KIND,
+                    source="form_page",
+                )
+            ]
+        return []
     return []
 
 
@@ -242,6 +301,12 @@ class Orchestrator:
         洪泛，超出记 ``triage_capped``）；建/并 Hypothesis 前对 asset 过
         check_scope（三层纵深第二层；runner 未挂 scope 时本层不触发，沙箱
         层仍是最终强校验），越界丢弃记 ``triage_out_of_scope``。
+
+        M8a：form_page Signal（POST 表单页）按表单字段名精确匹配同一张
+        ``_SQLI_PARAM_HINTS`` 展开候选，零命中回退页面路径提示
+        （``_SQLI_PATH_HINTS``，param=None）；与 get_param 候选共享同一
+        上限/去重/scope 校验，``triage_completed`` 增
+        ``created_by_source``/``merged_by_source`` 摘要区分来源类别。
         """
         store = FindingStore(self.evidence_dir / "findings.jsonl")
         signals, skipped = self._load_phase_signals()
@@ -251,6 +316,8 @@ class Orchestrator:
         created = merged = kept = capped = 0
         created_by_type: dict[str, int] = {}
         merged_by_type: dict[str, int] = {}
+        created_by_source: dict[str, int] = {}
+        merged_by_source: dict[str, int] = {}
         for signal in signals:
             candidates = _triage_candidates(signal)
             if not candidates:
@@ -290,6 +357,9 @@ class Orchestrator:
                     merged_by_type[cand.vuln_type] = (
                         merged_by_type.get(cand.vuln_type, 0) + 1
                     )
+                    merged_by_source[cand.source] = (
+                        merged_by_source.get(cand.source, 0) + 1
+                    )
                     signal_mapped = True
                     findings.append(existing)
                     continue
@@ -322,6 +392,9 @@ class Orchestrator:
                 created_by_type[cand.vuln_type] = (
                     created_by_type.get(cand.vuln_type, 0) + 1
                 )
+                created_by_source[cand.source] = (
+                    created_by_source.get(cand.source, 0) + 1
+                )
                 if cand.vuln_type == "sqli":
                     sqli_existing += 1
                 signal_mapped = True
@@ -345,6 +418,8 @@ class Orchestrator:
             skipped_lines=skipped,
             created_by_type=created_by_type,
             merged_by_type=merged_by_type,
+            created_by_source=created_by_source,
+            merged_by_source=merged_by_source,
         )
         return findings
 
@@ -443,17 +518,24 @@ class Orchestrator:
             return "blocked"  # 审计已在 _run_baseline 内记录
         baseline_ref, baseline_status = baseline
 
-        # 2. sqlmap 行为确认（沙箱内执行，scope 强校验不变）
+        # 2. sqlmap 行为确认（沙箱内执行，scope 强校验不变）；
+        # M8a：crawl-form 证据类候选（POST 表单页）走 --forms 模式——
+        # sqlmap 自解析页面内表单，不指定 -p、构造器永不手拼 --data
+        forms_mode = CRAWL_FORM_EVIDENCE_KIND in finding.evidence_kinds
+        sqlmap_params: dict = {
+            "url": finding.asset,
+            "with_session": True,
+            "level": 1,
+            "risk": 1,
+        }
+        if forms_mode:
+            sqlmap_params["forms"] = True
+        else:
+            sqlmap_params["param"] = finding.param
         try:
             argv = build_command(
                 "sqlmap",
-                {
-                    "url": finding.asset,
-                    "param": finding.param,
-                    "with_session": True,
-                    "level": 1,
-                    "risk": 1,
-                },
+                sqlmap_params,
                 egress_proxy_url=getattr(self.runner, "egress_proxy_url", None),
                 session=session,
             )
@@ -504,6 +586,17 @@ class Orchestrator:
             f"{t.type}（{t.title}）" if t.title else t.type for t in report.techniques
         )
         cookie_mark = secret_marker(session.cookie_header())
+        sqlmap_step = (
+            (
+                f"沙箱内执行 sqlmap -u '{finding.asset}' --cookie '{cookie_mark}' "
+                f"--forms --level 1 --risk 1 --batch"
+            )
+            if forms_mode
+            else (
+                f"沙箱内执行 sqlmap -u '{finding.asset}' --cookie '{cookie_mark}' "
+                f"-p {report.parameter} --level 1 --risk 1 --batch"
+            )
+        )
         finding.verification = Verification(
             method="sqlmap-confirmed",
             evidence_refs=[baseline_ref, sqlmap_ref],
@@ -515,8 +608,7 @@ class Orchestrator:
             reproduction_steps=[
                 f"以预置会话（Cookie {cookie_mark}）GET {finding.asset} "
                 f"→ baseline {baseline_status}（认证有效）",
-                f"沙箱内执行 sqlmap -u '{finding.asset}' --cookie '{cookie_mark}' "
-                f"-p {report.parameter} --level 1 --risk 1 --batch",
+                sqlmap_step,
                 f"sqlmap 判定注入点：Parameter {report.parameter} "
                 f"（{report.param_kind}）；技术：{techniques}",
                 f"复现 payload 示例：{report.techniques[0].payload}",
