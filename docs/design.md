@@ -223,6 +223,8 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 > **M3b 落地注记**（2026-08-07）：证据门实现于 `proofhound/verify/gate.py`——每 `vuln_type` 在 `GATE_MATRIX` 声明 `verification.method` 白名单与行为类 `evidence_kinds` 标签要求（当前仅落 sqli：method ∈ {sqlmap-confirmed, boolean-diff, time-blind-diff} 且含 `behavioral` 标签）；`check(finding) -> GateResult{passed, missing}` 产出缺项清单，未知 `vuln_type` fail-closed。编排层（`run_verify_phase`）在 `transition(CONFIRMED)` 前必过本门，与 M3a 状态机铁律构成**双层防守**；门不过记审计 `verify_gate_failed`，Finding 停于 Reproduced。XSS/LFI 等其余类型随对应 verify-* skill 扩展矩阵项。
 >
 > **M6b 落地注记**（2026-08-08，CVSS 评分真实化）：Confirmed 的严重级不再用 triage 种子值——改为 **CVSS v3.1 向量 + 代码确定性算分**。分工与理由：**LLM（T2 Verifier）只产向量字符串**（`cvss_vector` + 逐项理由 `cvss_rationale`），分数与严重级由 `proofhound/verify/cvss.py` 按 FIRST 官方公式（含官方 roundup）计算——分数必须确定性可复现、防 LLM 编数字、审计可按向量重算复核，故模型不接受 LLM 给的任何分数字段（verdict schema 无此键，多余键忽略）。契约 fail-closed：**confirm 缺失/非法向量 = 整个 verdict 非法**（走 M6a repair 一次后仍失败则 VerifierError，编排层停 Reproduced，无"无分数确认"降级路径）；reject 不得携带向量。向量解析严格（8 个 base 指标各恰好一次，缺/重/未知/temporal 指标、非法值、错版本一律拒绝；顺序宽容）。置态：编排层 confirm 分支在 `transition(CONFIRMED)` 前写入 `Finding.cvss_vector`/`cvss_score`（字段取代 §5.5 曾预留的 `cvss` 标量占位）并以算分严重级覆盖 triage 种子 severity——种子值仅为过渡态，历史 Finding 不回填（append-only 哲学）。对抗 SOP 增补 CVSS 指导：按证据定指标、不按漏洞类型套模板（如 sqlmap 仅布尔盲注确认未拖数据 → C 至多为 L；拖出库名/表名 → C 可为 H）。报告层（`report/data.py`）仅 Confirmed 桶透传 `cvss_vector`/`cvss_score`（非 Confirmed 不展示分数，旧数据容忍 None），默认模板详细发现章加条件渲染 CVSS 行。
+>
+> **M8b 落地注记**（2026-08-14，verify-xss 无头浏览器行为确认）：上表 XSS 行从"dalfox 类确认"落地为 first-party 浏览器验证器 `proofhound/verify/browser.py`（定位同 `verify/cvss.py`，**不走** tools/manifests 外部二进制注册体系；playwright 锁版本 `1.62.0`，Chromium 二进制经 `playwright install chromium` 安装，懒导入——无浏览器环境其余链路不受影响）。① **canary 探针机制**：每次 probe 生成唯一 token（`phxss_<12hex>`），`add_init_script` 先于页面脚本 hook alert/confirm/prompt 双信道（对话框钩子 + `window[token]` 标记位）捕获执行事件；payload 集为代码常量 ≤6 条（script 标签 / img onerror / svg onload 三类载体 × 两信道），URL 由 `payload_url()` 确定性构造（query 键替换 + urlencode，缺参 ValueError）——LLM 零介入（红线 1）。**确认铁律：仅 canary 执行事件可确认，"响应反射输入"永远不是证据**。② **scope 防线（红线 5，双层）**：加载任何 URL 前编排层 `check_scope`；页面加载后 `page.route` 拦截全部子请求，`allow_request()` 双重判定（同源归一化 ∧ `Scope.check_target`），跨 origin/越 scope 一律 abort 并记入请求链。③ **证据 100% 落盘（红线 3）**：每次尝试落 canary 事件 JSON + 执行后 DOM 快照 + console 记录 + 请求/响应链（含状态码，**不记请求头**——从源头杜绝 Cookie 落证据），全部经 `redact_bytes` 字节级脱敏。④ **编排**（`Orchestrator._verify_xss`）：带会话 baseline（复用 httpx 可达性对照）→ 逐 payload probe（按次记 `xss_probe_attempt` 审计，上限 = 模板条数，任一 canary 即停）→ 命中则 method=`browser-confirmed` + behavioral 标签 + **四段式证据结构**（`Verification` 增 `claim`/`expected`/`actual` 可选字段，`method` 复用现有字段；旧数据 null，报告层 `is not none` 判空跳过）→ REPRODUCED → 证据门（`GATE_MATRIX` 增 xss 项：method ∈ {browser-confirmed}）→ Verifier 终审 + CVSS 代码算分（M6b 机制不变）；全部 payload 干净完成无 canary → REJECTED，任一次尝试出错且未命中 → blocked（覆盖不全不驳回，fail-closed）；REPRODUCED 后的"证据门→Verifier→终态"收尾抽为 `_gate_and_review()` 两 handler 共用（sqli 链路行为不变）。⑤ **triage**：param-endpoint 另按 `_XSS_PARAM_HINTS`（name/q/search/query/keyword/comment/msg/message/text/redirect/url，保守小表）展开 xss 候选，独立上限 `_TRIAGE_XSS_CAP=10` 与独立 `triage_capped{vuln_type:"xss"}` 事件；两表交集参数同产 sqli+xss 两类候选（dedup 按 vuln_type 分量区分）。⑥ **API 接线**：`OrchestratorPhases.verify_skills` 多 verify skill 清单 + `EngagementRunner._verify` 逐 skill 过闸（沿用 M3d scan_skills 的 getattr 回退先例，旧 FakePhases 零改动）；verify-xss 未注册/未启用记 `verify_skill_skipped` 跳过（增强项不阻塞主链路）。⑦ **边界**：仅覆盖 reflected/GET 查询参数场景；stored/DOM 型与 POST 表单 XSS、JS 驱动交互属后续里程碑；浏览器是验证器不是爬虫（发现侧仍靠 katana）。旧测试**零改动**（新增 27 个测试：browser.py 纯函数/FakePage 单测 + browser marker 真实 Chromium e2e 自动 skip 先例 + triage/门/全链/多 skill 接线/四段式报告）。DVWA security=low xss_r 页实靶验收通过（`scripts/demo_xss_dvwa.py`：零种子 → canary marker 命中 → kimi-k3 confirm → Confirmed 5.4，凭据脱敏自检通过）。
 
 #### 5.4.3 Baseline 对照
 
@@ -439,6 +441,16 @@ proofhound/
 3. **供应链安全**：工具下载源被投毒 → 白名单 + 强制哈希校验 + 优先离线镜像。
 4. **法律责任**：工具仅限授权测试，scope 机制是产品级红线，不是可选项。
 5. **开放问题**：Verifier 与发现端的模型组合如何选型以最大化对抗效果；误报库的模式泛化粒度——均在 M3 以实验定案。
+
+### 9.1 远期方向（北极星，非当前里程碑承诺）
+
+- **Security Property / Graph**：把"验证"从单条 Finding 的行为确认，升级为跨
+  Finding 的安全属性推理与证据图谱——验证语义图谱化、属性级不变量校验
+  （"该参数的任何输入都不得进入执行上下文"）、利用链证据关联。这是验证层的
+  北极星方向。**M8b 不做任何 Graph 重构**：四段式证据结构
+  （claim/method/expected/actual）只是朝向属性化验证的最小一步，且仅落在
+  xss 链路（sqli 链路不动）；图谱化的数据模型与推理引擎留待后续里程碑
+  单独评审。
 
 ## 10. 参考项目（借鉴，不重复造）
 

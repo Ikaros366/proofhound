@@ -70,6 +70,27 @@ def docker_client():
 
 
 @pytest.fixture
+def chromium():
+    """真实 Chromium 浏览器（M8b e2e）：playwright 或浏览器二进制缺失即 skip
+    （仿 docker_client 先例，无浏览器环境自动跳过）。"""
+    pytest.importorskip("playwright")
+    from playwright.sync_api import sync_playwright
+
+    try:
+        pw = sync_playwright().start()
+    except Exception:
+        pytest.skip("playwright 启动失败")
+    try:
+        browser = pw.chromium.launch(headless=True)
+    except Exception:
+        pw.stop()
+        pytest.skip("Chromium 二进制不可用（playwright install chromium）")
+    yield browser
+    browser.close()
+    pw.stop()
+
+
+@pytest.fixture
 def sandbox_image(docker_client):
     from docker.errors import ImageNotFound
 

@@ -30,10 +30,16 @@ class GateRequirement:
     behavioral_kinds: frozenset[str]  # 至少命中一个的行为类 evidence_kinds 标签
 
 
-# 证据门矩阵（§5.4.2 表的代码化；本刀只落 sqli，其余类型随 verify-* skill 扩展）
+# 证据门矩阵（§5.4.2 表的代码化；sqli 落自 M3b，xss 落自 M8b，
+# 其余类型随 verify-* skill 扩展）
 GATE_MATRIX: dict[str, GateRequirement] = {
     "sqli": GateRequirement(
         methods=frozenset({"sqlmap-confirmed", "boolean-diff", "time-blind-diff"}),
+        behavioral_kinds=frozenset({BEHAVIORAL_EVIDENCE_KIND}),
+    ),
+    # M8b：XSS 唯一认可确认手段 = 无头浏览器 canary 执行事件（反射不算证据）
+    "xss": GateRequirement(
+        methods=frozenset({"browser-confirmed"}),
         behavioral_kinds=frozenset({BEHAVIORAL_EVIDENCE_KIND}),
     ),
 }

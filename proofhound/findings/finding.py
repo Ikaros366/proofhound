@@ -65,7 +65,14 @@ def _utc_now() -> str:
 
 
 class Verification(BaseModel):
-    """验证信息（§5.5）：Confirmed 必须携带且 evidence_refs 非空。"""
+    """验证信息（§5.5）：Confirmed 必须携带且 evidence_refs 非空。
+
+    M8b 四段式证据结构（先在 xss 链路落地，sqli 链路不动）：
+    ``claim``/``method``/``expected``/``actual``——其中 ``method`` 复用现有
+    字段（如 browser-confirmed），新增 ``claim``/``expected``/``actual``
+    三个可选字段；缺省 None，旧 findings.jsonl 回放零影响，报告层按
+    ``is not none`` 判空跳过（向后兼容）。
+    """
 
     method: str = Field(min_length=1)
     evidence_refs: list[str] = Field(min_length=1)
@@ -73,6 +80,9 @@ class Verification(BaseModel):
     reproduction_steps: list[str] = Field(default_factory=list)
     verified_by: str | None = None  # verify-* skill 标识
     verified_at: str | None = None
+    claim: str | None = None  # M8b：待证声明（如"参数 name 的输入在浏览器中被执行"）
+    expected: str | None = None  # M8b：预期（如"payload 中的 canary token 在页面上下文执行"）
+    actual: str | None = None  # M8b：实际（捕获的 canary 事件摘要）
 
 
 class VerifierVerdict(BaseModel):

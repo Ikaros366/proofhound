@@ -403,45 +403,60 @@ class EngagementRunner:
         eng = self.rt.engagement
         eng.transition(EngagementState.VERIFYING, reason="verify 阶段启动")
         store = FindingStore(eng.dir / "findings.jsonl")
-        covered = phases.verify_covered_vuln_types()
-        for finding in store.load_all():
-            if finding.state is not FindingState.HYPOTHESIS:
-                continue
-            if finding.vuln_type not in covered:
-                continue  # 该 verify skill 不覆盖：保持原态（编排器内记 verify_skipped）
-            outcome = self._gate(
-                phases.verify_skill,
-                phases.verify_risk_level,
-                finding_id=finding.id,
-                summary=(
-                    f"{phases.verify_skill} 行为验证 {finding.id}"
-                    f"（{finding.vuln_type} {finding.asset}）"
-                ),
-                resume_state=EngagementState.VERIFYING,
+        # M8b：多 verify skill（verify-sqli + verify-xss）逐 skill 过闸，确认/
+        # 审计粒度到 skill；无 verify_skills 属性的旧式 phases（FakePhases 等）
+        # 回退单 skill 接口，行为与 M5a 一致（对齐 M3d scan_skills 先例）。
+        verify_skills = getattr(phases, "verify_skills", None)
+        legacy = verify_skills is None
+        if legacy:
+            verify_skills = [(phases.verify_skill, phases.verify_risk_level)]
+        for skill_name, risk_level in verify_skills:
+            covered = (
+                phases.verify_covered_vuln_types()
+                if legacy
+                else phases.verify_covered_vuln_types(skill_name)
             )
-            if outcome in ("auto", "approved"):
-                continue
-            if outcome == "rejected":
-                # 拒绝（人工或超时）→ 对应 Hypothesis 终态 rejected（归报告
-                # rejected 桶）；归因取确认记录（operator/system + note）
-                conf = self.rt.confirmations.find(
-                    action=phases.verify_skill, finding_id=finding.id
-                )
-                who = (conf.operator if conf else None) or "operator"
-                detail = f"（{conf.note}）" if conf and conf.note else ""
-                finding.audit = self.rt.audit
-                finding.transition(
-                    FindingState.REJECTED,
-                    actor=who,
-                    reason=(
-                        f"operator_rejected: {who} 拒绝执行 "
-                        f"{phases.verify_skill}{detail}"
+            for finding in store.load_all():
+                if finding.state is not FindingState.HYPOTHESIS:
+                    continue
+                if finding.vuln_type not in covered:
+                    continue  # 该 verify skill 不覆盖：保持原态（编排器内记 verify_skipped）
+                outcome = self._gate(
+                    skill_name,
+                    risk_level,
+                    finding_id=finding.id,
+                    summary=(
+                        f"{skill_name} 行为验证 {finding.id}"
+                        f"（{finding.vuln_type} {finding.asset}）"
                     ),
+                    resume_state=EngagementState.VERIFYING,
                 )
-                store.append(finding)
-                assemble_evidence_pack(finding, evidence_base=eng.dir)
-            # forbidden：fail-closed 停留 Hypothesis（审计已在 _gate 内记录）
-        phases.verify()
+                if outcome in ("auto", "approved"):
+                    continue
+                if outcome == "rejected":
+                    # 拒绝（人工或超时）→ 对应 Hypothesis 终态 rejected（归报告
+                    # rejected 桶）；归因取确认记录（operator/system + note）
+                    conf = self.rt.confirmations.find(
+                        action=skill_name, finding_id=finding.id
+                    )
+                    who = (conf.operator if conf else None) or "operator"
+                    detail = f"（{conf.note}）" if conf and conf.note else ""
+                    finding.audit = self.rt.audit
+                    finding.transition(
+                        FindingState.REJECTED,
+                        actor=who,
+                        reason=(
+                            f"operator_rejected: {who} 拒绝执行 "
+                            f"{skill_name}{detail}"
+                        ),
+                    )
+                    store.append(finding)
+                    assemble_evidence_pack(finding, evidence_base=eng.dir)
+                # forbidden：fail-closed 停留 Hypothesis（审计已在 _gate 内记录）
+            if legacy:
+                phases.verify()
+            else:
+                phases.verify_with_skill(skill_name)
 
     # ---- 自主模式闸门 ----
 
@@ -568,6 +583,11 @@ class OrchestratorPhases:
     M3d：``scan_skills`` 暴露多 scan skill 清单（web-scan + recon-crawl），
     供 EngagementRunner 逐 skill 过闸；recon-crawl 未注册/未启用则跳过并记
     审计（爬行扫描是增强项，缺失不阻塞主链路）。
+
+    M8b：``verify_skills`` 暴露多 verify skill 清单（verify-sqli +
+    verify-xss），供 EngagementRunner 逐 skill 过闸（沿用 scan_skills 的
+    getattr 回退先例）；verify-xss 未注册/未启用则跳过并记审计
+    ``verify_skill_skipped``（XSS 浏览器验证是增强项，缺失不阻塞主链路）。
     """
 
     def __init__(
@@ -578,6 +598,7 @@ class OrchestratorPhases:
         scan_skill: str = "web-scan",
         verify_skill: str = "verify-sqli",
         crawl_skill: str = "recon-crawl",
+        verify_xss_skill: str = "verify-xss",
     ):
         self._orch = orchestrator
         self.scan_skill = scan_skill
@@ -597,6 +618,20 @@ class OrchestratorPhases:
             )
         else:
             self.scan_skills.append((crawl_skill, crawl.manifest.risk_level))
+        # M8b：多 verify skill 清单（首项即旧式单 skill 接口的 verify_skill）
+        self.verify_skills: list[tuple[str, str]] = [
+            (verify_skill, self.verify_risk_level)
+        ]
+        xss = registry.get(verify_xss_skill)
+        if xss is None or not xss.enabled:
+            reason = "skill 未注册" if xss is None else "skill 未启用"
+            orchestrator.audit.record(
+                "verify_skill_skipped",
+                skill=verify_xss_skill,
+                reason=f"{reason}，跳过 XSS 浏览器验证",
+            )
+        else:
+            self.verify_skills.append((verify_xss_skill, xss.manifest.risk_level))
 
     def scan(self, targets: list[str]) -> None:
         self._orch.run_scan_phase(targets, skill_name=self.scan_skill)
@@ -607,11 +642,15 @@ class OrchestratorPhases:
     def triage(self) -> list:
         return self._orch.run_triage_phase()
 
-    def verify_covered_vuln_types(self) -> frozenset[str]:
-        return self._orch.verify_skill_coverage(self.verify_skill)
+    def verify_covered_vuln_types(self, skill_name: str | None = None) -> frozenset[str]:
+        return self._orch.verify_skill_coverage(skill_name or self.verify_skill)
 
     def verify(self) -> list:
         return self._orch.run_verify_phase(skill_name=self.verify_skill)
+
+    def verify_with_skill(self, skill_name: str) -> list:
+        """M8b 多 skill 接口：按 skill 跑 verify 阶段。"""
+        return self._orch.run_verify_phase(skill_name=skill_name)
 
 
 def default_phases_factory(rt: EngagementRuntime) -> OrchestratorPhases:

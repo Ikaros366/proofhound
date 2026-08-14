@@ -45,6 +45,9 @@ SYSTEM_PROMPT = """\
 3. 前置条件当前是否满足？（认证态、参数可达性、目标行为稳定性）。
 你只收到结构化摘要与证据包索引（文件名/sha256/行号锚点），看不到原始输出——
 若摘要不足以支撑结论，一律判 reject 并在 reason 说明缺什么。
+确认手段语义：sqlmap-confirmed = sqlmap 明确判定注入点；browser-confirmed =
+无头浏览器（playwright chromium）canary 探针捕获 payload 执行事件——XSS 的
+唯一认可确认手段，仅"响应反射输入"不得判 confirm。
 
 CVSS 评分职责（仅 confirm 时）：你必须同时给出 cvss_vector（CVSS v3.1 base 向量，
 恰好包含 8 个指标，形如 CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H）与
@@ -181,6 +184,10 @@ class Verifier:
                         "evidence_refs": verification.evidence_refs,
                         "baseline_diff": verification.baseline_diff,
                         "reproduction_steps": verification.reproduction_steps,
+                        # M8b 四段式（xss 链路；sqli 旧数据为 null）
+                        "claim": verification.claim,
+                        "expected": verification.expected,
+                        "actual": verification.actual,
                     }
                     if verification
                     else None

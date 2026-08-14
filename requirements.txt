@@ -3,3 +3,5 @@
 fastapi==0.141.1
 uvicorn==0.52.1
 httpx==0.28.1
+# M8b 新增：verify-xss 无头浏览器行为确认（Chromium 二进制另需 playwright install chromium）
+playwright==1.62.0

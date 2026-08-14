@@ -13,7 +13,11 @@ tools/build.py 拼装 argv（红线 1：LLM 不碰命令）→ SandboxRunner 执
   确认洪泛 + 建/并前 check_scope 第三层纵深）；M8a 再扩展：katana
   POST 表单页 Signal（form_page）按表单字段名/页面路径提示展开 sqli
   候选（共享同一上限），verify 阶段对 crawl-form 证据类候选走
-  ``sqlmap --forms`` 模式（不手拼 --data）；
+  ``sqlmap --forms`` 模式（不手拼 --data）；M8b 再扩展：param-endpoint
+  另按 ``_XSS_PARAM_HINTS`` 展开 xss 候选（独立上限 10、独立
+  ``triage_capped`` 计数），verify 阶段新增 ``_verify_xss``——无头
+  Chromium canary 探针行为确认（``verify/browser.py``，first-party
+  验证器），method=browser-confirmed 过证据门 + Verifier 终审；
 - 失败预算：同类失败默认上限 2 次，命中置 blocked 并升级（task_blocked）；
   验证码/锁定一次即硬阻塞；scope 拒绝与命令构造失败视为规划缺陷，
   直接 failed、不重试；
@@ -67,6 +71,13 @@ from proofhound.tools.build import UnknownToolError, build_command, known_tools
 from proofhound.tools.manifest import load_manifest
 from proofhound.tools.parsers import PARSER_REGISTRY, parse_sqlmap_stdout
 from proofhound.tools.sandbox import RunResult, SandboxRunner
+from proofhound.verify.browser import (
+    BrowserUnavailableError,
+    BrowserVerifier,
+    new_token as new_canary_token,
+    payload_url as xss_payload_url,
+)
+from proofhound.verify.browser import PAYLOAD_TEMPLATES as XSS_PAYLOAD_TEMPLATES
 from proofhound.verify.cvss import base_score as cvss_base_score
 from proofhound.verify.cvss import severity_for_score
 from proofhound.verify.gate import BEHAVIORAL_EVIDENCE_KIND
@@ -92,6 +103,19 @@ _SQLI_PARAM_HINTS = frozenset(
 
 # M3d：每 engagement 新建 sqli Hypothesis 上限（防确认洪泛，超出记 triage_capped）
 _TRIAGE_SQLI_CAP = 20
+
+# M8b：param-endpoint → xss 假设的参数键启发式（保守小表，宁漏勿滥；
+# 与 _SQLI_PARAM_HINTS 有交集——交集参数会同产两类候选，dedup 按
+# vuln_type 分量区分互不合并，各自消耗一次 L2 确认）
+_XSS_PARAM_HINTS = frozenset(
+    {
+        "name", "q", "search", "query", "keyword", "comment", "msg",
+        "message", "text", "redirect", "url",
+    }
+)
+
+# M8b：每 engagement 新建 xss Hypothesis 上限（独立计数、独立 triage_capped 事件）
+_TRIAGE_XSS_CAP = 10
 
 # param-endpoint 候选的证据种类标签（爬行发现的带参端点，非行为证据）
 CRAWL_ENDPOINT_EVIDENCE_KIND = "crawl-endpoint"
@@ -157,7 +181,8 @@ def _triage_candidates(signal: Signal) -> list[_TriageCandidate]:
             )
         ]
     if signal.kind == "param-endpoint":
-        return [
+        keys = _query_param_keys(signal.asset)
+        candidates = [
             _TriageCandidate(
                 vuln_type="sqli",
                 param=key,
@@ -165,9 +190,23 @@ def _triage_candidates(signal: Signal) -> list[_TriageCandidate]:
                 evidence_kind=CRAWL_ENDPOINT_EVIDENCE_KIND,
                 source="get_param",
             )
-            for key in _query_param_keys(signal.asset)
+            for key in keys
             if key in _SQLI_PARAM_HINTS
         ]
+        # M8b：同一份 query 键再按 XSS 提示表展开 xss 候选（两表交集参数
+        # 会同产 sqli+xss 两条候选，dedup 按 vuln_type 分量区分）
+        candidates.extend(
+            _TriageCandidate(
+                vuln_type="xss",
+                param=key,
+                severity="medium",
+                evidence_kind=CRAWL_ENDPOINT_EVIDENCE_KIND,
+                source="get_param",
+            )
+            for key in keys
+            if key in _XSS_PARAM_HINTS
+        )
+        return candidates
     if signal.kind == "form_page":
         # M8a：表单字段名命中提示表 → 每字段一条候选（dedup 带 param 分量）；
         # 零命中回退页面路径提示（param=None）；都不命中保持 Signal
@@ -241,6 +280,7 @@ class Orchestrator:
         max_workers: int = 4,
         context_policy: ContextPolicy | None = None,
         tool_images: dict | None = None,
+        browser_factory=None,
     ):
         # llm 接受 ModelRouter（M2c 推荐：选路/计量/预算硬闸在路由层）；
         # 旧式单模型客户端由 Planner 自动包装适配（不计量）。
@@ -259,6 +299,10 @@ class Orchestrator:
         self.planner = Planner(
             llm, registry, self.tools, audit, context_policy=context_policy
         )
+        # M8b：verify-xss 的浏览器注入口子（测试给 FakeBrowser；None 时
+        # _verify_xss 懒建真实 BrowserVerifier 并缓存于 self._browser）
+        self.browser_factory = browser_factory
+        self._browser = None
 
     def run_scan_phase(self, targets: list[str], *, skill_name: str = "web-scan") -> TaskNode:
         """跑 scan 阶段：每目标一个子任务并行，返回阶段节点（含整棵树）。"""
@@ -307,13 +351,20 @@ class Orchestrator:
         （``_SQLI_PATH_HINTS``，param=None）；与 get_param 候选共享同一
         上限/去重/scope 校验，``triage_completed`` 增
         ``created_by_source``/``merged_by_source`` 摘要区分来源类别。
+
+        M8b：param-endpoint 另按 ``_XSS_PARAM_HINTS`` 展开 xss 候选
+        （两表交集参数同产两类候选，dedup 按 vuln_type 分量区分）；
+        xss 独立上限 ``_TRIAGE_XSS_CAP`` 与独立 ``triage_capped`` 事件。
         """
         store = FindingStore(self.evidence_dir / "findings.jsonl")
         signals, skipped = self._load_phase_signals()
         scope = getattr(self.runner, "scope", None)
-        sqli_existing = sum(1 for f in store.load_all() if f.vuln_type == "sqli")
+        existing_all = store.load_all()
+        sqli_existing = sum(1 for f in existing_all if f.vuln_type == "sqli")
+        xss_existing = sum(1 for f in existing_all if f.vuln_type == "xss")  # M8b
         findings: list[Finding] = []
-        created = merged = kept = capped = 0
+        created = merged = kept = 0
+        capped_by_type: dict[str, int] = {}  # M8b：按 vuln_type 分立 triage_capped
         created_by_type: dict[str, int] = {}
         merged_by_type: dict[str, int] = {}
         created_by_source: dict[str, int] = {}
@@ -364,7 +415,12 @@ class Orchestrator:
                     findings.append(existing)
                     continue
                 if cand.vuln_type == "sqli" and sqli_existing >= _TRIAGE_SQLI_CAP:
-                    capped += 1  # 防确认洪泛：每 engagement sqli 新建上限
+                    # 防确认洪泛：每 engagement sqli 新建上限
+                    capped_by_type["sqli"] = capped_by_type.get("sqli", 0) + 1
+                    continue
+                if cand.vuln_type == "xss" and xss_existing >= _TRIAGE_XSS_CAP:
+                    # M8b：xss 独立上限（与 sqli 互不挤占）
+                    capped_by_type["xss"] = capped_by_type.get("xss", 0) + 1
                     continue
                 finding = Finding(
                     id=store.next_id(),
@@ -397,17 +453,22 @@ class Orchestrator:
                 )
                 if cand.vuln_type == "sqli":
                     sqli_existing += 1
+                if cand.vuln_type == "xss":
+                    xss_existing += 1
                 signal_mapped = True
                 findings.append(finding)
             if not signal_mapped:
                 kept += 1
-        if capped:
-            self.audit.record(
-                "triage_capped",
-                vuln_type="sqli",
-                limit=_TRIAGE_SQLI_CAP,
-                dropped=capped,
-            )
+        # M8b：triage_capped 按 vuln_type 分立事件（sqli/xss 各自上限各自记）
+        for vuln_type, limit in (("sqli", _TRIAGE_SQLI_CAP), ("xss", _TRIAGE_XSS_CAP)):
+            dropped = capped_by_type.get(vuln_type, 0)
+            if dropped:
+                self.audit.record(
+                    "triage_capped",
+                    vuln_type=vuln_type,
+                    limit=limit,
+                    dropped=dropped,
+                )
         self.audit.record(
             "triage_completed",
             signals=len(signals),
@@ -441,7 +502,11 @@ class Orchestrator:
 
     def _verify_handlers(self) -> dict:
         """verify skill 名 → (覆盖的 vuln_type 集合, 处理函数)。"""
-        return {"verify-sqli": (frozenset({"sqli"}), self._verify_sqli)}
+        return {
+            "verify-sqli": (frozenset({"sqli"}), self._verify_sqli),
+            # M8b：无头浏览器 canary 行为确认（XSS 唯一确认门径）
+            "verify-xss": (frozenset({"xss"}), self._verify_xss),
+        }
 
     def verify_skill_coverage(self, skill_name: str = "verify-sqli") -> frozenset[str]:
         """verify skill 覆盖的 vuln_type 集合（M5a：API 自主模式闸门按此
@@ -473,22 +538,25 @@ class Orchestrator:
         store = FindingStore(self.evidence_dir / "findings.jsonl")
         counts = {"confirmed": 0, "rejected": 0, "blocked": 0, "skipped": 0}
         processed: list[Finding] = []
-        for finding in store.load_all():
-            if finding.state is not FindingState.HYPOTHESIS:
-                continue
-            if finding.vuln_type not in vuln_types:
-                self.audit.record(
-                    "verify_skipped",
-                    finding_id=finding.id,
-                    vuln_type=finding.vuln_type,
-                    reason=f"skill {skill_name} 不覆盖该漏洞类型",
-                )
-                counts["skipped"] += 1
-                continue
-            finding.audit = self.audit  # store 回放出的 Finding 无审计句柄
-            outcome = handler(finding, skill, store)
-            counts[outcome] += 1
-            processed.append(finding)
+        try:
+            for finding in store.load_all():
+                if finding.state is not FindingState.HYPOTHESIS:
+                    continue
+                if finding.vuln_type not in vuln_types:
+                    self.audit.record(
+                        "verify_skipped",
+                        finding_id=finding.id,
+                        vuln_type=finding.vuln_type,
+                        reason=f"skill {skill_name} 不覆盖该漏洞类型",
+                    )
+                    counts["skipped"] += 1
+                    continue
+                finding.audit = self.audit  # store 回放出的 Finding 无审计句柄
+                outcome = handler(finding, skill, store)
+                counts[outcome] += 1
+                processed.append(finding)
+        finally:
+            self._close_browser()  # M8b：phase 收尾释放浏览器（若本 phase 建过）
         self.audit.record(
             "verify_completed",
             skill=skill_name,
@@ -625,7 +693,17 @@ class Orchestrator:
         )
         store.append(finding)
 
-        # 5. 证据门（§5.4.2）：Confirmed 前必过；不过停于 Reproduced
+        # 5. 证据门 → Verifier 终审 → 终态迁移（公共收尾，M8b 抽出复用）
+        return self._gate_and_review(finding, skill, store)
+
+    def _gate_and_review(self, finding: Finding, skill, store: FindingStore) -> str:
+        """REPRODUCED 之后的公共收尾（verify-sqli / verify-xss 共用）：
+        证据门（§5.4.2）→ Verifier 终审（T2，§5.4.4）→ CONFIRMED/REJECTED。
+
+        返回 confirmed/rejected/blocked；blocked = 门不过 / Verifier 失败 /
+        铁律拦截，Finding 停留 Reproduced（fail-closed，不静默晋级）。
+        """
+        # 证据门：Confirmed 前必过；不过停于 Reproduced
         gate_result = gate_check(finding)
         if not gate_result.passed:
             self.audit.record(
@@ -635,7 +713,7 @@ class Orchestrator:
             )
             return "blocked"
 
-        # 6. Verifier 终审（T2，对抗校验；失败 fail-closed 停于 Reproduced）
+        # Verifier 终审（T2，对抗校验；失败 fail-closed 停于 Reproduced）
         pack_dir = assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
         manifest = json.loads((pack_dir / "manifest.json").read_text(encoding="utf-8"))
         verifier = Verifier(
@@ -655,7 +733,7 @@ class Orchestrator:
             )
             return "blocked"
 
-        # 7. 终审裁定 → 终态迁移（铁律在状态机层兜底，双层防守）
+        # 终审裁定 → 终态迁移（铁律在状态机层兜底，双层防守）
         if verdict.verdict == "confirm":
             # M6b：向量来自 Verifier（schema 层已校验合法）；分数与严重级
             # 只由代码按官方公式计算（LLM 不产数字），覆盖 triage 种子 severity
@@ -680,6 +758,197 @@ class Orchestrator:
         store.append(finding)
         assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
         return outcome
+
+    def _verify_xss(self, finding: Finding, skill, store: FindingStore) -> str:
+        """verify-xss SOP（skills/verify-xss/SKILL.md）的确定性执行（M8b）。
+
+        确认铁律：**仅 canary 执行事件可确认**（payload 在无头 Chromium 页面
+        上下文中执行），"响应反射输入"永远不是证据。全部 payload 干净完成
+        且无 canary → rejected；任一次尝试出错且未命中 canary → blocked
+        （覆盖不全不驳回，fail-closed）。URL/payload 全部来自代码常量与
+        Finding 数据（红线 1），唯一 LLM 调用是收尾的 Verifier 终审。
+        """
+        session = self._session()
+        if session is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="scope 未配置预置会话（session），无法进行带认证验证",
+            )
+            return "blocked"
+        scope = getattr(self.runner, "scope", None)
+        if scope is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="runner 未挂 scope，浏览器验证缺 scope 防线（fail-closed）",
+            )
+            return "blocked"
+        if not finding.param:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="xss 候选缺 param，无法构造 payload URL（fail-closed）",
+            )
+            return "blocked"
+
+        # 1. 带会话 baseline（与 verify-sqli 同一可达性对照）
+        baseline = self._run_baseline(finding, session)
+        if baseline is None:
+            return "blocked"  # 审计已在 _run_baseline 内记录
+        baseline_ref, baseline_status = baseline
+
+        # 2. 浏览器验证器（不可用 fail-closed，Finding 停留 Hypothesis）
+        try:
+            browser = self._get_browser(session)
+        except BrowserUnavailableError as exc:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=f"浏览器不可用（fail-closed）: {exc}",
+            )
+            return "blocked"
+
+        # 3. 逐 payload probe（预算门按次计数：每尝试记 xss_probe_attempt
+        # 审计，上限 = 模板条数 ≤6，任一 canary 执行即停）
+        hit = None  # BrowserProbeResult | None
+        had_error = False
+        for seq, template in enumerate(XSS_PAYLOAD_TEMPLATES, start=1):
+            token = new_canary_token()
+            payload = template.replace("{token}", token)
+            try:
+                url = xss_payload_url(finding.asset, finding.param, payload)
+            except ValueError as exc:
+                self.audit.record(
+                    "verify_blocked",
+                    finding_id=finding.id,
+                    reason=f"payload URL 构造失败（fail-closed）: {exc}",
+                )
+                return "blocked"
+            decision = check_scope(scope, [url])  # 红线 5：加载任何 URL 前过 scope
+            if not decision.allowed:
+                self.audit.record(
+                    "verify_scope_rejected",
+                    finding_id=finding.id,
+                    violations=decision.violations,
+                )
+                return "blocked"
+            result = browser.probe(
+                finding_id=finding.id, seq=seq, url=url, payload=payload, token=token
+            )
+            self.audit.record(
+                "xss_probe_attempt",
+                finding_id=finding.id,
+                seq=seq,
+                token=token,
+                canary=result.canary,
+                error=result.error is not None,
+                event_types=[event["type"] for event in result.events],
+            )
+            if result.error is not None:
+                had_error = True
+                continue
+            if result.canary:
+                hit = result
+                break
+
+        # 4. 无 canary：全部干净完成 → Rejected；存在错误 → blocked（fail-closed）
+        if hit is None:
+            if had_error:
+                self.audit.record(
+                    "verify_blocked",
+                    finding_id=finding.id,
+                    reason="浏览器尝试存在错误且未捕获 canary（覆盖不全，不驳回）",
+                )
+                return "blocked"
+            finding.transition(
+                FindingState.REJECTED,
+                actor=skill.name,
+                reason=(
+                    f"全部 {len(XSS_PAYLOAD_TEMPLATES)} 条 payload 均未触发 "
+                    "canary 执行事件（反射不执行/不反射）"
+                ),
+            )
+            store.append(finding)
+            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+            return "rejected"
+
+        # 5. canary 命中：证据入包（behavioral + browser-confirmed + 四段式）
+        cookie_mark = secret_marker(session.cookie_header())
+        event_types = "、".join(event["type"] for event in hit.events)
+        finding.verification = Verification(
+            method="browser-confirmed",
+            evidence_refs=[
+                baseline_ref,
+                str(hit.canary_path),
+                str(hit.dom_path),
+                str(hit.console_path),
+                str(hit.requests_path),
+            ],
+            baseline_diff=(
+                f"带会话 baseline {baseline_status}（认证有效，非登录跳转）；"
+                "payload 经无头 Chromium（playwright，canary 探针）加载，"
+                f"捕获 {len(hit.events)} 个执行事件（{event_types}，token 匹配）"
+            ),
+            claim=f"参数 {finding.param} 的输入在浏览器中被执行",
+            expected="payload 中的 canary token 在页面上下文执行（置位标记或触发对话框钩子）",
+            actual=(
+                f"捕获 {len(hit.events)} 个 canary 事件（类型 {event_types}，"
+                f"token {hit.token}）；事件原文见 {hit.canary_path.name}"
+            ),
+            reproduction_steps=[
+                f"以预置会话（Cookie {cookie_mark}）GET {finding.asset} "
+                f"→ baseline {baseline_status}（认证有效）",
+                "无头 Chromium（playwright chromium，canary 探针 "
+                f"add_init_script）加载 {hit.url}",
+                f"探针捕获 canary 执行事件：{event_types}（token {hit.token}）",
+                f"payload 原文：{hit.payload}",
+            ],
+            verified_by=f"{skill.name}@{skill.manifest.version}",
+            verified_at=_utc_now(),
+        )
+        if BEHAVIORAL_EVIDENCE_KIND not in finding.evidence_kinds:
+            finding.evidence_kinds.append(BEHAVIORAL_EVIDENCE_KIND)
+        finding.transition(
+            FindingState.REPRODUCED,
+            actor=skill.name,
+            reason=(
+                f"浏览器 canary 确认执行（{finding.param}，"
+                f"{len(hit.events)} 个事件）"
+            ),
+        )
+        store.append(finding)
+
+        # 6. 证据门 → Verifier 终审 → 终态（与 verify-sqli 同一收尾）
+        return self._gate_and_review(finding, skill, store)
+
+    def _get_browser(self, session: SessionConfig):
+        """懒建/复用浏览器验证器（M8b）；不可用抛 BrowserUnavailableError。
+
+        测试经 ``browser_factory`` 注入 FakeBrowser；否则建真实
+        BrowserVerifier（playwright 懒导入在 ``start()`` 内）。
+        """
+        if self._browser is None:
+            if self.browser_factory is not None:
+                self._browser = self.browser_factory()
+            else:
+                browser = BrowserVerifier(
+                    scope=getattr(self.runner, "scope", None),
+                    evidence_dir=self.evidence_dir,
+                    session=session,
+                )
+                browser.start()  # 不可用即抛 BrowserUnavailableError
+                self._browser = browser
+        return self._browser
+
+    def _close_browser(self) -> None:
+        """释放 verify phase 建过的浏览器（若有）；异常吞咽（不遮蔽主链路）。"""
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
 
     def _run_baseline(
         self, finding: Finding, session: SessionConfig

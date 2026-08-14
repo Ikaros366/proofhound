@@ -27,6 +27,7 @@ dependencies = [
     "docxtpl>=0.16",
     "fastapi>=0.115",
     "uvicorn>=0.30",
+    "playwright>=1.62",  # M8b：verify-xss 无头浏览器行为确认（懒导入，缺浏览器二进制时 xss 验证 fail-closed）
 ]
 
 [project.optional-dependencies]
@@ -47,4 +48,5 @@ include = ["proofhound*"]
 testpaths = ["tests"]
 markers = [
     "docker: 需要可用 Docker 守护进程的测试",
+    "browser: 需要 Playwright Chromium 浏览器二进制的测试（playwright install chromium）",
 ]
