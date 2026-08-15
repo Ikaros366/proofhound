@@ -296,7 +296,7 @@ def test_health_includes_version_and_confirm_timeout(client):
     resp = client.get("/api/health")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["version"] == "0.1.0"
+    assert data["version"] == "0.2.0"
     assert data["confirm_timeout"] == 30.0
     assert data["autonomy_gate"]["semi_auto"]["L2"] == "confirm"
 

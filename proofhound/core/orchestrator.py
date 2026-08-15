@@ -709,7 +709,7 @@ class Orchestrator:
             assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
             return "rejected"
 
-        # 4. 证据入包：behavioral 标签 + method + 复现步骤（凭据只记 sha256 标记）
+        # 4. 证据入包：behavioral 标签 + method + 复现步骤 + 四段式（凭据只记 sha256 标记）
         techniques = "；".join(
             f"{t.type}（{t.title}）" if t.title else t.type for t in report.techniques
         )
@@ -732,6 +732,13 @@ class Orchestrator:
                 f"带会话 baseline {baseline_status}（认证有效，非登录跳转）；"
                 f"sqlmap 确认参数 {report.parameter}（{report.param_kind}）注入："
                 f"{techniques}；共 {report.requests_total or '未知'} 次 HTTP 请求"
+            ),
+            claim=f"参数 {report.parameter} 的输入被服务端 SQL 引擎执行（注入成立）",
+            expected="sqlmap 在授权目标上行为确认注入点（非版本匹配/状态码推断）",
+            actual=(
+                f"sqlmap 确认参数 {report.parameter}（{report.param_kind}）注入："
+                f"{techniques}；共 {report.requests_total or '未知'} 次 HTTP 请求，"
+                f"判定原文见 {result.stdout_path.name}"
             ),
             reproduction_steps=[
                 f"以预置会话（Cookie {cookie_mark}）GET {finding.asset} "

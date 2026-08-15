@@ -43,6 +43,39 @@
 
 覆盖广度沿路线图渐进扩展，但纪律不变：**新漏洞类型必须先过"能否行为确认"这一关**——不能行为确认的宁可不做，绝不为凑覆盖率引入"疑似即确认"的降级路径。
 
+## 三分钟看清 ProofHound
+
+一条命令（`scripts/demo_killer.py`，见 Quickstart）：单 engagement 覆盖 DVWA（sqli + xss_r）与内置 IDOR fixture 双目标，katana 爬行自动产出 **21 条候选**，L2 确认队列按白名单**批准 4 条、拒绝 17 条**，最终 **3 个 Confirmed + 1 个对照 REJECTED**（证明不误报），scan→verify 全程 287 秒。以下为一次真实运行的脱敏结果：
+
+| 漏洞类型 | asset 形态 | 确认方法 | CVSS | 证据文件构成 |
+|---|---|---|---|---|
+| SQL 注入 | `127.0.0.1:8080/vulnerabilities/sqli/?id=1` | `sqlmap-confirmed`（沙箱 sqlmap 行为确认，4 种注入技术交叉） | 4.3 | katana 出处 + 带会话 baseline + sqlmap stdout（共 3 项） |
+| 反射型 XSS | `127.0.0.1:8080/vulnerabilities/xss_r/?name=1` | `browser-confirmed`（无头 Chromium canary 脚本执行事件） | 5.4 | katana 出处 + baseline + canary 事件 JSON + DOM 快照 + console + 请求链（共 6 项） |
+| IDOR/水平越权 | `127.0.0.1:<fixture>/invoice?id=1001` | `dual-session-confirmed`（双会话属性违反，正文相似度 0.965） | 4.3 | katana 出处 + 双会话响应原文 + 判定 JSON（共 4 项） |
+
+对照组 `/invoice?id=1002`（有授权判断）：B 会话 200 / A 会话 403，判定不成立 → **REJECTED**，同报告误报附录可查。三条 Confirmed 的 CVSS 均为 Verifier 出向量、代码按官方公式算分；每条证据包带 sha256 manifest 与行号锚点，可离线调出。
+
+真实审计链摘录（节选自真实运行 `audit.jsonl`，2026-08-14；凭据已是 `sha256:` 标记脱敏形态，长命令行以 `…` 省略尾部参数）：
+
+```jsonl
+{"ts": "2026-08-14T18:39:55Z", "event": "command_executed", "tool": "katana", "command": ["katana", "-u", "http://127.0.0.1:39231", "-H", "Cookie: sha256:43ea4ef3", "-d", "2", "-c", "5", "-jsonl", "-silent", "-nc", "-fs", "rdn", "…"], "exit_code": 0}
+{"ts": "2026-08-14T18:40:57Z", "event": "command_executed", "tool": "sqlmap", "command": ["sqlmap", "-u", "http://127.0.0.1:8080/vulnerabilities/sqli/?id=1&Submit=Submit", "--cookie", "sha256:43ea4ef3", "-p", "id", "--level", "1", "--risk", "1", "--batch", "…"], "exit_code": 0}
+{"ts": "2026-08-14T18:41:37Z", "event": "verifier_verdict", "finding_id": "F-2026-0005", "model": "kimi-k3", "verdict": "confirm", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N"}
+{"ts": "2026-08-14T18:41:37Z", "event": "verify_completed", "skill": "verify-sqli", "processed": 1, "confirmed": 1, "rejected": 0, "blocked": 0, "skipped": 11}
+{"ts": "2026-08-14T18:42:10Z", "event": "xss_probe_attempt", "finding_id": "F-2026-0008", "seq": 1, "token": "phxss_23149902eb12", "canary": true, "event_types": ["marker"]}
+{"ts": "2026-08-14T18:42:38Z", "event": "verifier_verdict", "finding_id": "F-2026-0008", "model": "kimi-k3", "verdict": "confirm", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:C/C:L/I:L/A:N"}
+{"ts": "2026-08-14T18:42:40Z", "event": "action_approved", "action": "verify-idor", "risk_level": "L2", "finding_id": "F-2026-0004", "operator": "demo-operator"}
+{"ts": "2026-08-14T18:42:52Z", "event": "idor_probe_attempt", "finding_id": "F-2026-0002", "role": "reference", "status": 200}
+{"ts": "2026-08-14T18:42:52Z", "event": "idor_probe_attempt", "finding_id": "F-2026-0002", "role": "attacker", "status": 403}
+{"ts": "2026-08-14T18:42:52Z", "event": "idor_probe_attempt", "finding_id": "F-2026-0004", "role": "attacker", "status": 200}
+{"ts": "2026-08-14T18:43:43Z", "event": "verifier_verdict", "finding_id": "F-2026-0004", "model": "kimi-k3", "verdict": "confirm", "cvss_vector": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:L/I:N/A:N"}
+{"ts": "2026-08-14T18:44:52Z", "event": "report_built", "template": "default_template.docx", "narrative": true, "out": "report.docx"}
+```
+
+报告样例见占位图，运行 `scripts/demo_killer.py` 可复现（每条 Confirmed 在报告中带四段式证据结构：claim/method/expected/actual）：
+
+![ProofHound 三漏洞报告样例（占位，待维护者补充）](docs/assets/killer_report.png)
+
 ## Quickstart：十分钟复现（DVWA 全流程）
 
 目标：全新机器从零 → DVWA 靶场 → 创建任务 → 批准 L2 → Confirmed → 出报告。
@@ -107,6 +140,15 @@ EOF
 .venv/bin/python -m proofhound.findings show <finding_id> --dir engagements/<engagement_id>
 # CLI 构建报告（--no-llm 跳过叙述生成）
 .venv/bin/python -m proofhound.report build --dir engagements/<engagement_id> --out report.docx
+```
+
+一键三漏洞全证据链演示（Killer Demo，前置条件：Docker + DVWA 运行中、`.env`
+配好 T1+T2、`playwright install chromium`）：
+
+```bash
+# 单 engagement 覆盖 DVWA（sqli+xss_r）与内置 IDOR fixture 双目标，
+# 一键跑出"一份报告、三个 Confirmed、每条带四段式证据"（产物落 evidence/demo_killer/）
+.venv/bin/python scripts/demo_killer.py
 ```
 
 ## 工具指南

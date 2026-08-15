@@ -161,7 +161,7 @@ def build_document() -> DocumentType:
             "{{ f.severity }}",
             "{{ f.vuln_type }}",
             "{{ f.asset }}",
-            "{{ f.title or '—' }}",
+            "{{ f.title or f.vuln_type }}",
         ],
     )
 
@@ -322,7 +322,7 @@ def build_document() -> DocumentType:
         "  narrative（叙述槽位，可为 null）, narrative_parts（M4.5 三段叙述 {description, impact, remediation}，可为 null）, rejection_reason（可为 null）, reason_cn（M6c 误报中文归因，可为 null，附录 B 用 reason_cn or rejection_reason 回退）",
         "  repro_text（M4.5 编号拼接复现文本，\\n 连接，供 {% raw %}{{r }}{% endraw %} 富文本；无步骤为空串）",
         "  cvss_vector / cvss_score（M6b：CVSS v3.1 向量 + 代码确定性算分，仅 Confirmed 有值，可为 null）",
-        "  verification.{method, evidence_refs[], baseline_diff, reproduction_steps[], verified_by, verified_at, claim, expected, actual（M8b 四段式，仅 xss 链路有值，可为 null——条件渲染须 is not none 判空）}（可为 null）",
+        "  verification.{method, evidence_refs[], baseline_diff, reproduction_steps[], verified_by, verified_at, claim, expected, actual（M8b 四段式，xss/idor/sqli（M8d 起）链路有值、其余与旧数据为 null——条件渲染须 is not none 判空）}（可为 null）",
         "  verifier.{model, verdict, reason, cvss_vector, cvss_rationale}（可为 null；后两者 M6b，reject 为 null）",
         "  evidence_pack.{pack_dir, assembled, entries[]}；entries[] = {file, sha256, source_ref, line_anchor, missing}",
         "sections.overview / sections.remediation（固定章节叙述，可为 null）",

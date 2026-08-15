@@ -120,7 +120,7 @@ def create_app(
         env_file=env_file,
     )
     management = ManagementService(manager)  # M6a 管理面（skill/scope）
-    app = FastAPI(title="ProofHound API", version="0.1.0")
+    app = FastAPI(title="ProofHound API", version="0.2.0")
     app.state.manager = manager
 
     @app.exception_handler(ApiError)
