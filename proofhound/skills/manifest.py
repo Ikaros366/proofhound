@@ -4,6 +4,10 @@
 - 一个 skill 是一个目录，``SKILL.md`` = YAML frontmatter + 正文 SOP；
 - frontmatter 七字段（name/description/version/required_tools/risk_level/
   inputs/outputs）**全部必填**——list 可为空，但键必须存在；
+- M9c③ 新增可选字段 ``mutating``：声明该 skill 的执行是否**改变目标状态**
+  （写操作）。自治闸门据此区分「只读验证」与「写操作」——只读验证在
+  semi_auto 下可自动执行，写操作仍须人工确认。**缺省 true（fail-closed）**：
+  未声明的 skill 一律按「会改变状态」对待；
 - 缺 frontmatter、YAML 损坏、字段缺失/非法均抛 :class:`SkillManifestError`。
 """
 
@@ -30,6 +34,10 @@ class SkillManifest(BaseModel):
     risk_level: Literal["L0", "L1", "L2"]  # L0 被动 / L1 主动扫描 / L2 利用验证
     inputs: list[str]
     outputs: list[str]
+    # M9c③：执行是否改变目标状态（写操作）。**缺省 true = fail-closed**——
+    # 未声明的 skill 一律按写操作对待（需人工确认），只读验证须显式声明
+    # ``mutating: false``。这一位决定自治闸门 L2 的细分裁定。
+    mutating: bool = True
 
 
 def parse_skill_md(path: str | Path) -> tuple[SkillManifest, str]:

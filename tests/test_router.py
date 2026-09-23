@@ -1,14 +1,16 @@
 """模型路由单元测试（M2c）：零真实网络，urllib 层一律 mock。
 
 覆盖：分档选路（model/url/key 各走各档）、temperature/max_tokens 透传、
-缺配置清晰报错、部分配置即报错、未配置档位调用报错、T1==T2 同模型警告、
-旧式客户端适配器。
+缺配置清晰报错、部分配置即报错、未配置档位调用报错、T1==T2 同模型被允许并记
+审计（M9b：红线 4 改为约束 agent 独立性，不再约束模型身份）、旧式客户端适配器。
 """
 
 import json
+import warnings
 
 import pytest
 
+from proofhound.compliance.audit import AuditLog
 from proofhound.llm.client import LLMError
 from proofhound.llm.router import (
     ModelRouter,
@@ -158,22 +160,41 @@ def test_complete_unconfigured_tier_raises():
         router.complete(Tier.T2, [{"role": "user", "content": "x"}])
 
 
-def test_same_model_t1_t2_warns():
+def test_same_model_t1_t2_is_allowed(tmp_path):
+    """M9b：T1 与 T2 允许同模型，且不再发任何警告。"""
     configs = _configs()
     configs[Tier.T2] = TierConfig(
         base_url="https://t2.example/v1", api_key="k2", model="m1"  # 与 T1 同模型
     )
-    with pytest.warns(UserWarning, match="相同模型"):
-        ModelRouter(configs)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        router = ModelRouter(configs, audit=audit)
+    assert caught == [], [str(w.message) for w in caught]
+    assert router.shared_model_across_tiers == "m1"
+    assert "llm_tiers_share_model" in [e["event"] for e in audit.read_all()]
 
 
-def test_different_model_t1_t2_no_warning(recwarn):
+def test_same_model_without_audit_still_works():
+    """无 audit 时同模型也不得抛错（审计是可选旁路）。"""
+    configs = _configs()
+    configs[Tier.T2] = TierConfig(
+        base_url="https://t2.example/v1", api_key="k2", model="m1"
+    )
+    router = ModelRouter(configs)
+    assert router.shared_model_across_tiers == "m1"
+
+
+def test_different_model_t1_t2_no_warning(recwarn, tmp_path):
     configs = _configs()
     configs[Tier.T2] = TierConfig(
         base_url="https://t2.example/v1", api_key="k2", model="m2"
     )
-    ModelRouter(configs)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    router = ModelRouter(configs, audit=audit)
     assert [w for w in recwarn.list if "相同模型" in str(w.message)] == []
+    assert router.shared_model_across_tiers is None
+    assert "llm_tiers_share_model" not in [e["event"] for e in audit.read_all()]
 
 
 def test_ensure_router_wraps_legacy_client():

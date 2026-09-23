@@ -71,6 +71,14 @@ from proofhound.core.tasks import (
     run_dag,
 )
 from proofhound.llm.client import LLMError
+from proofhound.llm.triage import (
+    ModelCandidate as _ModelCandidate,
+    ModelTriageError,
+    build_candidates as build_model_candidates,
+    summarize_signals as summarize_triage_signals,
+    build_candidates as build_model_candidates,
+    summarize_signals as summarize_triage_signals,
+)
 from proofhound.llm.router import ensure_router
 from proofhound.llm.usage import BudgetExceededError
 from proofhound.skills.registry import SkillRegistry
@@ -93,6 +101,7 @@ from proofhound.verify.idor import fetch as idor_fetch_default
 from proofhound.verify.idor import has_substance as idor_has_substance
 from proofhound.verify.idor import judge as idor_judge
 from proofhound.verify.idor import judgment_dict as idor_judgment_dict
+from proofhound.verify.prefilter import screen as prefilter_screen
 from proofhound.verify.verifier import Verifier, VerifierError
 
 _OUTPUT_SAMPLE_LIMIT = 4096  # 失败分类的输出采样上限（字节）
@@ -141,6 +150,12 @@ _IDOR_PARAM_HINTS = frozenset(
 
 # M8c：每 engagement 新建 idor Hypothesis 上限（独立计数、独立 triage_capped 事件）
 _TRIAGE_IDOR_CAP = 10
+
+# M9c②：**贵验证档**上限。启用廉价粗筛（``verify_prefilter``）时，cap 从
+# 「候选生成侧」移到这里——候选可以放开生成（模型 triage），由廉价粗筛先
+# 砍一遍，卡的是真正昂贵的 Chromium/sqlmap/双会话验证次数。
+# 关闭粗筛时该上限不生效（保持 M9c 之前行为：cap 只在 triage 生成侧）。
+_TRIAGE_EXPENSIVE_CAP = 60
 
 # param-endpoint 候选的证据种类标签（爬行发现的带参端点，非行为证据）
 CRAWL_ENDPOINT_EVIDENCE_KIND = "crawl-endpoint"
@@ -321,6 +336,11 @@ class Orchestrator:
         tool_images: dict | None = None,
         browser_factory=None,
         idor_fetch=None,
+        triage_rules: bool = True,
+        triage_model: bool = False,
+        verify_prefilter: bool = False,
+        prefilter_fetch=None,
+        expensive_cap: int = _TRIAGE_EXPENSIVE_CAP,
     ):
         # llm 接受 ModelRouter（M2c 推荐：选路/计量/预算硬闸在路由层）；
         # 旧式单模型客户端由 Planner 自动包装适配（不计量）。
@@ -346,6 +366,18 @@ class Orchestrator:
         # M8c：verify-idor 的取数注入口子（测试给罐头 fetch；None 时用
         # verify/idor.py 的真实 stdlib fetch）
         self._idor_fetch = idor_fetch if idor_fetch is not None else idor_fetch_default
+        # M9c①：triage 候选来源开关。model 侧**缺省关闭**——默认行为因此
+        # 与 M3a 起逐字节等价（tests/test_triage.py 断言「triage 不调 LLM」
+        # 由 triage_model=False 保证）；规则侧保留为快速路径与兜底。
+        self.triage_rules = triage_rules
+        self.triage_model = triage_model
+        # M9c②：贵验证档前置廉价粗筛（缺省关闭——默认行为与 M9c 之前
+        # 逐字节等价）。开启后 cap 卡在贵验证档而非候选生成侧。
+        self.verify_prefilter = verify_prefilter
+        self._prefilter_fetch = prefilter_fetch
+        self.expensive_cap = expensive_cap
+        self._expensive_spent = 0  # 本 phase 已花的贵验证次数
+        self._prefilter_advisory = 0  # 粗筛给出「不值得优先」建议的条数
 
     def run_scan_phase(self, targets: list[str], *, skill_name: str = "web-scan") -> TaskNode:
         """跑 scan 阶段：每目标一个子任务并行，返回阶段节点（含整棵树）。"""
@@ -377,11 +409,11 @@ class Orchestrator:
     # ---- triage 阶段（M3a，确定性、零 LLM 调用） ----
 
     def run_triage_phase(self) -> list[Finding]:
-        """确定性 triage：加载 scan 阶段 Signals → 规则映射 → findings.jsonl。
+        """triage：加载 scan 阶段 Signals → 候选映射 → findings.jsonl。
 
         可映射 vuln_type 的 Signal 建/并 Finding 置 Hypothesis（同 dedup_key
         合并证据并记审计 finding_deduplicated）；不可映射保持 Signal。
-        全程规则表判定，不接 LLM。
+        **默认全程规则表判定，零 LLM 调用**（与 M3a 起逐字节等价）。
 
         M3d：param-endpoint Signal 按 query 参数键展开 sqli 候选（启发式
         键名精确匹配 + 每 engagement 新建上限 ``_TRIAGE_SQLI_CAP`` 条防确认
@@ -402,10 +434,33 @@ class Orchestrator:
         M8c：param-endpoint 再按 ``_IDOR_PARAM_HINTS`` 展开 idor 候选
         （对象标识类键名保守表；与 sqli 表交集参数同产是设计行为）；
         idor 独立上限 ``_TRIAGE_IDOR_CAP`` 与独立 ``triage_capped`` 事件。
+
+        M9c①：候选有**两个来源**，由 ``self.triage_rules``（缺省 True）与
+        ``self.triage_model``（**缺省 False**）各自开关控制：
+
+        - 规则表：快速路径与兜底，零 LLM、确定性可测（见
+          :func:`_triage_candidates`）；
+        - 模型路径：T1 档补齐关键词盲区，见
+          :meth:`_model_candidates_by_asset`。参数名/字段名不在提示表内的
+          真实漏洞端点（``article_id`` / ``sku`` / ``ref`` / ``bh`` 等）在
+          纯规则表下**不产生任何候选**——不是验证失败，是看不见。
+
+        两来源候选**汇入同一套** dedup / 上限 / scope 校验 / 证据包逻辑，
+        故 5 层 scope 纵深与红线 5 零改动即覆盖模型候选；模型只提出候选，
+        **不改变任何确认路径**（候选仍须过 L2 闸门 → 行为验证 → 证据门 →
+        Verifier，红线 1/2）。
+
+        scope 纪律：只有**通过 check_scope 的 Signal** 才送进模型——越界信号
+        在到达模型之前就已丢弃，模型永远看不到 scope 外的资产。
         """
         store = FindingStore(self.evidence_dir / "findings.jsonl")
         signals, skipped = self._load_phase_signals()
         scope = getattr(self.runner, "scope", None)
+        # M9c①：模型路径的送审集合 = 通过 check_scope 的候选型 Signal
+        #（越界信号不送审；模型永远看不到 scope 外的资产）
+        model_by_asset: dict[tuple[str, str], list[_TriageCandidate]] = {}
+        if self.triage_model:
+            model_by_asset = self._model_candidates_by_asset(signals, scope)
         existing_all = store.load_all()
         sqli_existing = sum(1 for f in existing_all if f.vuln_type == "sqli")
         xss_existing = sum(1 for f in existing_all if f.vuln_type == "xss")  # M8b
@@ -418,7 +473,12 @@ class Orchestrator:
         created_by_source: dict[str, int] = {}
         merged_by_source: dict[str, int] = {}
         for signal in signals:
-            candidates = _triage_candidates(signal)
+            # M9c①：两来源候选的并集（纯模型臂即 triage_rules=False）
+            candidates = _triage_candidates(signal) if self.triage_rules else []
+            if self.triage_model:
+                candidates = candidates + model_by_asset.get(
+                    (signal.asset, signal.kind), []
+                )
             if not candidates:
                 kept += 1
                 continue
@@ -433,85 +493,26 @@ class Orchestrator:
                     )
                     kept += 1
                     continue
-            signal_mapped = False
-            for cand in candidates:
-                dedup_key = compute_dedup_key(signal.asset, cand.vuln_type, cand.param)
-                existing = store.get_by_dedup_key(dedup_key)
-                if existing is not None:
-                    if signal.evidence_ref in existing.source_signal_refs:
-                        continue  # 幂等：该证据已归并过
-                    existing.source_signal_refs.append(signal.evidence_ref)
-                    if cand.evidence_kind not in existing.evidence_kinds:
-                        existing.evidence_kinds.append(cand.evidence_kind)
-                    existing.updated_at = _utc_now()
-                    store.append(existing)
-                    self.audit.record(
-                        "finding_deduplicated",
-                        finding_id=existing.id,
-                        dedup_key=dedup_key,
-                        evidence_ref=signal.evidence_ref,
-                    )
-                    assemble_evidence_pack(existing, evidence_base=self.evidence_dir)
-                    merged += 1
-                    merged_by_type[cand.vuln_type] = (
-                        merged_by_type.get(cand.vuln_type, 0) + 1
-                    )
-                    merged_by_source[cand.source] = (
-                        merged_by_source.get(cand.source, 0) + 1
-                    )
-                    signal_mapped = True
-                    findings.append(existing)
-                    continue
-                if cand.vuln_type == "sqli" and sqli_existing >= _TRIAGE_SQLI_CAP:
-                    # 防确认洪泛：每 engagement sqli 新建上限
-                    capped_by_type["sqli"] = capped_by_type.get("sqli", 0) + 1
-                    continue
-                if cand.vuln_type == "xss" and xss_existing >= _TRIAGE_XSS_CAP:
-                    # M8b：xss 独立上限（与 sqli 互不挤占）
-                    capped_by_type["xss"] = capped_by_type.get("xss", 0) + 1
-                    continue
-                if cand.vuln_type == "idor" and idor_existing >= _TRIAGE_IDOR_CAP:
-                    # M8c：idor 独立上限（与 sqli/xss 互不挤占）
-                    capped_by_type["idor"] = capped_by_type.get("idor", 0) + 1
-                    continue
-                finding = Finding(
-                    id=store.next_id(),
-                    state=FindingState.SIGNAL,
-                    vuln_type=cand.vuln_type,
-                    severity=cand.severity,
-                    asset=signal.asset,
-                    param=cand.param,
-                    confidence="low",
-                    evidence_kinds=[cand.evidence_kind],
-                    dedup_key=dedup_key,
-                    source_signal_refs=[signal.evidence_ref],
-                    created_at=_utc_now(),
-                    updated_at=_utc_now(),
-                    audit=self.audit,
-                )
-                finding.transition(
-                    FindingState.HYPOTHESIS,
-                    actor="triage",
-                    reason=f"规则映射 {signal.kind}→{cand.vuln_type}",
-                )
-                store.append(finding)
-                assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
-                created += 1
-                created_by_type[cand.vuln_type] = (
-                    created_by_type.get(cand.vuln_type, 0) + 1
-                )
-                created_by_source[cand.source] = (
-                    created_by_source.get(cand.source, 0) + 1
-                )
-                if cand.vuln_type == "sqli":
-                    sqli_existing += 1
-                if cand.vuln_type == "xss":
-                    xss_existing += 1
-                if cand.vuln_type == "idor":
-                    idor_existing += 1
-                signal_mapped = True
-                findings.append(finding)
-            if not signal_mapped:
+            mapped = self._ingest_candidates(
+                store,
+                findings,
+                signal,
+                candidates,
+                sqli_existing,
+                xss_existing,
+                idor_existing,
+                created,
+                merged,
+                capped_by_type,
+                created_by_type,
+                merged_by_type,
+                created_by_source,
+                merged_by_source,
+            )
+            created, merged, hits, sqli_existing, xss_existing, idor_existing = (
+                mapped
+            )
+            if hits == 0:
                 kept += 1
         # M8b/M8c：triage_capped 按 vuln_type 分立事件（各自上限各自记）
         for vuln_type, limit in (
@@ -541,6 +542,187 @@ class Orchestrator:
             merged_by_source=merged_by_source,
         )
         return findings
+
+    def _ingest_candidates(
+        self,
+        store: FindingStore,
+        findings: list[Finding],
+        signal: Signal,
+        candidates: list[_TriageCandidate],
+        sqli_existing: int,
+        xss_existing: int,
+        idor_existing: int,
+        created: int,
+        merged: int,
+        capped_by_type: dict[str, int],
+        created_by_type: dict[str, int],
+        merged_by_type: dict[str, int],
+        created_by_source: dict[str, int],
+        merged_by_source: dict[str, int],
+    ) -> tuple[int, int, int, int, int, int]:
+        """把一批候选建/并成 Finding。
+
+        返回 ``(created, merged, 映射条数, sqli_existing, xss_existing,
+        idor_existing)``——三个 existing 计数是**上限判定的状态**，必须写回
+        调用方，否则同一轮内多条候选会各按旧值判定、上限失效。
+
+        M9c① 从旧 ``run_triage_phase`` 内联循环体**机械抽出**（仅
+        ``cand``→``candidate``、``signal_mapped``→``mapped``），逻辑与旧代码
+        逐句等价——规则路径的重建/去重/上限/计数/审计语义零改动。计数器按
+        「可变容器传入原地更新、整数由调用方按返回值写回」处理。
+        """
+        mapped = 0
+        for candidate in candidates:
+            dedup_key = compute_dedup_key(
+                signal.asset, candidate.vuln_type, candidate.param
+            )
+            existing = store.get_by_dedup_key(dedup_key)
+            if existing is not None:
+                if signal.evidence_ref in existing.source_signal_refs:
+                    continue  # 幂等：该证据已归并过
+                existing.source_signal_refs.append(signal.evidence_ref)
+                if candidate.evidence_kind not in existing.evidence_kinds:
+                    existing.evidence_kinds.append(candidate.evidence_kind)
+                existing.updated_at = _utc_now()
+                store.append(existing)
+                self.audit.record(
+                    "finding_deduplicated",
+                    finding_id=existing.id,
+                    dedup_key=dedup_key,
+                    evidence_ref=signal.evidence_ref,
+                )
+                assemble_evidence_pack(existing, evidence_base=self.evidence_dir)
+                merged += 1
+                merged_by_type[candidate.vuln_type] = (
+                    merged_by_type.get(candidate.vuln_type, 0) + 1
+                )
+                merged_by_source[candidate.source] = (
+                    merged_by_source.get(candidate.source, 0) + 1
+                )
+                mapped += 1
+                findings.append(existing)
+                continue
+            if candidate.vuln_type == "sqli" and sqli_existing >= _TRIAGE_SQLI_CAP:
+                # 防确认洪泛：每 engagement sqli 新建上限
+                capped_by_type["sqli"] = capped_by_type.get("sqli", 0) + 1
+                continue
+            if candidate.vuln_type == "xss" and xss_existing >= _TRIAGE_XSS_CAP:
+                # M8b：xss 独立上限（与 sqli 互不挤占）
+                capped_by_type["xss"] = capped_by_type.get("xss", 0) + 1
+                continue
+            if candidate.vuln_type == "idor" and idor_existing >= _TRIAGE_IDOR_CAP:
+                # M8c：idor 独立上限（与 sqli/xss 互不挤占）
+                capped_by_type["idor"] = capped_by_type.get("idor", 0) + 1
+                continue
+            finding = Finding(
+                id=store.next_id(),
+                state=FindingState.SIGNAL,
+                vuln_type=candidate.vuln_type,
+                severity=candidate.severity,
+                asset=signal.asset,
+                param=candidate.param,
+                confidence="low",
+                evidence_kinds=[candidate.evidence_kind],
+                dedup_key=dedup_key,
+                source_signal_refs=[signal.evidence_ref],
+                created_at=_utc_now(),
+                updated_at=_utc_now(),
+                audit=self.audit,
+            )
+            finding.transition(
+                FindingState.HYPOTHESIS,
+                actor="triage",
+                reason=(
+                    f"规则映射 {signal.kind}→{candidate.vuln_type}"
+                    if candidate.source in ("web_probe", "get_param", "form_page")
+                    else f"模型假设 {signal.kind}→{candidate.vuln_type}"
+                ),
+            )
+            store.append(finding)
+            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+            created += 1
+            created_by_type[candidate.vuln_type] = (
+                created_by_type.get(candidate.vuln_type, 0) + 1
+            )
+            created_by_source[candidate.source] = (
+                created_by_source.get(candidate.source, 0) + 1
+            )
+            if candidate.vuln_type == "sqli":
+                sqli_existing += 1
+            if candidate.vuln_type == "xss":
+                xss_existing += 1
+            if candidate.vuln_type == "idor":
+                idor_existing += 1
+            mapped += 1
+            findings.append(finding)
+        return created, merged, mapped, sqli_existing, xss_existing, idor_existing
+
+    def _model_candidates_by_asset(self, signals, scope):
+        """M9c①：T1 档产出候选，按 ``(asset, kind)`` 归位以便并回主循环。
+
+        送审集合 = **通过 check_scope 的** Signal（越界信号不进模型上下文）。
+        返回 ``{(asset, kind): [与规则表同构的候选]}``；失败按归因记审计后返回
+        空 dict——fail-closed 零候选，绝不降级为"当作合法候选"（红线 2）。
+        """
+        eligible = []
+        for signal in signals:
+            if signal.kind not in ("param-endpoint", "form_page"):
+                continue
+            if scope is not None and not check_scope(scope, [signal.asset]).allowed:
+                continue
+            eligible.append(signal)
+        if not eligible:
+            return {}
+        try:
+            summaries = summarize_triage_signals(eligible)
+            produced = build_model_candidates(
+                self.router, summaries, audit=self.audit
+            )
+        except ModelTriageError as exc:
+            # 输出非法（schema/白名单/JSON 坏）：fail-closed 零候选，
+            # 规则结果照旧生效；不静默、不降级
+            self.audit.record(
+                "triage_model_invalid",
+                reason=str(exc)[:500],
+                signals=len(eligible),
+            )
+            return {}
+        except (BudgetExceededError, ContextOverflowError):
+            raise  # 预算/上下文硬闸优先于 triage，不可被吞
+        except LLMError as exc:
+            # 档位未配置 / HTTP 故障：不阻塞主链路（规则结果仍是有效产出）
+            self.audit.record(
+                "triage_model_failed",
+                reason=str(exc)[:500],
+                signals=len(eligible),
+            )
+            return {}
+        owners: dict[str, list] = {}
+        for signal in eligible:
+            owners.setdefault(signal.asset, []).append(signal)
+        by_asset: dict[tuple[str, str], list[_TriageCandidate]] = {}
+        for item in produced:
+            hit = owners.get(item.asset)
+            if not hit:
+                continue  # 归位不上（模型改了 URL）：丢弃，宁漏勿滥
+            for signal in hit:
+                by_asset.setdefault((signal.asset, signal.kind), []).append(
+                    _TriageCandidate(
+                        vuln_type=item.vuln_type,
+                        param=item.param,
+                        severity="medium",
+                        evidence_kind=(
+                            CRAWL_FORM_EVIDENCE_KIND
+                            if signal.kind == "form_page"
+                            else CRAWL_ENDPOINT_EVIDENCE_KIND
+                        ),
+                        # triage_completed 的 created_by_source 分量
+                        source=(
+                            "model_form" if signal.kind == "form_page" else "model"
+                        ),
+                    )
+                )
+        return by_asset
 
     def _load_phase_signals(self) -> tuple[list[Signal], int]:
         """加载 evidence_dir 下全部 *.signals.jsonl（坏行跳过并计数）。"""
@@ -612,18 +794,87 @@ class Orchestrator:
                     counts["skipped"] += 1
                     continue
                 finding.audit = self.audit  # store 回放出的 Finding 无审计句柄
+                # M9c②：贵验证档前置廉价粗筛（关闭时此块零开销、零行为差）
+                if self.verify_prefilter:
+                    verdict = self._prefilter_or_cap(finding, skill_name)
+                    if verdict is not None:
+                        counts[verdict] += 1
+                        continue
                 outcome = handler(finding, skill, store)
                 counts[outcome] += 1
                 processed.append(finding)
         finally:
             self._close_browser()  # M8b：phase 收尾释放浏览器（若本 phase 建过）
+        extra = (
+            {"prefilter_advisory": self._prefilter_advisory}
+            if self.verify_prefilter
+            else {}
+        )
         self.audit.record(
             "verify_completed",
             skill=skill_name,
             processed=len(processed),
             **counts,
+            **extra,
         )
         return processed
+
+    def _prefilter_or_cap(self, finding: Finding, skill_name: str) -> str | None:
+        """M9c②：廉价粗筛（建议性）+ 贵验证档 cap。
+
+        返回 ``None`` = 放行到贵验证档；返回 ``"capped"`` = 贵验证档配额用尽，
+        **Finding 保持 Hypothesis**（不 Rejected——cap 与粗筛都只是资源调度，
+        不是判定，红线 2）。
+
+        粗筛**永不返回"丢弃"**：初版曾对 ``UNLIKELY`` 直接不进贵验证档，实测为
+        负收益（发现率被砍、误报率不降），故收窄为建议性信号——只记审计
+        ``verify_prefilter_unlikely``，候选照常进贵验证档。
+        """
+        asset = finding.asset
+        param = finding.param
+        if not param:
+            # 表单/路径型候选：param 可能为空；尝试从 asset 的 query 里取
+            # 第一个键作为扰动目标（取不到就交给 prefilter 判 UNKNOWN）
+            keys = _query_param_keys(asset)
+            param = keys[0] if keys else None
+        try:
+            result = prefilter_screen(
+                asset, param, fetcher=self._prefilter_fetch
+            )
+        except Exception as exc:  # noqa: BLE001 - 粗筛故障绝不阻塞主链路
+            self.audit.record(
+                "verify_prefilter_error",
+                finding_id=finding.id,
+                reason=f"{type(exc).__name__}: {exc}"[:300],
+            )
+            result = None
+        if result is not None:
+            # 粗筛**只出建议、永不丢弃**（M9c② 实测：丢弃是负收益——见
+            # verify/prefilter.py 的 passed 注释）。UNLIKELY 如实记审计，
+            # 由贵验证档排序与人工参考；候选照常进贵验证档。
+            self.audit.record(
+                "verify_prefilter_unlikely"
+                if result.advisory
+                else "verify_prefilter_passed",
+                finding_id=finding.id,
+                skill=skill_name,
+                # decision/reason/thresholds/长度明细全在 to_dict() 里，
+                # 不重复传 decision（否则 kwarg 冲突）
+                **result.to_dict(),
+            )
+            if result.advisory:
+                self._prefilter_advisory += 1
+        if self._expensive_spent >= self.expensive_cap:
+            # 贵验证档配额用尽：停在 Hypothesis（不驳回），交人工/下一轮
+            self.audit.record(
+                "verify_capped",
+                finding_id=finding.id,
+                skill=skill_name,
+                limit=self.expensive_cap,
+            )
+            return "capped"
+        self._expensive_spent += 1
+        return None
 
     def _verify_sqli(self, finding: Finding, skill, store: FindingStore) -> str:
         """verify-sqli SOP（skills/verify-sqli/SKILL.md）的确定性执行。

@@ -1,5 +1,8 @@
 ---
 name: verify-idor
+# mutating: false —— 验证动作只读：双会话各发一次 GET 对比，
+# 无写操作（M9c③）
+mutating: false
 description: IDOR/水平越权假设的属性验证 SOP——双会话（reference/victim 与主会话）对照判定属性违反 + Verifier 终审，产出 Confirmed/Rejected
 version: 1.0.0
 required_tools: []

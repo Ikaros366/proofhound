@@ -10,9 +10,10 @@
 
 - **证据门控反误报**：候选发现走 Signal→Hypothesis→Reproduced→Confirmed 状态机；版本匹配型 CVE、纯状态码型发现被铁律硬编码永久禁止 Confirmed；证据门（`verify/gate.py`）+ Verifier（独立模型对抗校验）双层防守。
 - **出处可调出**：每条 Finding 配证据包（原文 + sha256 manifest + 行号锚点），`python -m proofhound.findings show <id>` 纯文件离线调出，不碰网络/LLM。
-- **预算硬闸**：Run 级 token 预算调用前检查，超限即停并记审计，与 scope 授权同级不可绕过；LLM 三档路由（T0 廉价/T1 中档/T2 前沿），Verifier 与发现端必须不同模型。
+- **预算硬闸**：Run 级 token 预算调用前检查，超限即停并记审计，与 scope 授权同级不可绕过；LLM 三档路由（T0 廉价/T1 中档/T2 前沿），Verifier 以独立 agent 对抗校验——输入被硬性限制为结构化摘要与证据索引，看不到发现端的推理链；独立性来自隔离而非模型差异，T1/T2 可同模型。
 - **授权先行**：无 scope 授权文件系统拒绝启动；每条拟执行命令先提取目标过 scope 校验，越界拒绝 + 记审计。
 - **模板化报告**：docx 模板（docxtpl）一键出报告；事实字段全部来自结构化数据，LLM 只做叙述润色且段落必须锚定 Finding ID，另有确定性叙事事实守卫校验状态措辞与计数。
+- **发现侧不靠关键词表**：参数名不在内置提示表内的真实漏洞（`article_id` / `sku` / `ref` / 中文站 `bh` 等），纯规则表**根本不产生候选**——不是验证失败，是看不见。T1 档**模型驱动假设生成**补上这一层，并在 `scripts/bench_triage.py` 的中性基准上用三臂消融量化：纯规则表发现率 **33.3%** → 接入模型 **100%**（详见下「发现效果基准」）。
 
 ## ⚠️ 法律免责声明
 
@@ -25,7 +26,7 @@
 1. **LLM 只做推理**：确定性动作由调度器直接执行；LLM 规划输出结构化 JSON，不直接生成 shell 命令（命令由工具管理器按 manifest 模板拼装）。
 2. **发现 ≠ 漏洞**：候选发现默认是假的，必须经行为验证晋级 Confirmed。
 3. **上下文只进结构化摘要**：工具原始输出一律落盘 `evidence/`，LLM 上下文只有结构化数据 + 文件引用路径。
-4. **模型按任务分级**：解析/润色用廉价模型，漏洞假设与 Verifier 用前沿模型；Verifier 与发现端必须用不同模型。
+4. **模型按任务分级 + 校验独立性**：解析/润色用廉价模型，漏洞假设与 Verifier 用前沿模型；**校验独立性**——Verifier 在独立 agent、独立上下文中运行，输入仅限结构化摘要与证据索引，**模型身份不作约束**（T1/T2 可同模型）。
 5. **授权前置**：scope 强制校验、预算帽、append-only 审计日志在任何自治模式下都不可绕过。
 
 ## 定位与边界
@@ -44,6 +45,8 @@
 覆盖广度沿路线图渐进扩展，但纪律不变：**新漏洞类型必须先过"能否行为确认"这一关**——不能行为确认的宁可不做，绝不为凑覆盖率引入"疑似即确认"的降级路径。
 
 ## 三分钟看清 ProofHound
+
+最短路径只需一个目标——**不必手写 scope 文件**：系统从目标自动派生授权范围（只从该 host 派生、不跟随重定向、不扩张；通配符/裸 TLD/全网段一律拒绝），并要求你显式确认已获授权（派生是技术动作，授权是你的确认，两者分开留痕）。沙箱出口默认 `restricted`，其白名单就是这个派生范围。
 
 一条命令（`scripts/demo_killer.py`，见 Quickstart）：单 engagement 覆盖 DVWA（sqli + xss_r）与内置 IDOR fixture 双目标，katana 爬行自动产出 **21 条候选**，L2 确认队列按白名单**批准 4 条、拒绝 17 条**，最终 **3 个 Confirmed + 1 个对照 REJECTED**（证明不误报），scan→verify 全程 287 秒。以下为一次真实运行的脱敏结果：
 
@@ -80,7 +83,7 @@
 
 目标：全新机器从零 → DVWA 靶场 → 创建任务 → 批准 L2 → Confirmed → 出报告。
 
-前提：Linux（WSL 亦可）+ 可用 Docker 守护进程 + Python 3.12 + 一组 OpenAI 兼容 LLM API key（T1、T2 两档且须为**不同模型**）。
+前提：Linux（WSL 亦可）+ 可用 Docker 守护进程 + Python 3.12 + 一组 OpenAI 兼容 LLM API key（T1、T2 两档；**可用同一模型**，独立性由 agent 隔离保证，建议至少不同模型家族以降低共享盲点）。
 
 ```bash
 # 1. 获取代码与依赖
@@ -191,11 +194,29 @@ tools.d/dirsearch/
 3. `proofhound/tools/parsers/<name>_<fmt>.py`：输出解析器，配版本快照回归测试防格式漂移。
 4. `skills/<skill-name>/SKILL.md`：Skill 声明（`risk_level` L0/L1/L2 + `required_tools`）；发现类 skill 只能产 Signal/Hypothesis，Confirmed 必须经 verify-* skill 产出。
 
-## Skill 管理
+## Skill 库（内置，不开放用户自写）
 
-控制台「技能」视图支持上传（zip ≤1MiB、单顶层目录、必含 SKILL.md）、在线编辑、删除；上传经 schema + required_tools ⊆ 构造器注册表校验，all-or-nothing 零写入；内置 skill 受保护（删除 409、编辑走 copy-on-edit 不改仓库文件）。
+> **M9d 变更**：本系统**不开放用户编写 / 上传 skill**。skill 库全部内置、随仓库交付，
+> 改动内置 skill 即改动仓库文件（走正常代码评审）。配套的导入安全闸与上传/编辑端点
+> 因此一并移除——没有外来脚本可扫。
 
-> ⚠️ **信任警告**：Skill 声明的 `required_tools` 会驱动沙箱内真实命令执行。**只导入可信来源的 Skill**；导入前审阅 SKILL.md 全文。
+内置 skill 五个，各自由 `SKILL.md`（YAML frontmatter + 正文 SOP）声明：
+
+| skill | 风险级 | 是否改变目标状态 | 作用 |
+|---|---|---|---|
+| `web-scan` | L1 | 是 | httpx 探活与指纹采集 |
+| `recon-crawl` | L1 | 是 | katana 爬行与带参端点发现 |
+| `verify-sqli` | L2 | **否（只读）** | 带会话 baseline + sqlmap 确认 + Verifier 终审 |
+| `verify-xss` | L2 | **否（只读）** | 无头 Chromium canary 行为确认 |
+| `verify-idor` | L2 | **否（只读）** | 双会话属性验证（越权/IDOR） |
+
+**风险画像以代码为准**：`proofhound/skills/profiles.py` 的 `SKILL_PROFILES` 是
+`risk_level` 与「是否只读」的**运行时唯一真相源**（`SKILL.md` 的 frontmatter 是
+人类可读文档，`tests/test_skill_profiles.py` 断言两者一致）。这张表决定哪些动作在
+semi_auto 下可以自动执行——新增内置 skill 必须在表内登记，否则 fail-closed。
+
+> ⚠️ **信任边界**：`required_tools` 会驱动沙箱内真实命令执行。skill 随仓库交付意味着
+> 这个边界由代码评审把关，而不是由终端用户上传时把关。
 
 ## 自主模式三档
 
@@ -203,7 +224,10 @@ tools.d/dirsearch/
 |---|---|---|---|
 | L0 被动 | 自动 | 自动 | 自动 |
 | L1 主动扫描 | 需确认 | 自动 | 自动 |
-| L2 利用验证 | 需确认 | 需确认 | 自动 |
+| L2 利用验证（写操作） | 需确认 | 需确认 | 自动 |
+| L2 只读验证（M9c③ 人工闸细分） | 需确认 | **自动** | 自动 |
+
+L2 内部区分「只读验证」与「写操作」：只读与否由 skill 在 `SKILL.md` 用 `mutating` 声明（**缺省 `true` = fail-closed**，未声明即按写操作对待）；内置 `verify-sqli` / `verify-xss` / `verify-idor` 声明为只读。细分级**不放宽最严格档**（supervised 一律需确认）。
 
 未知风险级 fail-closed（一律禁止）。模式切换收紧自由、放宽须显式 operator 确认并记 `autonomy_mode_changed` 审计；确认请求超时默认拒绝。**任何模式下 scope 校验、预算硬闸、凭据脱敏、append-only 审计都不可旁路。**
 
@@ -223,7 +247,66 @@ tools.d/dirsearch/
 
 ## 路线图与已知限制
 
-已完成：M1 工具底座（manifest/安装器/沙箱/scope/审计）→ M2 Skill 系统 + 编排器 + 模型路由预算 → M3 Finding 生命周期 + 证据门 + Verifier + verify-sqli 垂直切片 + katana 发现自动化 → M4 报告引擎 + 模板适配 → M5 Web API + 自主模式闸门 + 本地控制台 → M6 稳定性加固 + 管理面 + CVSS 真实化 + 叙事事实守卫。M7 开源准备即本仓库当前形态；M8 验证场景扩展进行中：已完成 POST 表单发现自动化、verify-xss（浏览器 canary 行为确认）、verify-idor（双会话属性验证）。待做：PDF 报告管线、verify-lfi、垂直越权/多步业务流验证、stored/DOM 型 XSS、LLM triage、成本仪表盘、MCP 暴露、持续监测。
+> **状态**：M9a~M9d 的改动**尚未提交**（工作树有未提交改动），发布动作由维护者裁决。
+
+已完成：M1 工具底座（manifest/安装器/沙箱/scope/审计）→ M2 编排器 + 模型路由预算 → M3 Finding 生命周期 +
+证据门 + Verifier + verify-sqli + katana 发现自动化 → M4 报告引擎 + 模板适配 → M5 Web API + 自主模式闸门 + 本地控制台 →
+M6 稳定性加固 + 管理面 + CVSS 真实化 + 叙事事实守卫 → M7 开源准备 → M8 验证场景扩展（POST 表单发现、verify-xss 浏览器
+canary 确认、verify-idor 双会话属性验证）。
+
+**M9 起转向发现层与结构收敛**（四条已落地）：
+
+| 里程碑 | 内容 |
+|---|---|
+| M9a | **从目标派生 scope**——创建 engagement 只给 target，不再手写 scope YAML（派生与授权拆开，`acknowledge_authorization` 显式确认） |
+| M9b | 红线 4 重定义为**校验独立性**——Verifier 的独立性由 agent 隔离 + 输入边界保证，**不约束模型身份**（T1/T2 可同模型） |
+| M9c | **发现层去锁**——T1 档模型驱动假设生成补关键词盲区；廉价粗筛层把上限从候选生成侧移到贵验证档；中性基准量化增益 |
+| M9d | **skill 收敛**——不开放用户自写 skill（skill 库全部内置），撤下导入安全闸与上传端点；风险画像改为 `skills/profiles.py` **单一真相源** |
+
+### 发现效果基准
+
+`scripts/bench_triage.py` 用**自建 stdlib fixture**（A/B 两族端点行为同构，唯一变量是参数名是否命中内置提示表）
+做三臂消融，因此发现率差异只可能来自 triage 的关键词匹配，不可能来自靶场难度差：
+
+| 臂 | 发现率 | 误报率（候选级） | 粗筛后 |
+|---|---|---|---|
+| `rules`（纯规则表，M9c 之前） | **33.3%** | 50.0% | 33.3% / 25.0% |
+| `model`（纯模型，真实 T1 档） | 91.7% | 50.0% | 91.7% / 25.0% |
+| `rules+model`（目标形态，真实 T1 档） | **100.0%** | 75.0% | **100.0% / 25.0%** |
+
+纯规则表漏掉 8/12 条真实漏洞，其中 6 条是参数名不在提示表的盲区。
+
+```bash
+.venv/bin/python scripts/bench_triage.py            # 离线确定性，零 Docker 零 LLM
+.venv/bin/python scripts/bench_triage.py --model    # rules+model 臂接真实 T1 档（需 PROOFHOUND_T1_*）
+```
+
+> **语义纪律**：该基准的误报率是**候选级**——发现侧产出候选不等于确认漏洞（红线 2）。Confirmed 级数字须跑真实
+> verify 链路（Docker + Chromium + T2）。发现侧的误报由确认链路（L2 闸门 + 行为验证 + 证据门 + Verifier）消化，
+> 而不是靠发现侧保守到看不见漏洞。
+
+**两个发现层开关缺省关闭**，开启后行为变更：`PROOFHOUND_TRIAGE_MODEL=1`（模型驱动假设生成）、
+`PROOFHOUND_VERIFY_PREFILTER=1`（贵验证档前置廉价粗筛）。
+
+### 下一步（待维护者裁决）
+
+按依赖排序，前三项各自独立可交付：
+
+1. **基线数字补完**——当前基准只到候选级。用同一 fixture 端到端跑通真实确认链路，拿到
+   **Confirmed 级误报率与单题成本**。这是 M9c 两个开关「要不要默认开启」以及一切后续
+   「发现侧继续放开」论证的事实前提。
+   *工作量小（复用既有 fixture 与装配），但需要 Docker + Chromium + T2。*
+2. **验证类型扩展：SSRF**——发现层已不是瓶颈（模型已达 100%），瓶颈转为**可确认的漏洞类别数**。
+   选 SSRF 而非 LFI 的理由是确认手段的确定性：SSRF 靠**回调服务器收到请求**判定，是二值事实；
+   LFI 靠回显 canary 文件，受目标环境与路径知识影响，判定更易含糊。建议**分两步走**：
+   先把 `vuln_type` 白名单从 `{sqli,xss,idor}` 放开一个类型、用基准测模型候选质量，
+   再决定是否投入建验证器——而不是先建验证器再给它找活干。
+3. **成本可见性**——单题成本目前只在基准脚本里算得出来，系统内没有视图。M9c 引入了模型 triage 的
+   token 开销，成本不透明会直接影响「要不要默认开启」的判断。
+
+搁置：PDF 报告管线、stored/DOM 型 XSS、垂直越权/多步业务流验证、MCP 暴露、持续监测（均非当前瓶颈）；
+**skill 机制进一步收敛（Phase 3）明确不做**——`SkillRegistry` 经 M9d 已不再是安全真相源，且
+`web-scan`/`recon-crawl` 的 SOP 仍被 T1 规划器真实读取，进一步收敛只有审美收益却要动 168 个测试函数。
 
 已知限制摘要（完整清单见 [AGENTS.md](AGENTS.md)「已知限制」）：行为验证为 sqli/xss/IDOR 三条垂直切片（各有限定场景——sqli 覆盖 GET 参数与 POST 表单、XSS 仅 reflected/GET、IDOR 仅水平越权 GET 对象且需双身份会话）；发现自动化覆盖 GET 查询参数端点与 POST 表单页；API 无认证；沙箱出口白名单仅覆盖 HTTP(S)；控制台为轮询无 WebSocket；报告仅 docx。
 

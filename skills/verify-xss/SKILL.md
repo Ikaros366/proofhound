@@ -1,5 +1,8 @@
 ---
 name: verify-xss
+# mutating: false —— 验证动作只读：浏览器只加载 payload 页面，
+# 非破坏性 canary 探针，不提交状态变更（M9c③）
+mutating: false
 description: XSS 假设的行为验证 SOP——无头 Chromium canary 探针确认 payload 真实执行 + Verifier 终审，产出 Confirmed/Rejected
 version: 1.0.0
 required_tools: []

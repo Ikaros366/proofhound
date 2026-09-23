@@ -8,8 +8,10 @@
 - 每次调用记录 tier/model/tokens/耗时（llm/usage.py），并追加审计
   ``llm_call``；配置预算（:class:`~proofhound.llm.usage.TokenBudget`）时
   每次调用前检查，超限抛 :class:`~proofhound.llm.usage.BudgetExceededError`；
-- 红线 4 启动校验：T2 与 T1 配置了相同模型时打警告（Verifier 与发现端
-  必须用不同模型，M3 验证层将使用 T2）。
+- 红线 4（M9b 重定义）：**校验独立性**——Verifier 必须在独立 agent、独立
+  上下文中运行，输入仅限结构化摘要与证据索引；**不约束模型身份**，T1 与 T2
+  允许配置同一模型（同模型时记 ``llm_tiers_share_model`` 审计提示共享盲点，
+  不再是启动警告）。
 """
 
 from __future__ import annotations
@@ -116,12 +118,25 @@ class ModelRouter:
         self._clients = {
             tier: LLMClient(cfg.to_llm_config()) for tier, cfg in self.configs.items()
         }
+        # M9b：红线 4 不再约束"模型身份"，改为约束"agent 独立性"——Verifier
+        # 与发现端必须在独立 agent、独立上下文中运行，输入仅限结构化摘要与
+        # 证据索引（见 verify/verifier.py 的输入边界，
+        # tests/test_verifier_independence.py 锁死该性质）。
+        # 故 T1 与 T2 允许配置同一模型；同模型时只记一次审计，提示共享盲点
+        # 风险——"不同模型"本就不等于"不同盲点"（同家族不同尺寸的模型盲点
+        # 高度相关），模型身份不是独立性的有效保证。
         t1, t2 = self.configs.get(Tier.T1), self.configs.get(Tier.T2)
-        if t1 is not None and t2 is not None and t1.model == t2.model:
-            warnings.warn(
-                f"T2 与 T1 配置了相同模型（{t1.model}）：红线 4 要求 Verifier "
-                "与发现端使用不同模型（M3 验证层将使用 T2 档）",
-                stacklevel=2,
+        self.shared_model_across_tiers = (
+            t1.model if (t1 is not None and t2 is not None and t1.model == t2.model) else None
+        )
+        if self.shared_model_across_tiers is not None and self.audit is not None:
+            self.audit.record(
+                "llm_tiers_share_model",
+                model=self.shared_model_across_tiers,
+                note=(
+                    "T1/T2 配置同一模型；校验独立性由 agent 隔离与输入边界保证，"
+                    "建议至少考虑不同模型家族以降低共享盲点"
+                ),
             )
 
     @classmethod

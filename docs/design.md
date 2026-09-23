@@ -22,7 +22,7 @@
 
 ### 2.1 功能目标
 
-- **F1 可导入 Skill**：采用 Agent Skills 开放规范（SKILL.md），支持从本地目录、Git 仓库、内部 registry 导入第三方 skill，与 Kimi Code / Claude Code 生态兼容。
+- ~~**F1 可导入 Skill**：采用 Agent Skills 开放规范（SKILL.md），支持从本地目录、Git 仓库、内部 registry 导入第三方 skill，与 Kimi Code / Claude Code 生态兼容。~~ **已于 M9d 撤回**（维护者裁定不开放用户自写 skill）：skill 库全部内置、随仓库交付，仍用 SKILL.md 作为组织格式与人类可读文档，但不再是外部扩展面；导入安全闸与上传端点一并移除。详见 §7.6.4。
 - **F2 工具自管理**：本地预置工具优先使用；缺失工具按配方自动下载安装（白名单源 + 哈希校验）；全程在 Docker 沙箱中执行。
 - **F3 模板化报告**：用户提供 docx/html 模板，系统按模板自动输出渗透报告；事实性内容全部来自结构化数据，LLM 只做叙述润色。
 
@@ -49,7 +49,7 @@
 1. **LLM 只做推理**：确定性动作（端口扫描、目录爆破、模板渲染）由调度器直接执行，LLM 只负责制定计划、解读结构化结果、决定下一步。
 2. **发现 ≠ 漏洞**：一切候选发现默认是假的，必须通过验证层的状态机和证据门才能进入报告。
 3. **上下文只进结构化摘要**：工具原始输出一律落盘，进入 LLM 上下文的只有解析后的结构化数据与文件引用。
-4. **模型按任务分级**：解析/分类/去重/润色用廉价模型，仅漏洞假设与利用链规划使用前沿模型。
+4. **模型按任务分级 + 校验独立性**：解析/分类/去重/润色用廉价模型，仅漏洞假设与利用链规划使用前沿模型；**校验独立性**（M9b 重定义）——Verifier 必须在独立 agent、独立上下文中运行，输入仅限结构化摘要与证据索引（看不到发现端的推理链），**模型身份不作约束**，T1 与 T2 允许配置同一模型。独立性由 agent 隔离与输入边界保证，而非模型差异——"不同模型"并不等于"不同盲点"（同家族不同尺寸的模型盲点高度相关）。
 5. **授权前置**：无 scope 授权文件系统拒绝启动；每条拟执行命令的目标先过 scope 校验。
 
 ## 4. 总体架构
@@ -238,10 +238,10 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 #### 5.4.4 Verifier Agent（对抗校验）
 
 - 独立 Agent，唯一职责是**攻击结论**：证据是否支持？是否存在更平凡的解释？前置条件当前是否满足？
-- 与发现端使用不同模型，避免同源偏见。
+- 在独立 agent、独立上下文中运行（M9b：不约束模型身份，改由 agent 隔离 + 输入边界避免同源偏见）。
 - 输出结构化裁定：`confirm / downgrade / reject + 理由`。
 
-> **M3b 落地注记**（2026-08-07）：实现于 `proofhound/verify/verifier.py`，走 **T2 档**（红线 4：与发现端 T1 异模型，同模型启动警告沿用 M2c 机制）。输入严守红线 3：Finding 结构化摘要 + 证据包索引（文件名/sha256/行号锚点）+ baseline diff 摘要，**不喂原始输出**；prompt 超字符硬上限抛 `ContextOverflowError`。输出 Pydantic 强校验 `{"verdict": confirm|reject, "reason"}`（本刀不收 downgrade），任何非法输出抛 `VerifierError`——**非法 verdict 拒收**，编排层 fail-closed 停于 Reproduced 并记 `verify_blocked`。裁定落 `Finding.verifier`，记审计 `verifier_verdict{finding_id, model, verdict, reason}`。Confirmed 迁移条件 = 行为证据存在 ∧ 证据门通过 ∧ Verifier confirm，三者缺一不得确认；reject → `REJECTED(actor=verifier)`。
+> **M3b 落地注记**（2026-08-07）：实现于 `proofhound/verify/verifier.py`，走 **T2 档**（红线 4 于 M9b 重定义为 **校验独立性**：独立 agent + 输入边界，**不约束模型身份**，T1/T2 允许同模型）。输入严守红线 3：Finding 结构化摘要 + 证据包索引（文件名/sha256/行号锚点）+ baseline diff 摘要，**不喂原始输出**；prompt 超字符硬上限抛 `ContextOverflowError`。输出 Pydantic 强校验 `{"verdict": confirm|reject, "reason"}`（本刀不收 downgrade），任何非法输出抛 `VerifierError`——**非法 verdict 拒收**，编排层 fail-closed 停于 Reproduced 并记 `verify_blocked`。裁定落 `Finding.verifier`，记审计 `verifier_verdict{finding_id, model, verdict, reason}`。Confirmed 迁移条件 = 行为证据存在 ∧ 证据门通过 ∧ Verifier confirm，三者缺一不得确认；reject → `REJECTED(actor=verifier)`。
 
 #### 5.4.5 去重与误报库
 
@@ -290,7 +290,7 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 |---|---|---|
 | T0 廉价/本地 | 输出解析兜底、分类、去重判定、报告润色 | DeepSeek / Kimi K2 级 API，或本地 Qwen（数据不出内网，合规友好） |
 | T1 中档 | triage、摘要、假设生成 | 中档商用模型 |
-| T2 前沿 | 漏洞推理、利用链规划、Verifier 终审 | 前沿推理模型（Verifier 与发现端必须用不同模型） |
+| T2 前沿 | 漏洞推理、利用链规划、Verifier 终审 | 前沿推理模型；Verifier 与发现端**须为独立 agent、独立上下文**（M9b：模型身份不作约束，可与 T1 同模型） |
 
 **上下文治理**：
 - 工具原始输出 100% 落盘，上下文只进结构化摘要 + 引用路径。
@@ -303,7 +303,7 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 
 **成本可观测**：每次 LLM 调用记录 tokens/费用/耗时，按 engagement 出成本仪表盘；超预算自动降级或挂起。
 
-> **M2c 落地注记**（2026-08-07）：模型路由落地为 `proofhound/llm/router.py`——Tier 枚举 + TierConfig，三档独立环境变量 `PROOFHOUND_T0/T1/T2_{BASE_URL,API_KEY,MODEL[,TEMPERATURE,MAX_TOKENS]}`，HTTP 复用 `llm/client.py`，router 只做选路与计量；T1==T2 同模型启动即警告（红线 4）。用量计量与预算硬闸落地为 `proofhound/llm/usage.py`：每次调用记 tier/model/prompt_tokens/completion_tokens/耗时（响应无 usage 时按 4 字符≈1 token 估算并标 `estimated`），追加审计 `llm_call`；`PROOFHOUND_MAX_TOKENS_PER_RUN`（及可选分档 `..._T0/T1/T2`）为 Run 级硬闸，调用前检查，超限即停止规划循环、节点 blocked 并记 `llm_budget_exceeded`——与 scope 同级，任何自治模式不可绕过。上下文治理落地为 `proofhound/core/context.py`：Signal 摘要超 `PROOFHOUND_CONTEXT_MAX_SIGNALS`（默认 20）条按 kind 聚合、每类留最新 `PROOFHOUND_CONTEXT_KEEP_LATEST`（默认 5）条并保留 total_counts；prompt 字符硬上限 `PROOFHOUND_CONTEXT_MAX_CHARS`（默认 32000），超限先压缩、仍超则任务 failed 并记 `context_overflow`，禁止静默截断。未做：成本仪表盘（现仅有 `llm_call` 审计事件）、"超额自动降级模型或挂起请示"（当前策略为超限即 blocked 升级）。
+> **M2c 落地注记**（2026-08-07）：模型路由落地为 `proofhound/llm/router.py`——Tier 枚举 + TierConfig，三档独立环境变量 `PROOFHOUND_T0/T1/T2_{BASE_URL,API_KEY,MODEL[,TEMPERATURE,MAX_TOKENS]}`，HTTP 复用 `llm/client.py`，router 只做选路与计量；T1==T2 同模型记 `llm_tiers_share_model` 审计（M9b：红线 4 已重定义为 agent 独立性，不再是启动警告）。用量计量与预算硬闸落地为 `proofhound/llm/usage.py`：每次调用记 tier/model/prompt_tokens/completion_tokens/耗时（响应无 usage 时按 4 字符≈1 token 估算并标 `estimated`），追加审计 `llm_call`；`PROOFHOUND_MAX_TOKENS_PER_RUN`（及可选分档 `..._T0/T1/T2`）为 Run 级硬闸，调用前检查，超限即停止规划循环、节点 blocked 并记 `llm_budget_exceeded`——与 scope 同级，任何自治模式不可绕过。上下文治理落地为 `proofhound/core/context.py`：Signal 摘要超 `PROOFHOUND_CONTEXT_MAX_SIGNALS`（默认 20）条按 kind 聚合、每类留最新 `PROOFHOUND_CONTEXT_KEEP_LATEST`（默认 5）条并保留 total_counts；prompt 字符硬上限 `PROOFHOUND_CONTEXT_MAX_CHARS`（默认 32000），超限先压缩、仍超则任务 failed 并记 `context_overflow`，禁止静默截断。未做：成本仪表盘（现仅有 `llm_call` 审计事件）、"超额自动降级模型或挂起请示"（当前策略为超限即 blocked 升级）。
 
 ### 5.7 报告引擎（L5）
 
@@ -428,6 +428,204 @@ proofhound/
 └── docs/
 ```
 
+## 7.5 M9 落地注记（2026-09-22：scope 零摩擦化 + 校验独立性重定义）
+
+**M9a 从种子目标派生 scope**（`proofhound/compliance/derive.py`）。动机：M9a 之前创建
+engagement 必须手写 scope YAML，摩擦高到促使操作员想直接删掉 scope 校验——而 scope 不只是
+授权声明，它同时是**出口白名单的数据源**（`tools/egress.py`：白名单 = scope + 安装源），
+删掉等于要么全阻要么开全放。故 M9a 采取"降摩擦但不放宽"：
+
+1. **派生是纯确定性动作**（零 LLM 零网络）：从种子 host 产 `domains` / 单主机 `networks`
+   （IP 恒 `/32`、`/128`）+ 显式非默认端口。**只从种子 host 派生，不跟随重定向、不解析页面
+   链接、不并入爬到的域名**——扩张授权范围是安全事故，不是便利。
+2. **授权是人的确认**：两者此前混在一起，M9a 拆开——无 scope 文件时由目标派生，此时必须显式
+   `acknowledge_authorization=true`，否则 403 且零副作用；确认落审计 `authorization_acknowledged`，
+   派生落 `scope_derived`，两条并行留痕便于事后归因。
+3. **fail-closed 纪律**：通配符、裸 TLD、`0.0.0.0/0`、单标签主机（localhost 除外）、不可解析
+   形态一律 `ScopeDerivationError`。宁可让操作员手写 scope，也不产出一个过宽的授权。
+4. **`ports` 语义沿用既有约定**（空 = 不限端口）。显式默认端口（http→80 / https→443）**不写入**
+   `ports`——刻意不从 scheme 推 `ports: [443]`，那会把操作员已授权的同一主机挡在 8080 之外，
+   属"派生反而更严"的意外，与降摩擦意图相反。
+5. **派生结果持久化**为实际生效的那一份（`api.json` 的 `derived_scope`），而非每次扫描现算——
+   否则"操作员看到的"与"实际生效的"会漂移，审计也追溯不了。`load_scope` 把派生范围与 scope
+   文件**并集**，**5 层 `check_scope` 与出口白名单因此零改动自动覆盖**。
+
+> **实现期真实踩到的坑**：`Engagement._persist()` 原先硬编码 key 白名单，会把 `derived_scope`
+> 抹掉——每次状态迁移写回后 `start()` 就重校验到一个空 scope，授权范围静默消失。已修，并由
+> `test_derived_scope_survives_state_transition_persist` / `..._survives_manager_restart` 锁死。
+
+**M9a 附带还债**：`default_phases_factory` 的沙箱出口从演示取向的 `open` 改为默认 `restricted`
+（AGENTS.md 已知限制 24 由此还清）。
+
+**M9b 红线 4 重定义：模型身份 → 校验独立性**。原表述"Verifier 与发现端必须用不同模型"，实现上
+只是 `ModelRouter` 启动时一句 `warnings.warn`（非硬约束），且**本就管错了维度**——"不同模型" ≠
+"不同盲点"（同家族不同尺寸的模型盲点高度相关）。Verifier 的独立性实际由三处保证，且全都与模型
+身份无关：① 输入边界（红线 3：只收结构化摘要 + 证据包索引 + diff 摘要，不喂原始输出）；
+② 独立 agent + 独立 system prompt（对抗校验员视角）；③ 输出 Pydantic 强校验（非法 verdict 一律
+拒收）。故 M9b 把红线 4 改为约束这三条——从不可验证的配置事实，变成**可测试的工程属性**，
+并以 `tests/test_verifier_independence.py` 锁死（含"同模型下依然成立"一条，这是 M9b 的核心主张）。
+同模型配置保留 `llm_tiers_share_model` 审计，提示共享盲点风险。
+
+## 7.6 M9c 落地注记（2026-09-22：发现层去锁）
+
+**问题定位**。M3d 起 triage 是纯规则表（`core/orchestrator.py::_triage_candidates`）：参数键
+**精确匹配**约 20 个英文键名。一个参数叫 `article_id` / `sku` / `token` / `ref` / `no`，或中文站点
+的 `bh`（编号），系统**根本不产生候选**——不是验证失败，是看不见。而 `llm/router.py` 的档位定义
+里 T1 档写的就是「triage、摘要、假设生成、规划」，triage 却从未用过 LLM。
+
+**为什么先测基线**。参照系缺失时，所有架构增益都悬空——无法分辨「新 triage 有效」与「模型本来
+就能干、脚手架在拖后腿」。故 M9c 的硬前置是中性基座（`scripts/bench_triage.py`）：
+
+- **为什么不用 DVWA**：DVWA 的参数名全是 `id`/`name`，**恰好落在提示表内**——拿它测关键词盲区
+  必然测不出来。基座因此自建 stdlib fixture，A/B 两族端点**行为同构、唯一变量是参数名是否命中
+  提示表**，故任何发现率差异只可能来自 triage 的关键词匹配，不可能来自靶场难度差。
+- **三臂消融**：`rules`（现状）/ `model`（纯模型，对标"裸模型"参照线）/ `rules+model`（目标形态）。
+- **实测**（12 真漏洞 / 4 安全对照，确定性、零 Docker 零 LLM）：
+
+  | 臂 | 发现率 | 误报率 | 粗筛后 |
+  |---|---|---|---|
+  | `rules`（现状） | **33.3%** | 50.0% | 33.3% / 0.0% |
+  | `model`（纯模型） | 91.7% | 0.0% | 91.7% / 0.0% |
+  | `rules+model`（目标） | **100.0%** | 50.0% | **100.0% / 0.0%** |
+
+  纯规则表**漏掉 8/12 条真实漏洞**，其中 6 条正是参数名不在提示表的盲区。这就是"发现层被锁死"
+  的第一个可复现数字。
+
+- **真实 T1 档实测**（`bench_triage.py --model`，替换「能力上界」替身）：
+
+  | 臂 | 发现率 | 误报率 | 粗筛后 |
+  |---|---|---|---|
+  | `rules` | 33.3% | 50.0% | 33.3% / 25.0% |
+  | `model`（真实 T1，5,516 token） | **91.7%** | 50.0% | 91.7% / 25.0% |
+  | `rules+model`（真实 T1，10,028 token） | **100.0%** | 75.0% | 100.0% / 25.0% |
+
+  即：**真实 T1 档的发现率与理想模型上界几乎持平**（91.7% vs 91.7%），但模型沿提示词的
+  语义线索把对照组 `/d/safe4`（有授权判断的安全端点）也判成了候选，故**候选级**误报率高于
+  替身。这正是扫描结果必须过 L2 闸门 + 行为验证 + 证据门 + Verifier 才成 Confirmed 的原因
+  （红线 2）——发现侧的误报由确认链路消化，而不是靠发现侧保守到看不见漏洞。
+
+
+**① 模型驱动假设生成**（`proofhound/llm/triage.py`，T1 档）。四条纪律：
+
+1. **只推理**（红线 1）：产出结构化候选（`vuln_type` + `param` + 理由 + 置信度），不生成命令、
+   不发请求；
+2. **不发明漏洞类型**：`vuln_type` 白名单硬编码为 `{sqli, xss, idor}`（= `GATE_MATRIX` 覆盖类型）。
+   未知类型虽被证据门 fail-closed 拒绝，但放行只会污染 `findings.jsonl`；
+3. **输入边界**（红线 3）：prompt 只含 URL path、参数名、状态码、表单字段名与**响应长度**；
+   响应体一行不进（HTTP 响应体是最典型的不可信输入），原文落 `evidence/`、prompt 只给文件引用；
+4. **fail-closed**：Pydantic 强校验 + 白名单 + **接地性**（`param` 必须在该批摘要真实出现过）+
+   `llm/repair.py` 一次修复重试；非法输出**零候选**，不降级为"当作合法候选"。
+
+**归属确定性回填**：模型只回参数名与类型、**不回 URL**，候选归属由送审摘要回填——模型无法把
+候选挪到别的资产上（红线 5 面）。**送审集合 = 通过 `check_scope` 的 Signal**，越界信号在到达模型
+之前就已丢弃。
+
+**② 接线**（`core/orchestrator.py`）。候选两来源由 `triage_rules`（缺省 True）与 `triage_model`
+（**缺省 False**）开关控制，两者**汇入同一套** dedup / 上限 / scope 校验 / 证据包逻辑——故 5 层
+`check_scope` 纵深与出口白名单零改动即覆盖模型候选。模型只提出候选，**不改变任何确认路径**
+（仍须过 L2 闸门 → 行为验证 → 证据门 → Verifier）。规则路径经 `_ingest_candidates` 机械抽出后
+**逐字节等价**，旧 21 个 triage 测试零改动全绿。
+
+**③ 廉价粗筛**（`proofhound/verify/prefilter.py`）。动机：原先 `_TRIAGE_*_CAP`（20/10/10）是在
+**发现侧**设卡防确认洪泛，等于用"少发现"换"不洪泛"；本层加入后 cap 移到**贵验证档**
+（`_TRIAGE_EXPENSIVE_CAP`），发现侧随之放开。判定依据是**参数影响力差分**（两个语义上应产生不同
+结果的取值，比响应长度）。
+
+> **实现期实测到的负结果（重要，已锁进代码注释与测试）**：初版把 `UNLIKELY`（两个取值响应逐字节
+> 等长）当作"不进贵验证档"，在本仓库基座上实测为**负收益**——`rules+model` 臂发现率被从 100%
+> 砍到 83.3%，而误报率**一点没降**。原因是差分假设不成立：「两个取值等长」同样出现在 blind 注入、
+> 定长模板、参数不影响输出等大量情形里，它**不是**漏洞的负面证据。故本层收窄为
+> **建议性信号（永不丢弃候选）**：只产出 `decision` 供贵验证档排序与人工参考。
+> 另修一处方法感知缺陷：POST 表单候选的 asset 是页面 URL（无 query），对它发 GET 探测在语义上
+> 不成立（两个取值必然等长），原先误判 `UNLIKELY`，现判 `UNKNOWN`（宁漏勿滥）。
+> 修好后的实测：粗筛把候选级误报率从 50% 降到 **0%**，且**不再损失任何真漏洞**（发现率保持 100%）。
+
+**开关与残余**：`PROOFHOUND_TRIAGE_MODEL` / `PROOFHOUND_VERIFY_PREFILTER` 均**缺省关闭**，
+默认行为与 M9c 之前逐字节等价。残余：模型输出质量取决于档位模型（基座内 `model` 臂用的是
+"能力上界"离线替身，**不代表真实模型表现**——真实数字须 `bench_triage.py --model` 跑 T1 档）；
+粗筛只处理 GET 型候选，POST 表单候选一律放行；候选级误报率不等于 Confirmed 级误报率
+（后者须跑真实 verify 链路）。
+
+### 7.6.3 M9c③ 人工闸细分（只读验证可自动 / 写操作留人工）
+
+**动因**。`autonomy.py` 原先按 L0/L1/L2 一刀切：semi_auto 下**所有** L2 动作都进确认
+队列。但 L2 里混着两类性质完全不同的动作——「只读验证」（sqlmap 确认、浏览器 canary
+探测、双会话 GET 对比）与「写操作 / 状态变更」。前者不改变目标状态，后者会。代码里
+`katana` 的 `-cos` 状态变更排除清单（logout/ids 类端点）说明维护者早已在意这个区分。
+
+**改动面只有一格**。`_GATE_MATRIX` 从「模式 × 等级」扩为「模式 × 等级 × 是否改变状态」：
+
+| 模式 | L0 | L1 | L2 写操作 | L2 只读验证 |
+|---|---|---|---|---|
+| supervised | auto | confirm | confirm | confirm |
+| semi_auto | auto | auto | confirm | **auto** |
+| unattended | auto | auto | auto | auto |
+
+- **supervised 一律 confirm**：细分级只在"要不要问人"上做区分，**不放宽最严格档**；
+- **unattended 本就全自动**：细分不改变其裁定；
+- **唯一差异格 = semi_auto × L2**，有参数化测试逐格核对，防止误放宽其他档。
+
+**mutating 从哪来**：skill manifest 新增可选字段 `mutating`（**缺省 `true` =
+fail-closed**）。未声明的 skill 一律按"会改变目标状态"对待。内置声明：
+`verify-sqli` / `verify-xss` / `verify-idor` = `false`（三者都是只读验证——sqlmap 构造
+器硬禁 `risk>2` 的 OR 型注入与任何写操作，浏览器只加载 payload 页，idor 只发 GET 对比）；
+`web-scan` / `recon-crawl` = `true`（会向目标发起真实请求，保守声明）。
+
+**不改 API 契约**：`gate_matrix()` 仍返回扁平「模式 → 等级 → 裁定字符串」——
+`GET /health` 的 `autonomy_gate` 字段与控制台 `app.js`（按字符串渲染）依赖该形态，
+故不因新增维度改形；只读行另经 `gate_matrix_read_only()` 导出。
+
+**为什么这一刀安全**：它区分的是"是否改变目标状态"，而**不是**放宽任何硬闸——
+scope 强校验、token 预算、凭据脱敏、append-only 审计在任何裁定下一律照旧；且只读声明
+是 skill 的显式契约，未声明即按写操作处理。命中细分级自动执行的 L2 会落审计
+`action_read_only_auto`，便于事后归因"为什么这次没人被问"。
+
+**验证**：`tests/test_gate_sublevels.py`（39 个：矩阵两行逐格 / 未知等级两行都
+fail-closed / 导出形态与只读导出差异面 / manifest 缺省与显式声明 / 编排层映射与
+fail-closed 回退）+ `tests/test_readonly_e2e.py`（2 个端到端：semi_auto 下只读验证
+**零确认队列**且 Finding 仍走完行为验证到 Confirmed、写操作仍进队列）。
+
+
+### 7.6.4 M9d skill 收敛（撤下用户导入面 + 单一真相源）
+
+**动因（维护者裁定）**：本系统**不打算让用户自己写 skill**。这条裁定直接抹掉了
+skill 机制在本项目里的两个真实价值：
+
+1. **不可信输入的校验边界**——导入安全闸（`skills/gate.py` 静态扫描外来脚本的网络外联/
+   删除/提权/动态执行 + 高危默认禁用 + 人工 `confirm()`）的前提是"skill 可以是外来文件"，
+   而 zip 上传端点（M6a）服务的是"用户交付 skill"这一场景；
+2. **扩展不需要改仓库**——用户可加扫描过程，同样以上传为前提。
+
+两者前提都不成立时，剩下的就是纯开销，且其中一项是**可验证的正确性风险**。
+
+**① 单一真相源**（`proofhound/skills/profiles.py`）。「某条内置 skill 是 L2 还是 L1、
+是否只读」原先同时存在于 SKILL.md frontmatter 与各 Python 处（闸门槽位、`mutating_by_skill`
+映射）——**没有任何机制保证两者一致**，改一处忘一处即静默不一致，而这类不一致恰好落在
+安全语义上（闸门裁定、是否需人工确认）。M9d 起该表是**运行时唯一真相源**，闸门只读它；
+`SKILL.md` 降级为人类可读文档，由 `tests/test_skill_profiles.py` 断言逐条一致——
+**文档可以读，但不能与代码矛盾**（不一致即测试失败，而不是静默生效）。
+表内未登记的名字走 fail-closed（`profile_for` 抛错），非内置名字回退 manifest 声明值以保持
+对外语义不变。
+
+> 其中一条测试刻意写成「诚实记录」：断言编排路径上 `manifest.risk_level` 已**不再作为
+> 判定值被读**（只作为 `_builtin_risk_level` 的回退实参出现）。这是为了防止后来者误以为
+> 改 Markdown 里的 `risk_level` 能改变闸门行为。
+
+**② 撤下用户导入面**（净删约 600 行）。删除面：
+`skills/gate.py`（206 行）、`registry` 的 `risk_report`/`confirmed`/`confirm()`、
+API 侧 `GET/POST/PUT/DELETE /api/skills` 五个端点与 `SkillUpdateRequest`、
+`management.py` 的 skill CRUD（zip 上传 / copy-on-edit / 符号链接本地化，441→207 行）、
+控制台「技能」上传编辑视图（`app.js` −158 行）与导航项。**保留**：SKILL.md 解析校验、
+registry（编排器仍需按名查 skill 与正文 SOP）、`enable()`/`disable()`
+（planner 的「skill 未启用即拒」仍依赖它，有测试覆盖）。
+
+**③ 撤回公开承诺**。F1「可导入 Skill（本地目录 / Git 仓库 / 内部 registry 三种导入来源）」
+标记为**已撤回**——它曾是对外承诺，故按 M9a 撤回已知限制 24 的先例显式记明，而非静默删除。
+
+**代价与披露**：删除两个测被删功能的测试文件（`test_skill_gate.py`、`test_skill_admin.py`）。
+其余 18 个引用 `SkillRegistry` 的测试文件**零改动**——因为 registry 接口本身保留，
+只删了它内部的安全闸与确认流程。
+
 ## 8. 开发路线图
 
 | 里程碑 | 内容 | 验收标准 |
@@ -437,6 +635,9 @@ proofhound/
 | M2 编排器（2~3 周） | skill registry、任务 DAG、模型路由、预算帽、上下文治理；补齐 M1 遗留：① 从文件读取目标（如 `httpx -l targets.txt`）的 scope 解析与校验，消除 no_targets 放行口子；② 沙箱网络出口白名单 | 单目标 recon+扫描全自动；上下文体积有上限；成本仪表盘可见 |
 | M3 验证层（3 周） | 状态机、baseline 对照、3 个 verify skill（sqli/xss/lfi）、Verifier Agent、去重、误报库——**M3a 已完成（2026-08-07）**：状态机（铁律硬编码）+ 证据包/离线 show + 去重 + 确定性 triage；**M3b 已完成（2026-08-07）**：证据门 + 预置会话（凭据脱敏）+ sqlmap 接入 + Verifier（T2）+ verify-sqli 垂直切片，DVWA 实靶 Confirmed | XBEN/DVWA 上 Confirmed 发现 100% 带证据；误报率达标 |
 | M4 报告引擎（1~2 周） | docxtpl 管线、叙述润色、误报附录 | 给定模板一键出报告，事实字段零手写 |
+| M9a 从目标派生 scope（零手写 YAML）+ API 运行栈 restricted 出口（2026-09-22 已完成） | `compliance/derive.py` 纯确定性派生（只从种子 host、不扩张；通配符/裸 TLD/全网段 fail-closed）；`scope_paths` 变可选 + `acknowledge_authorization`（派生与授权拆开）；派生结果落盘并集生效，5 层 check_scope 与出口白名单零改动覆盖；`default_phases_factory` 默认 restricted（还清已知限制 24） | 只给 target 即可跑通；派生范围放行目标、拒绝兄弟域/后缀伪装域/范围外 IP；无授权确认 403 且零副作用；重启后派生范围仍在；出口白名单随 scope |
+| M9c 发现层去锁：模型驱动假设生成 + 廉价粗筛 + 中性基准（2026-09-22 已完成） | ① 中性基准基座 `scripts/bench_triage.py`（自建 stdlib fixture，A/B 两族行为同构、唯一变量是参数名是否命中提示表；三臂消融 rules/model/rules+model；确定性 in-process 爬行，零 Docker）；② `proofhound/llm/triage.py` T1 档模型假设生成（白名单 `{sqli,xss,idor}` + 输入边界 + 接地性 + fail-closed + M6a 一次修复重试）；③ 接线 `triage_rules`/`triage_model` 双开关（model 缺省关闭，规则路径逐字节等价）；④ `proofhound/verify/prefilter.py` 廉价粗筛 + cap 移到贵验证档；⑤ M9c③ 人工闸细分（`mutating` 声明 + 闸门矩阵「模式 × 等级 × 是否改变状态」，唯一差异格 = semi_auto × L2） | 基准实测：纯规则表发现率 33.3%（漏 8/12，其中 6 条为关键词盲区）→ `rules+model` **100%**，粗筛后误报率 **0%**；新测试 87 个 + 旧 776 全绿（共 863，旧测试零改动）；粗筛实测负结果（丢弃式筛选是负收益）已收窄为建议性并锁进测试 |
+| M9b 红线 4 重定义：模型身份 → 校验独立性（2026-09-22 已完成） | 删除 T1==T2 同模型启动警告（改记 `llm_tiers_share_model` 审计）；红线 4 改约束「独立 agent + 独立上下文 + 输入边界」，不约束模型身份；新增独立性锁死测试 | T1/T2 同模型下功能全通且无警告；输入白名单/超限 fail-closed/输出契约三条在同模型下依然成立；「必须用不同模型」表述全树零残留 |
 | M5 产品化（按需）——M5a 已完成（2026-08-07） | **M5a ✅**：本机 Web API（FastAPI 后端，无前端）+ 自主模式三档闸门（矩阵代码化）+ 动作确认队列（持久化 + operator 审计）；待做：M5b 前端控制台（自治模式切换、确认队列、证据浏览）、MCP 暴露、持续监测、增量复测 | — |
 
 ## 9. 风险与开放问题
@@ -445,7 +646,7 @@ proofhound/
 2. **复杂业务逻辑漏洞**仍是 LLM 短板 → 第一版以 Signal 形式交人工，不硬做。
 3. **供应链安全**：工具下载源被投毒 → 白名单 + 强制哈希校验 + 优先离线镜像。
 4. **法律责任**：工具仅限授权测试，scope 机制是产品级红线，不是可选项。
-5. **开放问题**：Verifier 与发现端的模型组合如何选型以最大化对抗效果；误报库的模式泛化粒度——均在 M3 以实验定案。
+5. **开放问题**：Verifier 与发现端的模型组合如何选型以最大化对抗效果——M9b 已解除「必须不同模型」的硬约束（红线 4 改约束 agent 独立性），因此该问题收窄为：**模型家族多样性**与 **agent 角色/输入隔离**各自对对抗效果的边际贡献如何，以及是否需要刻意要求不同**家族**（而非仅不同型号）；误报库的模式泛化粒度——均在 M3 以实验定案。
 
 ### 9.1 远期方向（北极星，非当前里程碑承诺）
 

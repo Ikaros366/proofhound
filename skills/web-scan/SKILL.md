@@ -1,5 +1,7 @@
 ---
 name: web-scan
+# mutating: true —— 主动扫描会向目标发起真实 HTTP 请求（M9c③）
+mutating: true
 description: 基于 httpx 的 Web 目标探活与指纹采集 SOP，产出结构化 Signal
 version: 1.0.0
 required_tools: [httpx]

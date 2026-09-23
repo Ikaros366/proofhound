@@ -182,25 +182,10 @@ def part_b(client: TestClient, dvwa, stamp: str) -> str:
     )
 
     _check(client.post(f"/api/engagements/{eng_id}/run"), 202, "启动")
-    print("[*] 已启动；等待 L2 verify 动作阻塞进确认队列 ...")
-    conf = _wait_confirmation(client, eng_id, timeout=600)
-    assert conf["action"] == "verify-sqli" and conf["risk_level"] == "L2", conf
-    print(f"[*] L2 阻塞如期出现: cid={conf['cid']} action={conf['action']} "
-          f"finding={conf['finding_id']}")
-    print(f"    summary: {conf['summary']}")
-    state = client.get(f"/api/engagements/{eng_id}").json()["state"]
-    assert state == "confirming", state
-
-    _check(
-        client.post(
-            f"/api/confirmations/{conf['cid']}/approve",
-            json={"operator": "demo-operator", "note": "演示授权：批准 sqlmap 行为验证"},
-        ),
-        200,
-        "批准确认",
-    )
-    print("[*] 已批准；等待 sqlmap 行为确认 + 证据门 + Verifier T2 终审"
-          "（实跑约需数分钟）...")
+    # M9c③ 起 semi_auto 下只读 L2 验证（verify-sqli）由闸门直接放行、不进确认队列：
+    # 人工闸细分只对「写操作」保留确认（唯一差异格 = semi_auto × L2 只读）。
+    print("[*] 已启动；semi_auto 下只读 verify 自动执行，等待 sqlmap + 证据门 + "
+          "Verifier T2 终审（实跑约需数分钟）...")
     state = _wait_state(client, eng_id, {"done", "failed"}, timeout=1200)
     if state != "done":
         raise DemoError(f"Part B engagement 终态为 {state}（预期 done）")
@@ -214,14 +199,21 @@ def part_b(client: TestClient, dvwa, stamp: str) -> str:
     print(f"    verifier={sqli['verifier']['model']} verdict={sqli['verifier']['verdict']}")
     print(f"    reason={sqli['verifier']['reason']}")
 
-    # approve 审计事件原文（完成报告素材）
+    # 闸门自动放行审计事件原文（完成报告素材）
     audit_lines = (eng_dir / "audit.jsonl").read_text(encoding="utf-8").splitlines()
-    approved = [
-        line for line in audit_lines
-        if '"action_approved"' in line and conf["cid"] in line
+    pending = client.get(f"/api/engagements/{eng_id}/confirmations").json()[
+        "confirmations"
     ]
-    assert approved, "审计链缺少 action_approved 事件"
-    print(f"[*] approve 审计事件原文:\n    {approved[0]}")
+    assert pending == [], f"semi_auto 下只读验证不应进确认队列: {pending}"
+    assert not [
+        line for line in audit_lines if '"action_approved"' in line
+    ], "semi_auto 下不应出现人工批准"
+    auto = [
+        line for line in audit_lines
+        if '"action_read_only_auto"' in line and '"verify-sqli"' in line
+    ]
+    assert auto, "审计链缺少 action_read_only_auto(verify-sqli)"
+    print(f"[*] action_read_only_auto 审计事件原文:\n    {auto[0]}")
 
     # 凭据脱敏自检：除 session.json（0600 凭据存储）外任何文件无 cookie 原文
     leaks = []

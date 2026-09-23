@@ -1,5 +1,7 @@
 ---
 name: recon-crawl
+# mutating: true —— 爬行会向目标发起大量真实请求（M9c③）
+mutating: true
 description: 基于 katana 的 Web 爬行与带参端点发现 SOP，产出 param-endpoint Signal
 version: 1.0.0
 required_tools: [katana]

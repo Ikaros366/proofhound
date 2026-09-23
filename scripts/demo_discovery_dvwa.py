@@ -215,15 +215,23 @@ def run_demo(client: TestClient, dvwa, eng_id: str, skip_l2: bool) -> None:
           f"包内 {[f for f, r in zip(pack_files, pack_refs) if katana_stdout.name in r]}）"
           f"+ baseline + sqlmap 输出，共 {len(pack_files)} 项")
 
-    # ---- 批准/拒绝两路径审计事件原文 ----
-    approved = [
-        e for e in _audit_events(eng_dir, "action_approved") if e.get("cid") == approved_cid
+    # ---- 审计链：M9c③ 起 semi_auto 下只读 L2 验证自动执行，不进确认队列 ----
+    # 人工闸细分只对「写操作」保留确认（唯一差异格 = semi_auto × L2 只读），
+    # 故这里断言的不再是 action_approved，而是闸门如实记下的自动放行。
+    assert not _audit_events(eng_dir, "action_approved"), (
+        "semi_auto 下只读验证不应出现人工批准"
+    )
+    auto_events = [
+        e for e in _audit_events(eng_dir, "action_read_only_auto")
+        if e.get("action") == "verify-sqli"
     ]
-    rejected = _audit_events(eng_dir, "action_rejected")
-    assert approved, "审计链缺少目标条目的 action_approved"
-    assert rejected, "审计链缺少 action_rejected"
-    print(f"[*] 批准审计事件原文:\n    {json.dumps(approved[0], ensure_ascii=False)}")
-    print(f"[*] 拒绝审计事件原文（首条）:\n    {json.dumps(rejected[0], ensure_ascii=False)}")
+    assert auto_events, "审计链缺少 action_read_only_auto(verify-sqli)"
+    assert all(e.get("mode") == "semi_auto" for e in auto_events), auto_events
+    assert not _audit_events(eng_dir, "action_rejected"), (
+        "semi_auto 下只读验证不应出现人工拒绝"
+    )
+    print("[*] 只读自动执行审计事件原文（首条）:\n    "
+          f"{json.dumps(auto_events[0], ensure_ascii=False)}")
 
     # ---- 凭据脱敏自检 ----
     cookie_value = dvwa.session_cookies().get("PHPSESSID", "")

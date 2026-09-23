@@ -258,20 +258,27 @@ def run_demo(client: TestClient, eng_id: str, skip_l2: bool) -> None:
         assert c_attempts[0]["status"] == 200 and c_attempts[1]["status"] == 403
         print(f"[*] 断言通过：对照组 1002 REJECTED（B=200 / A=403，判定不成立不误报）")
 
-    # ---- 断言 6：审计链完整（批准 + Verifier 带向量 + verify_completed） ----
-    approved_events = [
-        e for e in _audit_events(eng_dir, "action_approved")
+    # ---- 审计链：M9c③ 起 semi_auto 下只读 L2 验证自动执行，不进确认队列 ----
+    # 人工闸细分只对「写操作」保留确认（唯一差异格 = semi_auto × L2 只读），
+    # 故这里断言的不再是 action_approved，而是闸门如实记下的自动放行。
+    assert not _audit_events(eng_dir, "action_approved"), (
+        "semi_auto 下只读验证不应出现人工批准"
+    )
+    auto_events = [
+        e for e in _audit_events(eng_dir, "action_read_only_auto")
         if e.get("action") == "verify-idor"
     ]
-    assert approved_events, "审计链缺少 action_approved(verify-idor)"
+    assert auto_events, "审计链缺少 action_read_only_auto(verify-idor)"
+    assert all(e.get("mode") == "semi_auto" for e in auto_events), auto_events
     verdicts = _audit_events(eng_dir, "verifier_verdict")
     assert verdicts and verdicts[0].get("cvss_vector"), "verifier_verdict 缺 CVSS 向量"
     completed = [e for e in _audit_events(eng_dir, "verify_completed")
                  if e.get("skill") == "verify-idor"]
     assert completed and completed[0]["confirmed"] >= 1
-    print(f"[*] 批准审计事件原文（首条）:\n    {json.dumps(approved_events[0], ensure_ascii=False)}")
-    print(f"[*] 断言通过：审计链完整（action_approved + verifier_verdict 带向量 "
-          f"+ verify_completed confirmed={completed[0]['confirmed']}）")
+    print("[*] 只读自动执行审计事件原文（首条）:\n    "
+          f"{json.dumps(auto_events[0], ensure_ascii=False)}")
+    print(f"[*] 断言通过：审计链完整（action_read_only_auto ×{len(auto_events)} + "
+          f"verifier_verdict 带向量 + verify_completed confirmed={completed[0]['confirmed']}）")
 
     # ---- 断言 7：双会话凭据全目录无原文（除 session.json）+ 0600 ----
     leaks = []

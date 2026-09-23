@@ -36,10 +36,17 @@ def parse_cookie(cookie: str) -> dict[str, str]:
 
 
 class CreateEngagementRequest(BaseModel):
-    """创建 engagement：目标 + scope 授权文件 + 可选会话/模式/预算。"""
+    """创建 engagement：目标 + 可选 scope 授权文件 + 可选会话/模式/预算。
+
+    M9a：``scope_paths`` 变为可选——留空时系统从 ``target`` **自动派生**授权范围
+    （纯确定性动作，不跟随重定向、不扩张）。派生不构成授权：此时必须设置
+    ``acknowledge_authorization=true``，表示已获得对该范围的书面测试授权；
+    该确认落审计 ``authorization_acknowledged``。两者是分开的两件事。
+    """
 
     target: str = Field(min_length=1)  # 单目标 URL/IP/域名（构造器仅支持单目标）
-    scope_paths: list[str] = Field(min_length=1)  # scope YAML，相对 workspace 或绝对路径
+    scope_paths: list[str] = Field(default_factory=list)  # scope YAML，相对 workspace 或绝对路径；留空则由 target 派生
+    acknowledge_authorization: bool = False  # M9a：派生 scope 时必需的显式授权确认
     cookie: str | None = None  # 可选预置会话 Cookie 头（k=v; k=v 形式）
     reference_cookie: str | None = None  # M8c：可选第二身份会话（reference/victim，verify-idor 用）
     autonomy_mode: AutonomyMode = AutonomyMode.SEMI_AUTO  # 默认半自动（§5.9.2）
@@ -89,12 +96,6 @@ class ReportBuildRequest(BaseModel):
 
     template: str | None = None  # 模板文件名/相对路径，缺省 default_template.docx
     narrative: bool = False
-
-
-class SkillUpdateRequest(BaseModel):
-    """编辑 skill（M6a）：SKILL.md 全文，保存即校验（非法 422 零写入）。"""
-
-    content: str = Field(min_length=1)
 
 
 class ScopeCreateRequest(BaseModel):

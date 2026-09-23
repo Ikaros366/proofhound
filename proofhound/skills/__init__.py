@@ -1,6 +1,9 @@
-"""L2 Skill 系统（§5.1）：SKILL.md 规范、Registry、导入安全闸。"""
+"""L2 Skill 系统（§5.1）：SKILL.md 规范与 Registry。
 
-from proofhound.skills.gate import RiskFinding, RiskReport, scan_skill
+M9d 起不开放用户自写 skill，原「导入安全闸」随上传端点一并移除
+（见 ``registry.py`` 模块文档的说明）。
+"""
+
 from proofhound.skills.manifest import (
     SkillManifest,
     SkillManifestError,
@@ -10,12 +13,9 @@ from proofhound.skills.registry import RegistryError, Skill, SkillRegistry
 
 __all__ = [
     "RegistryError",
-    "RiskFinding",
-    "RiskReport",
     "Skill",
     "SkillManifest",
     "SkillManifestError",
     "SkillRegistry",
     "parse_skill_md",
-    "scan_skill",
 ]

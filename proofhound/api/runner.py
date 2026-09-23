@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import uuid
 from dataclasses import dataclass
@@ -232,6 +233,8 @@ class Engagement:
         self.id: str = meta["id"]
         self.target: str = meta["target"]
         self.scope_paths: list[str] = list(meta["scope_paths"])
+        # M9a：从目标派生的授权范围（落盘于 api.json）；无派生时为 None。
+        self.derived_scope: dict | None = meta.get("derived_scope")
         self.budget: int | None = meta.get("budget")
         self.created_at: str = meta["created_at"]
         self.with_session: bool = bool(meta.get("with_session"))
@@ -286,6 +289,10 @@ class Engagement:
             "with_session": self.with_session,
             "with_reference_session": self.with_reference_session,
         }
+        if self.derived_scope is not None:
+            # M9a：派生范围必须随之持久化——否则每次状态迁移写回都会把它抹掉，
+            # start() 重校验时读到空 scope，授权范围静默消失（= 拒绝一切）。
+            meta["derived_scope"] = self.derived_scope
         (self.dir / "api.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
@@ -383,6 +390,7 @@ class EngagementRunner:
                     target=target,
                     summary=f"{skill_name} 扫描目标 {target}",
                     resume_state=EngagementState.SCANNING,
+                    mutating=_skill_mutating(phases, skill_name),
                 )
                 in ("auto", "approved")
             ]
@@ -433,6 +441,7 @@ class EngagementRunner:
                         f"（{finding.vuln_type} {finding.asset}）"
                     ),
                     resume_state=EngagementState.VERIFYING,
+                    mutating=_skill_mutating(phases, skill_name),
                 )
                 if outcome in ("auto", "approved"):
                     continue
@@ -472,13 +481,30 @@ class EngagementRunner:
         finding_id: str | None = None,
         summary: str,
         resume_state: EngagementState,
+        mutating: bool = True,
     ) -> str:
         """过自主模式闸门，返回 auto/approved/rejected/forbidden。
 
         模式在每次判定时重读：运行中切换自治模式即时生效。
+
+        M9c③：``mutating`` 来自发起该动作的 skill 的 manifest 声明（**缺省
+        True = fail-closed**，调用方不声明即按写操作对待）。只在 semi_auto ×
+        L2 上区分：只读验证（不改目标状态）可自动执行，写操作仍进确认队列。
         """
         gate = AutonomyGate(self.rt.engagement.current_mode(), self.rt.audit)
-        decision = gate.decide(risk_level)
+        decision = gate.decide(risk_level, mutating=mutating)
+        if decision is GateDecision.AUTO and risk_level == "L2" and not mutating:
+            # M9c③：只读验证被判 auto 是**细分级**的结果（而非模式本就全自动），
+            # 落审计便于区分"为什么这次没人被问"。
+            self.rt.audit.record(
+                "action_read_only_auto",
+                action=action,
+                risk_level=risk_level,
+                finding_id=finding_id,
+                target=target,
+                mode=self.rt.engagement.current_mode().value,
+                reason="skill 声明 mutating=false（只读验证），且模式允许自动执行",
+            )
         if decision is GateDecision.AUTO:
             return "auto"
         if decision is GateDecision.FORBIDDEN:
@@ -610,8 +636,26 @@ class OrchestratorPhases:
         self._orch = orchestrator
         self.scan_skill = scan_skill
         self.verify_skill = verify_skill
-        self.scan_risk_level = registry.get(scan_skill).manifest.risk_level
-        self.verify_risk_level = registry.get(verify_skill).manifest.risk_level
+        self.scan_risk_level = _builtin_risk_level(
+            scan_skill, registry.get(scan_skill).manifest.risk_level
+        )
+        self.verify_risk_level = _builtin_risk_level(
+            verify_skill, registry.get(verify_skill).manifest.risk_level
+        )
+        # M9c③：skill → 是否改变目标状态（用于 L2 只读/写细分级）。
+        # 全部注册 skill 都收进来（不只 scan/verify 槽位），缺声明即 True。
+        from proofhound.skills.profiles import SKILL_PROFILES
+
+        self.mutating_by_skill: dict[str, bool] = {}
+        for entry in registry.list():
+            skill = registry.get(entry["name"])
+            if skill is None:
+                continue
+            # M9d：内置 skill 以 profiles 为唯一真相源；非内置回退 manifest 声明
+            profile = SKILL_PROFILES.get(entry["name"])
+            self.mutating_by_skill[entry["name"]] = (
+                profile.mutating if profile is not None else bool(skill.manifest.mutating)
+            )
         self.scan_skills: list[tuple[str, str]] = [
             (scan_skill, self.scan_risk_level)
         ]
@@ -624,7 +668,9 @@ class OrchestratorPhases:
                 reason=f"{reason}，跳过爬行扫描",
             )
         else:
-            self.scan_skills.append((crawl_skill, crawl.manifest.risk_level))
+            self.scan_skills.append(
+                (crawl_skill, _builtin_risk_level(crawl_skill, crawl.manifest.risk_level))
+            )
         # M8b：多 verify skill 清单（首项即旧式单 skill 接口的 verify_skill）
         self.verify_skills: list[tuple[str, str]] = [
             (verify_skill, self.verify_risk_level)
@@ -638,7 +684,12 @@ class OrchestratorPhases:
                 reason=f"{reason}，跳过 XSS 浏览器验证",
             )
         else:
-            self.verify_skills.append((verify_xss_skill, xss.manifest.risk_level))
+            self.verify_skills.append(
+                (
+                    verify_xss_skill,
+                    _builtin_risk_level(verify_xss_skill, xss.manifest.risk_level),
+                )
+            )
         # M8c：第三 verify skill 槽位（IDOR 双会话验证是增强项，缺失不阻塞主链路）
         idor = registry.get(verify_idor_skill)
         if idor is None or not idor.enabled:
@@ -649,7 +700,12 @@ class OrchestratorPhases:
                 reason=f"{reason}，跳过 IDOR 双会话验证",
             )
         else:
-            self.verify_skills.append((verify_idor_skill, idor.manifest.risk_level))
+            self.verify_skills.append(
+                (
+                    verify_idor_skill,
+                    _builtin_risk_level(verify_idor_skill, idor.manifest.risk_level),
+                )
+            )
 
     def scan(self, targets: list[str]) -> None:
         self._orch.run_scan_phase(targets, skill_name=self.scan_skill)
@@ -669,6 +725,34 @@ class OrchestratorPhases:
     def verify_with_skill(self, skill_name: str) -> list:
         """M8b 多 skill 接口：按 skill 跑 verify 阶段。"""
         return self._orch.run_verify_phase(skill_name=skill_name)
+
+
+def _skill_mutating(phases, skill_name: str) -> bool:
+    """skill 是否改变目标状态（M9c③）；查不到即 True（fail-closed）。
+
+    ``OrchestratorPhases.mutating_by_skill`` 由 registry 的 manifest 声明填充；
+    旧式 phases（测试替身 FakePhases 等）无该属性 → 一律 True，行为与 M9c③
+    之前逐字节一致。
+    """
+    return getattr(phases, "mutating_by_skill", {}).get(skill_name, True)
+
+
+def _builtin_risk_level(skill_name: str, fallback: str) -> str:
+    """内置 skill 的风险等级以 ``skills/profiles.py`` 为准（M9d 单一真相源）。
+
+    非内置/未登记的名字（用户自建目录、测试替身）回退到 manifest 声明值——
+    保持既有行为，不因收敛真相源而改变对外语义。
+    """
+    from proofhound.skills.profiles import SKILL_PROFILES
+
+    profile = SKILL_PROFILES.get(skill_name)
+    return profile.risk_level if profile is not None else fallback
+
+
+def _env_flag(name: str) -> bool:
+    """布尔环境变量（M9c）：``1/true/yes/on`` 为真，其余（含未设）为假。"""
+    value = (os.environ.get(name) or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def default_phases_factory(rt: EngagementRuntime) -> OrchestratorPhases:
@@ -698,15 +782,26 @@ def default_phases_factory(rt: EngagementRuntime) -> OrchestratorPhases:
     installer = ToolInstaller(workspace / "tools.d")
     for tool in ("httpx", "sqlmap", "katana"):
         installer.ensure(load_manifest(manifests_dir / f"{tool}.yaml"))
+    # M9a：默认 restricted——容器接入 proofhound-egress（internal，无网关/NAT），
+    # HTTP(S) 强制经白名单正向代理出站，白名单 = scope（+ 安装白名单源）。
+    # scope 现在由目标派生并落盘，白名单因此始终有据可依。
+    #
+    # 逃生阀：某些环境无法创建 internal 网络或绑定网关代理（如受限的 Docker
+    # 环境），可显式设 PROOFHOUND_SANDBOX_EGRESS=open 退回演示取向。默认严格。
+    egress_mode = (os.environ.get("PROOFHOUND_SANDBOX_EGRESS") or "restricted").strip().lower()
+    if egress_mode not in {"restricted", "open", "none"}:
+        raise ValueError(
+            f"PROOFHOUND_SANDBOX_EGRESS 非法取值 {egress_mode!r}（可选 restricted/open/none）"
+        )
     runner = SandboxRunner(
         rt.scope,
         rt.audit,
         evidence_dir=rt.engagement.dir,
         tools_dir=workspace / "tools.d",
-        # 与 demo 脚本一致的演示取向网络（host + open）；restricted 出口
-        # 白名单属后续硬化切片
         config=SandboxConfig(
-            image="alpine:3.20", network_mode="host", egress=EgressPolicy(mode="open")
+            image="alpine:3.20",
+            network_mode="bridge",
+            egress=EgressPolicy(mode=egress_mode),
         ),
         client=client,
     )
@@ -719,7 +814,15 @@ def default_phases_factory(rt: EngagementRuntime) -> OrchestratorPhases:
         rt.env_file, audit=rt.audit, tracker=UsageTracker(), budget=budget
     )
     orch = Orchestrator(
-        registry, runner, router, rt.audit, evidence_dir=rt.engagement.dir
+        registry,
+        runner,
+        router,
+        rt.audit,
+        evidence_dir=rt.engagement.dir,
+        # M9c：发现侧去锁。两者缺省关闭，保持与 M9c 之前逐字节等价；
+        # 显式开启后：模型 triage 补关键词盲区，廉价粗筛只出建议、不丢候选。
+        triage_model=_env_flag("PROOFHOUND_TRIAGE_MODEL"),
+        verify_prefilter=_env_flag("PROOFHOUND_VERIFY_PREFILTER"),
     )
     return OrchestratorPhases(orch, registry)
 
@@ -794,21 +897,50 @@ class EngagementManager:
             path = self.workspace_root / path
         return path
 
-    def load_scope(self, scope_paths: list[str]) -> Scope:
-        """加载并合并 scope 文件；文件缺失/非法一律 fail-closed 拒绝。"""
+    def load_scope(
+        self,
+        scope_paths: list[str],
+        *,
+        derived_scope: dict | None = None,
+        target: str | None = None,
+    ) -> Scope:
+        """加载并合并 scope；文件缺失/非法一律 fail-closed 拒绝。
+
+        M9a：``derived_scope`` 是建 engagement 时从种子目标派生并**落盘**的授权
+        范围（``api.json`` 的 ``derived_scope``）。它作为基底并入，scope 文件项
+        叠加其上——两者**并集**生效。派生结果持久化而非每次现算，保证
+        "操作员看到的"与"实际生效的"是同一份（可审计）。
+
+        ``scope_paths`` 为空且无派生范围时返回空 Scope；此时 ``check_scope``
+        的 fail-closed 语义会拒绝一切目标，调用方须自行给出清晰报错。
+        """
         domains: list[str] = []
         networks: list[str] = []
         ports: list[int] = []
+
+        if derived_scope:
+            domains.extend(derived_scope.get("domains") or [])
+            networks.extend(derived_scope.get("networks") or [])
+            ports.extend(derived_scope.get("ports") or [])
+
         for raw in scope_paths:
             path = self._resolve_scope_path(raw)
             try:
-                scope = Scope.from_file(path)
+                loaded = Scope.from_file(path)
             except Exception as exc:
                 raise ScopeViolationError(f"scope 文件不可用: {raw}（{exc}）") from None
-            domains.extend(scope.domains)
-            networks.extend(scope.networks)
-            ports.extend(scope.ports)
-        return Scope(domains=domains, networks=networks, ports=ports)
+            domains.extend(loaded.domains)
+            networks.extend(loaded.networks)
+            ports.extend(loaded.ports)
+
+        merged = Scope(domains=domains, networks=networks, ports=ports)
+        if not (merged.domains or merged.networks):
+            where = target or "（未提供目标）"
+            raise ScopeViolationError(
+                f"没有任何授权范围：scope_paths 为空且未从目标 {where} 派生。"
+                "请显式提供 scope 文件，或给一个可解析的目标以自动派生"
+            )
+        return merged
 
     def check_target(self, scope: Scope, target: str) -> None:
         """目标过 check_scope；越界抛 :class:`ScopeViolationError`。"""
@@ -849,8 +981,34 @@ class EngagementManager:
     # ---- engagement CRUD ----
 
     def create(self, request) -> Engagement:
-        """创建 engagement。**先校验后建目录**：scope 违规时零目录零审计。"""
-        scope = self.load_scope(request.scope_paths)  # 文件问题即 403
+        """创建 engagement。**先校验后建目录**：scope 违规时零目录零审计。
+
+        M9a：``scope_paths`` 为空时从 ``target`` 派生 scope（零手写 YAML），
+        并把派生结果落盘为**实际生效的那一份**。派生是纯确定性动作，不构成
+        授权——授权由 ``acknowledge_authorization`` 显式确认并落审计。
+        """
+        from proofhound.compliance.derive import (
+            ScopeDerivationError,
+            derive_scope,
+            derived_scope_marker,
+        )
+
+        derived_meta: dict | None = None
+        if request.scope_paths:
+            scope = self.load_scope(request.scope_paths)  # 文件问题即 403
+        else:
+            # 无 scope 文件：从目标派生。派生失败即 403，不建任何目录。
+            try:
+                scope = derive_scope(request.target)
+            except ScopeDerivationError as exc:
+                raise ScopeViolationError(f"无法从目标派生 scope：{exc}") from None
+            derived_meta = derived_scope_marker(scope, target=request.target)
+            if not getattr(request, "acknowledge_authorization", False):
+                # 自动派生出的范围就是这次测试的授权边界，必须显式确认。
+                raise ScopeViolationError(
+                    "从目标自动派生了授权范围，需要显式确认授权："
+                    "请设置 acknowledge_authorization=true（表示你已获得对该范围的书面测试授权）"
+                )
         self.check_target(scope, request.target)  # 越界即 403，无任何副作用
         eng_id = f"eng-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:8]}"
         directory = self.engagements_dir / eng_id
@@ -886,6 +1044,10 @@ class EngagementManager:
             "with_session": request.cookie is not None,
             "with_reference_session": request.reference_cookie is not None,  # M8c
         }
+        if derived_meta is not None:
+            # 派生范围落盘为实际生效的那一份（M9a）：api.json 是 engagement
+            # 元数据的权威来源，start() 重校验时从这里读回。
+            meta["derived_scope"] = derived_meta
         eng = Engagement(self, directory, meta)
         eng._persist()
         # 报告元信息（§5.7 engagement.json：target/scope/started_at）
@@ -918,6 +1080,16 @@ class EngagementManager:
             with_reference_session=meta["with_reference_session"],  # M8c
             extras=sorted(request.extras or {}),  # 只记键名
         )
+        if derived_meta is not None:
+            # M9a：派生范围的全量留痕 + 授权确认留痕（两者分开，便于事后归因）
+            eng.audit.record("scope_derived", engagement_id=eng_id, **derived_meta)
+            eng.audit.record(
+                "authorization_acknowledged",
+                engagement_id=eng_id,
+                target=request.target,
+                derived=True,
+                scope=derived_meta,
+            )
         with self._lock:
             self._engagements[eng_id] = eng
         return eng
@@ -944,8 +1116,12 @@ class EngagementManager:
                 raise InvalidStateError(
                     f"当前状态 {eng.state.value} 不可启动（仅 created 可启动/重跑）"
                 )
-        # 不信任创建时校验结果：scope 文件可能已合法变更，重新加载 + 重新校验
-        scope = self.load_scope(eng.scope_paths)
+        # 不信任创建时校验结果：scope 文件可能已合法变更，重新加载 + 重新校验；
+        # M9a 派生范围（若有）一并读回并集生效——5 层 check_scope 因此自动覆盖
+        # 派生范围，无需改动任何一层。
+        scope = self.load_scope(
+            eng.scope_paths, derived_scope=eng.derived_scope, target=eng.target
+        )
         decision = check_scope(scope, [eng.target])
         eng.audit.record(
             "scope_recheck",

@@ -1,38 +1,26 @@
-"""管理面服务层（M6a，§5.9.2）：Skill 与 Scope 文件的管理 CRUD。
+"""管理面服务层（M6a，§5.9.2）：Scope 文件的管理 CRUD。
+
+> **M9d 移除 Skill 管理面**：本系统不开放用户自写 skill（skill 库全部内置、
+> 随仓库交付），故 zip 上传 / SKILL.md 编辑 / 删除 / copy-on-edit / 符号链接
+> 本地化这一整套端点失去使用场景，与「导入安全闸」一并删除。skill 现在只随
+> 仓库发布，改内置 skill 就是改仓库文件（走正常代码评审）。
 
 - **只读写配置与文本**：零命令构造、零沙箱、零 LLM 调用（红线自查）；
-- 写操作 confine：``skills/`` 与 ``scopes/`` 内，resolve 后强制校验；
-  演示 workspace 的 ``skills`` 常是指向仓库的符号链接——写端点先把符号
-  链接本地化（``_ensure_real_skills_dir``：顶层链接替换为真目录 + 逐
-  skill 符号链接），内置 skill 编辑走 **copy-on-edit**（复制实体到
-  workspace 再改），绝不顺着符号链接写仓库文件；
-- **内置判定**：skill 目录 resolve 后落在 workspace 之外（符号链接逃出）
-  → 内置，经 API 只读（DELETE 直接 409，PUT 走 copy-on-edit）；
-  ``--workspace .``（workspace 即仓库）时无内外之分，skill 一律按用户
-  skill 处理；copy-on-edit 后该 skill 转为 workspace 实体（builtin=false，
-  可再编辑/删除，删除即从 registry 消失、仓库内置不再透出）；
-- 校验 **all-or-nothing**：全部校验通过前零写入；写入走临时目录/临时
-  文件 + rename/os.replace，拒绝即零残留；
-- 审计：``skill_imported``/``skill_updated``（含新旧 sha256）/
-  ``skill_deleted`` 与 ``scope_created``/``scope_updated``（含新旧
-  sha256）/``scope_deleted`` 写 workspace 级 ``management.jsonl``
-  （append-only，与 engagement 审计同级纪律）；
-- registry 热重载：列表/读取按请求新建 ``SkillRegistry`` 重新 discover；
-  engagement 运行时 registry 本就逐次 run 新建（runner.py
-  default_phases_factory）——新 skill 无需重启即可被创建任务使用。
+- 写操作 confine：``scopes/`` 内，resolve 后强制校验；
+- 校验 **all-or-nothing**：全部校验通过前零写入；写入走临时文件 +
+  os.replace，拒绝即零残留；
+- 审计：``scope_created``/``scope_updated``（含新旧 sha256）/
+  ``scope_deleted`` 写 workspace 级 ``management.jsonl``
+  （append-only，与 engagement 审计同级纪律）。
 """
 
 from __future__ import annotations
 
 import hashlib
-import io
 import ipaddress
 import os
 import re
-import shutil
-import tempfile
-import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import yaml
 
@@ -43,14 +31,7 @@ from proofhound.api.runner import (
 )
 from proofhound.compliance.audit import AuditLog
 from proofhound.compliance.scope import Scope
-from proofhound.skills.manifest import SkillManifestError, parse_skill_md
-from proofhound.skills.registry import SkillRegistry
-from proofhound.tools.build import known_tools
 
-#: skill 上传 zip 大小上限（压缩态）
-SKILL_ZIP_MAX_BYTES = 1 * 1024 * 1024
-#: zip 解压总量上限（防 zip 炸弹：1 MiB 压缩包的放大兜底）
-SKILL_ZIP_EXTRACT_MAX_BYTES = 8 * 1024 * 1024
 #: scope 文件名白名单
 SCOPE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.ya?ml$")
 #: scope 允许的顶层键（session 凭据只走创建任务 cookie 入口，不进管理面——
@@ -127,226 +108,13 @@ def validate_scope_text(text: str) -> dict:
 
 
 class ManagementService:
-    """workspace 级管理面：skill 库与 scope 文件 CRUD（server.py 的薄壳后端）。"""
+    """workspace 级管理面：scope 文件 CRUD（server.py 的薄壳后端）。"""
 
     def __init__(self, manager):
         self.workspace_root = manager.workspace_root  # 已 resolve
-        self.skills_dir = manager.skills_dir
         self.scopes_dir = manager.scopes_dir
         self.tools_dir = manager.workspace_root / "tools.d"
         self.audit: AuditLog = manager.management_audit
-
-    # ==================== skill 管理 ====================
-
-    def _registry(self) -> SkillRegistry:
-        """按请求重解析（热重载）；audit=None：registered 事件不进管理日志。"""
-        return SkillRegistry(self.skills_dir).discover()
-
-    def _is_builtin(self, skill_path: Path) -> bool:
-        """内置 = resolve 后落在 workspace 之外（符号链接逃出到仓库）。"""
-        return not skill_path.resolve().is_relative_to(self.workspace_root)
-
-    def _ensure_real_skills_dir(self) -> None:
-        """把符号链接形态的 skills/ 本地化为真目录（写端点前置）。
-
-        顶层符号链接 → 替换为真目录 + 逐 skill 符号链接（内置内容仍可读，
-        但任何写入不再顺顶层链接落进仓库）；不存在则创建；真目录 no-op。
-        """
-        if self.skills_dir.is_symlink():
-            target = self.skills_dir.resolve()
-            entries = sorted(target.iterdir())
-            self.skills_dir.unlink()  # 只删符号链接本身，不触碰目标
-            self.skills_dir.mkdir()
-            for entry in entries:
-                (self.skills_dir / entry.name).symlink_to(entry)
-        elif not self.skills_dir.exists():
-            self.skills_dir.mkdir(parents=True)
-
-    def _skill_summary(self, skill) -> dict:
-        manifest = skill.manifest
-        return {
-            "name": manifest.name,
-            "description": manifest.description,
-            "version": manifest.version,
-            "risk_level": manifest.risk_level,
-            "required_tools": list(manifest.required_tools),
-            "missing_tools": [
-                t
-                for t in manifest.required_tools
-                if not (self.tools_dir / t).is_dir()
-            ],
-            "unknown_tools": [
-                t for t in manifest.required_tools if t not in known_tools()
-            ],
-            "inputs": list(manifest.inputs),
-            "outputs": list(manifest.outputs),
-            "enabled": skill.enabled,
-            "builtin": self._is_builtin(skill.path),
-            "sha256": _sha256_file(skill.path / "SKILL.md"),
-        }
-
-    def list_skills(self) -> list[dict]:
-        registry = self._registry()
-        return [
-            self._skill_summary(registry.get(item["name"]))
-            for item in registry.list()
-        ]
-
-    def get_skill(self, name: str) -> dict:
-        skill = self._registry().get(name)
-        if skill is None:
-            raise NotFoundError(f"skill 不存在: {name}")
-        summary = self._skill_summary(skill)
-        return {
-            "name": summary["name"],
-            "builtin": summary["builtin"],
-            "sha256": summary["sha256"],
-            "content": (skill.path / "SKILL.md").read_text(encoding="utf-8"),
-        }
-
-    def _validate_skill_md(self, candidate: Path, expect_name: str | None) -> None:
-        """全量校验 SKILL.md：frontmatter schema + required_tools ⊆ 构造器注册表
-        +（可选）manifest name 与目录名一致。非法抛 ValidationFailedError。"""
-        try:
-            manifest, _ = parse_skill_md(candidate)
-        except (SkillManifestError, OSError) as exc:
-            raise ValidationFailedError(f"SKILL.md 校验失败: {exc}") from exc
-        unknown = [t for t in manifest.required_tools if t not in known_tools()]
-        if unknown:
-            raise ValidationFailedError(
-                f"required_tools 含未知工具（无命令构造器，注册表: {known_tools()}）: "
-                f"{unknown}"
-            )
-        if expect_name is not None and manifest.name != expect_name:
-            raise ValidationFailedError(
-                f"manifest name 与目录名不一致: {manifest.name!r} != {expect_name!r}"
-            )
-
-    def import_skill_zip(self, body: bytes) -> dict:
-        """zip 上传（all-or-nothing）：单顶层目录 + 必含 SKILL.md + 防穿越。"""
-        if len(body) > SKILL_ZIP_MAX_BYTES:
-            raise ValidationFailedError(
-                f"zip 超过大小上限（{len(body)} > {SKILL_ZIP_MAX_BYTES} 字节）"
-            )
-        try:
-            zf = zipfile.ZipFile(io.BytesIO(body))
-        except zipfile.BadZipFile as exc:
-            raise ValidationFailedError(f"非法 zip 文件: {exc}") from exc
-
-        tops: set[str] = set()
-        files: list[tuple[PurePosixPath, zipfile.ZipInfo]] = []
-        total_size = 0
-        for info in zf.infolist():
-            name = info.filename
-            if "\\" in name:
-                raise ValidationFailedError(f"zip 条目含反斜杠（拒绝）: {name!r}")
-            rel = PurePosixPath(name)
-            if rel.is_absolute() or ".." in rel.parts:
-                raise ValidationFailedError(f"zip 条目路径穿越（拒绝）: {name!r}")
-            if not rel.parts:
-                continue
-            tops.add(rel.parts[0])
-            if info.is_dir():
-                continue
-            if len(rel.parts) < 2:
-                raise ValidationFailedError(f"zip 根目录不允许直接放文件: {name!r}")
-            total_size += info.file_size
-            if total_size > SKILL_ZIP_EXTRACT_MAX_BYTES:
-                raise ValidationFailedError(
-                    f"zip 解压总量超过上限（{SKILL_ZIP_EXTRACT_MAX_BYTES} 字节）"
-                )
-            files.append((rel, info))
-        if len(tops) != 1:
-            raise ValidationFailedError(
-                f"zip 必须恰好一个顶层目录（实际 {len(tops)} 个）"
-            )
-        top = next(iter(tops))
-        if PurePosixPath(top) / "SKILL.md" not in [rel for rel, _ in files]:
-            raise ValidationFailedError(f"zip 缺少 {top}/SKILL.md")
-
-        self._ensure_real_skills_dir()
-        staging = Path(tempfile.mkdtemp(prefix=".tmp-upload-", dir=self.skills_dir))
-        try:
-            for rel, info in files:
-                dest = staging.joinpath(*rel.parts)
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(zf.read(info))
-            self._validate_skill_md(staging / top / "SKILL.md", expect_name=top)
-            dest_dir = self.skills_dir / top
-            if dest_dir.exists() or dest_dir.is_symlink():
-                raise InvalidStateError(
-                    f"skill 已存在（编辑请用 PUT）: {top}"
-                )
-            (staging / top).rename(dest_dir)
-        finally:
-            shutil.rmtree(staging, ignore_errors=True)
-        sha = _sha256_file(dest_dir / "SKILL.md")
-        self.audit.record("skill_imported", name=top, sha256=sha, files=len(files))
-        return {"name": top, "sha256": sha}
-
-    def update_skill(self, name: str, content: str) -> dict:
-        """编辑 SKILL.md 全文（保存即校验）；内置 skill 走 copy-on-edit。"""
-        skill = self._registry().get(name)
-        if skill is None:
-            raise NotFoundError(f"skill 不存在: {name}")
-        self._ensure_real_skills_dir()
-        # 校验先于任何写（all-or-nothing）
-        staging = Path(tempfile.mkdtemp(prefix=".tmp-validate-", dir=self.skills_dir))
-        try:
-            candidate = staging / "SKILL.md"
-            candidate.write_text(content, encoding="utf-8")
-            self._validate_skill_md(candidate, expect_name=name)
-        finally:
-            shutil.rmtree(staging, ignore_errors=True)
-
-        builtin = self._is_builtin(skill.path)
-        old_sha = _sha256_file(skill.path / "SKILL.md")
-        new_sha = _sha256_bytes(content.encode("utf-8"))
-        if builtin:
-            # copy-on-edit：复制实体到 workspace skills/ 再改，仓库文件零触碰
-            src = skill.path.resolve()
-            staging = Path(
-                tempfile.mkdtemp(prefix=".tmp-edit-", dir=self.skills_dir)
-            )
-            try:
-                copy = staging / name
-                shutil.copytree(src, copy)
-                (copy / "SKILL.md").write_text(content, encoding="utf-8")
-                link = self.skills_dir / name
-                link.unlink()  # 只删符号链接本身
-                copy.rename(self.skills_dir / name)
-            finally:
-                shutil.rmtree(staging, ignore_errors=True)
-        else:
-            target = skill.path / "SKILL.md"
-            tmp_file = skill.path / ".SKILL.md.tmp"
-            tmp_file.write_text(content, encoding="utf-8")
-            os.replace(tmp_file, target)
-        self.audit.record(
-            "skill_updated",
-            name=name,
-            old_sha256=old_sha,
-            new_sha256=new_sha,
-            copied_from_builtin=builtin,
-        )
-        return {"name": name, "sha256": new_sha, "copied_from_builtin": builtin}
-
-    def delete_skill(self, name: str) -> dict:
-        """删除用户 skill；内置 skill 直接 409。"""
-        skill = self._registry().get(name)
-        if skill is None:
-            raise NotFoundError(f"skill 不存在: {name}")
-        if self._is_builtin(skill.path):
-            raise InvalidStateError(
-                f"内置 skill 经 API 只读，禁止删除: {name}（编辑将创建 workspace 副本）"
-            )
-        sha = _sha256_file(skill.path / "SKILL.md")
-        if skill.path.is_symlink():
-            # 双保险：不落内置判定的边角（workspace 内手工符号链接）也不顺着删
-            raise InvalidStateError(f"skill 目录为符号链接，拒绝删除: {name}")
-        shutil.rmtree(skill.path)
-        self.audit.record("skill_deleted", name=name, sha256=sha)
-        return {"deleted": name}
 
     # ==================== scope 管理 ====================
 
@@ -434,8 +202,6 @@ class ManagementService:
 __all__ = [
     "ManagementService",
     "SCOPE_NAME_RE",
-    "SKILL_ZIP_EXTRACT_MAX_BYTES",
-    "SKILL_ZIP_MAX_BYTES",
     "ValidationFailedError",
     "validate_scope_text",
 ]

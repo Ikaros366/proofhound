@@ -1,5 +1,8 @@
 ---
 name: verify-sqli
+# mutating: false —— 验证动作只读（sqlmap 固定 --batch，构造器硬禁
+# risk>2 的 OR 型注入与任何写操作），不改变目标状态（M9c③）
+mutating: false
 description: SQL 注入假设的行为验证 SOP——带会话 baseline + sqlmap 确认 + Verifier 终审，产出 Confirmed/Rejected
 version: 1.0.0
 required_tools: [httpx, sqlmap]

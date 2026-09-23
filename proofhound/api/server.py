@@ -33,7 +33,6 @@ from proofhound.api.models import (
     ReportBuildRequest,
     ScopeCreateRequest,
     ScopeUpdateRequest,
-    SkillUpdateRequest,
 )
 from proofhound.api.runner import (
     ApiError,
@@ -369,36 +368,10 @@ def create_app(
         )
         return {"confirmation": conf.to_dict(), "engagement_id": eng.id}
 
-    # ---- M6a 管理面：skill 库管理（只读写配置文本，零命令构造） ----
-
-    @app.get("/api/skills")
-    def list_skills() -> dict:
-        """skill 列表（按请求重解析 registry：变更即热重载，无需重启）。"""
-        return {"skills": management.list_skills()}
-
-    @app.get("/api/skills/{name}")
-    def get_skill(name: str) -> dict:
-        """SKILL.md 全文 + 内置标记 + sha256（控制台编辑器数据源）。"""
-        return management.get_skill(name)
-
-    @app.post("/api/skills", status_code=201)
-    async def import_skill(request: Request) -> dict:
-        """zip 上传：单顶层目录 + 必含 SKILL.md + 防穿越 + ≤1MiB；
-        校验 all-or-nothing，拒绝即零写入。"""
-        return management.import_skill_zip(await request.body())
-
-    @app.put("/api/skills/{name}")
-    def update_skill(name: str, request: SkillUpdateRequest) -> dict:
-        """编辑 SKILL.md 全文（保存即校验）；内置 skill copy-on-edit
-        （复制实体到 workspace skills/ 再改，绝不顺符号链接写仓库）。"""
-        return management.update_skill(name, request.content)
-
-    @app.delete("/api/skills/{name}")
-    def delete_skill(name: str) -> dict:
-        """删除用户 skill；内置 skill 409。"""
-        return management.delete_skill(name)
-
     # ---- M6a 管理面：scope 授权文件管理（仅限 workspace scopes/ 内） ----
+    #
+    # M9d：skill 管理端点（GET/POST/PUT/DELETE /api/skills）已移除——不开放
+    # 用户自写 skill，skill 库全部内置并随仓库交付。
 
     @app.get("/api/scopes")
     def list_scopes() -> dict:

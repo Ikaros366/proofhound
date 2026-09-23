@@ -207,11 +207,22 @@ def run_demo(client: TestClient, dvwa, eng_id: str, skip_l2: bool) -> None:
     print(f"[*] 断言通过：canary 事件 JSON ×{len(canary_files)}、"
           f"DOM 快照 ×{len(dom_files)} 落盘非空")
 
-    # ---- 断言 5：审计链完整（discovery→triage→verify） ----
-    assert _audit_events(eng_dir, "action_approved"), "审计链缺少 action_approved"
+    # ---- 审计链：M9c③ 起 semi_auto 下只读 L2 验证自动执行，不进确认队列 ----
+    # 人工闸细分只对「写操作」保留确认（唯一差异格 = semi_auto × L2 只读），
+    # 故这里断言的不再是 action_approved，而是闸门如实记下的自动放行。
+    assert not _audit_events(eng_dir, "action_approved"), (
+        "semi_auto 下只读验证不应出现人工批准"
+    )
+    auto_events = [
+        e for e in _audit_events(eng_dir, "action_read_only_auto")
+        if e.get("action") == "verify-xss"
+    ]
+    assert auto_events, "审计链缺少 action_read_only_auto(verify-xss)"
+    assert all(e.get("mode") == "semi_auto" for e in auto_events), auto_events
     assert _audit_events(eng_dir, "verify_completed"), "审计链缺少 verify_completed"
-    print("[*] 断言通过：审计链 katana → triage_completed → action_approved "
-          "→ xss_probe_attempt → verify_completed 完整")
+    print("[*] 断言通过：审计链 katana → triage_completed → "
+          f"action_read_only_auto ×{len(auto_events)} → xss_probe_attempt → "
+          "verify_completed 完整")
 
     # ---- 断言 6：Confirmed + 四段式（不断言 CVSS 分数，只打印） ----
     final = next(f for f in findings if f["id"] == target_finding["id"])

@@ -82,7 +82,6 @@ function route() {
   const m = hash.match(/^#\/engagement\/([A-Za-z0-9-]+)$/);
   if (m) renderDetail(view, m[1]);
   else if (hash === '#/health') renderHealth(view);
-  else if (hash === '#/skills') renderSkills(view);
   else if (hash === '#/scopes') renderScopes(view);
   else renderList(view);
 }
@@ -99,7 +98,7 @@ function renderList(view) {
 
   const targetInput = el('input');
   targetInput.type = 'text';
-  targetInput.placeholder = '目标 URL / IP / 域名（须在 scope 授权内）';
+  targetInput.placeholder = '目标 URL / IP / 域名（留空 scope 文件时，授权范围由此自动派生）';
   grid.appendChild(field('目标 target', targetInput));
 
   const budgetInput = el('input');
@@ -111,7 +110,26 @@ function renderList(view) {
   const scopeSelect = el('select');
   scopeSelect.multiple = true;
   scopeSelect.size = 3;
-  grid.appendChild(field('scope 授权文件（多选；数据源为「授权」视图的 scopes/ 目录）', scopeSelect, 'full'));
+  grid.appendChild(
+    field(
+      'scope 授权文件（可选，多选；留空则由上面的目标自动派生授权范围）',
+      scopeSelect,
+      'full'
+    )
+  );
+
+  // M9a：派生 scope 时的显式授权确认。派生（技术动作）与授权（合规确认）
+  // 是两件事——系统给出范围，人确认有权测试该范围。
+  const ackCheck = el('input');
+  ackCheck.type = 'checkbox';
+  const ackLabel = el('label', 'field full');
+  ackLabel.appendChild(ackCheck);
+  ackLabel.appendChild(
+    document.createTextNode(
+      ' 我确认已获得对上述目标的书面测试授权（未选 scope 文件、由目标自动派生范围时必填）'
+    )
+  );
+  grid.appendChild(ackLabel);
   // 下拉数据源：GET /api/scopes（进视图拉一次；无效文件不列为可选项）
   api('/api/scopes').then((data) => {
     const scopes = (data.scopes || []).filter((s) => s.valid !== false);
@@ -203,9 +221,23 @@ function renderList(view) {
       scope_paths: Array.from(scopeSelect.selectedOptions).map((o) => `scopes/${o.value}`),
       autonomy_mode: selectedMode,
     };
-    if (!body.scope_paths.length) {
-      errSlot.replaceChildren(el('div', 'error-box', '请至少选择一个 scope 授权文件（可在「授权」视图新建）'));
+    if (!body.target) {
+      errSlot.replaceChildren(el('div', 'error-box', '请填写目标'));
       return;
+    }
+    if (!body.scope_paths.length) {
+      // 无 scope 文件 → 由目标派生；此时必须有显式授权确认
+      if (!ackCheck.checked) {
+        errSlot.replaceChildren(
+          el(
+            'div',
+            'error-box',
+            '未选择 scope 文件时将按目标自动派生授权范围，请勾选下方授权确认'
+          )
+        );
+        return;
+      }
+      body.acknowledge_authorization = true;
     }
     const cookie = cookieInput.value;
     if (cookie.trim()) body.cookie = cookie;
@@ -957,164 +989,6 @@ function renderHealth(view) {
 }
 
 // ---- ④ Skills 管理（M6a；纯 textarea 编辑，零编辑器库） ----
-
-function renderSkills(view) {
-  const listPanel = el('div', 'panel');
-  listPanel.appendChild(el('h3', null, 'Skill 列表'));
-  const listBody = el('div', null, '加载中…');
-  listPanel.appendChild(listBody);
-
-  const uploadPanel = el('div', 'panel');
-  uploadPanel.appendChild(el('h3', null, '上传 Skill（zip ≤ 1MiB，单顶层目录含 SKILL.md）'));
-  const uploadRow = el('div', 'conf-actions');
-  const fileInput = el('input');
-  fileInput.type = 'file';
-  fileInput.accept = '.zip';
-  const uploadBtn = el('button', 'primary', '上传');
-  uploadBtn.disabled = true;
-  fileInput.addEventListener('change', () => { uploadBtn.disabled = !fileInput.files.length; });
-  uploadRow.append(fileInput, uploadBtn);
-  const uploadSlot = el('div');
-  uploadPanel.append(uploadRow, uploadSlot);
-
-  const editorPanel = el('div', 'panel');
-  editorPanel.appendChild(el('h3', null, '编辑器'));
-  editorPanel.appendChild(el('div', 'hint', '点击列表行查看 / 编辑 SKILL.md 全文。'));
-
-  view.append(listPanel, uploadPanel, editorPanel);
-
-  async function refresh() {
-    const data = await api('/api/skills');
-    renderRows(data.skills || []);
-  }
-
-  function renderRows(skills) {
-    if (!skills.length) {
-      listBody.replaceChildren(el('div', 'hint', '暂无 skill。'));
-      return;
-    }
-    const table = el('table', 'data');
-    const head = el('tr');
-    ['名称', '风险', '工具', '来源', '启用', 'sha256'].forEach((h) => head.appendChild(el('th', null, h)));
-    table.appendChild(el('thead')).appendChild(head);
-    const tbody = el('tbody');
-    skills.forEach((s) => {
-      const tr = el('tr');
-      tr.appendChild(el('td', 'mono', s.name));
-      tr.appendChild(badgeCell(`badge risk-${s.risk_level}`, s.risk_level));
-      const toolsTd = el('td');
-      (s.required_tools || []).forEach((t) => {
-        const unknown = (s.unknown_tools || []).includes(t);
-        const missing = (s.missing_tools || []).includes(t);
-        const tag = el('span', unknown || missing ? 'tag warn' : 'tag', t);
-        if (unknown) tag.title = '未知工具（无命令构造器）';
-        else if (missing) tag.title = '工具未安装（tools.d 缺失）';
-        toolsTd.appendChild(tag);
-      });
-      tr.appendChild(toolsTd);
-      tr.appendChild(badgeCell(
-        s.builtin ? 'badge decision-confirm' : 'badge decision-auto',
-        s.builtin ? '内置' : '用户'
-      ));
-      tr.appendChild(el('td', null, s.enabled ? '是' : '否'));
-      const shaTd = el('td', 'mono', shortSha(s.sha256));
-      shaTd.title = s.sha256 || '';
-      tr.appendChild(shaTd);
-      tr.addEventListener('click', () => selectSkill(s.name));
-      tbody.appendChild(tr);
-    });
-    table.appendChild(tbody);
-    listBody.replaceChildren(table);
-  }
-
-  async function selectSkill(name) {
-    editorPanel.replaceChildren();
-    editorPanel.appendChild(el('h3', null, `编辑 ${name}`));
-    let detail;
-    try { detail = await api(`/api/skills/${encodeURIComponent(name)}`); }
-    catch (err) { editorPanel.appendChild(errorBox(err)); return; }
-    if (detail.builtin) {
-      editorPanel.appendChild(el('div', 'hint',
-        '内置 skill 只读；保存将创建 workspace 副本（copy-on-edit），仓库文件不变。'));
-    }
-    const shaLine = el('div', 'hint', `sha256: ${detail.sha256}`);
-    editorPanel.appendChild(shaLine);
-    const ta = el('textarea', 'md-editor');
-    ta.rows = 22;
-    ta.value = detail.content;
-    editorPanel.appendChild(ta);
-    const slot = el('div');
-    const btnRow = el('div', 'conf-actions');
-    const saveBtn = el('button', 'primary', '保存');
-    const delBtn = el('button', 'danger', '删除');
-    delBtn.disabled = detail.builtin;
-    if (detail.builtin) delBtn.title = '内置 skill 禁止删除（保存将创建副本）';
-    saveBtn.addEventListener('click', async () => {
-      saveBtn.disabled = true;
-      slot.replaceChildren();
-      try {
-        const r = await api(`/api/skills/${encodeURIComponent(name)}`, {
-          method: 'PUT', body: { content: ta.value },
-        });
-        shaLine.textContent = `sha256: ${r.sha256}`;
-        detail.builtin = false;
-        detail.sha256 = r.sha256;
-        delBtn.disabled = false;
-        delBtn.title = '';
-        slot.replaceChildren(el('div', 'ok-box',
-          `已保存（sha256 ${shortSha(r.sha256)}${r.copied_from_builtin ? '，已创建 workspace 副本' : ''}）`));
-        await refresh();
-      } catch (err) {
-        slot.replaceChildren(errorBox(err)); // 校验错误原样展示
-      } finally { saveBtn.disabled = false; }
-    });
-    delBtn.addEventListener('click', async () => {
-      if (!window.confirm(`确认删除 skill？\nname: ${name}\nsha256: ${detail.sha256}`)) return;
-      slot.replaceChildren();
-      try {
-        await api(`/api/skills/${encodeURIComponent(name)}`, { method: 'DELETE' });
-        editorPanel.replaceChildren();
-        editorPanel.appendChild(el('h3', null, '编辑器'));
-        editorPanel.appendChild(el('div', 'ok-box', `已删除 ${name}`));
-        await refresh();
-      } catch (err) { slot.replaceChildren(errorBox(err)); }
-    });
-    btnRow.append(saveBtn, delBtn);
-    editorPanel.append(btnRow, slot);
-  }
-
-  uploadBtn.addEventListener('click', async () => {
-    const file = fileInput.files[0];
-    if (!file) return;
-    uploadBtn.disabled = true;
-    uploadSlot.replaceChildren();
-    try {
-      const resp = await fetch('/api/skills', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/zip' },
-        body: file,
-      });
-      const data = await resp.json().catch(() => ({}));
-      if (!resp.ok) {
-        const detail = data && data.detail;
-        throw Object.assign(
-          new Error((detail && detail.message) || `HTTP ${resp.status}`),
-          { code: detail && detail.error }
-        );
-      }
-      uploadSlot.replaceChildren(el('div', 'ok-box',
-        `已导入 ${data.name}（sha256 ${shortSha(data.sha256)}）`));
-      fileInput.value = '';
-      await refresh();
-    } catch (err) {
-      uploadSlot.replaceChildren(errorBox(err));
-    } finally { uploadBtn.disabled = !fileInput.files.length; }
-  });
-
-  refresh().catch((err) => listBody.replaceChildren(errorBox(err)));
-}
-
-// ---- ⑤ Scope 授权文件管理（M6a；同款纯 textarea 纪律） ----
 
 function renderScopes(view) {
   const listPanel = el('div', 'panel');

@@ -244,7 +244,7 @@ def part_a(client, rec, cookie_header: str) -> str:
 
 def part_b(client, rec, cookie_header: str) -> str:
     print("\n" + "=" * 72)
-    print("Part B：L2 verify 阻塞 → 批准 → Confirmed → 逐文件审阅证据包")
+    print("Part B：只读 L2 verify 自动执行（semi_auto）→ Confirmed → 逐文件审阅证据包")
     print("=" * 72)
     resp = _check(
         client.post("/api/engagements", json={
@@ -270,24 +270,29 @@ def part_b(client, rec, cookie_header: str) -> str:
 
     resp = _check(client.post(f"/api/engagements/{eng_id}/run"), 202, "启动")
     rec.record("POST run B", resp)
-    print("[*] 已启动；等待 L2 verify 动作阻塞进确认队列 ...")
-    conf = _wait_confirmation(client, rec, eng_id, timeout=600)
-    assert conf["action"] == "verify-sqli" and conf["risk_level"] == "L2", conf
-    print(f"[*] L2 阻塞如期出现: cid={conf['cid']} finding={conf['finding_id']}")
-    print(f"    summary: {conf['summary']}（created_at={conf['created_at']}，倒计时数据源）")
-
-    resp = _check(
-        client.post(
-            f"/api/confirmations/{conf['cid']}/approve",
-            json={"operator": "console-demo", "note": "控制台演示授权：批准 sqlmap 行为验证"},
-        ),
-        200, "批准确认",
-    )
-    rec.record("POST approve B", resp)
-    print("[*] 已批准（operator=console-demo）；等待 sqlmap + 证据门 + Verifier T2 终审 ...")
+    # M9c③ 起 semi_auto 下只读 L2 验证（verify-sqli）自动执行、不进确认队列；
+    # 确认队列的实弹覆盖见 tests/test_readonly_e2e.py::test_writer_skill_still_queues_confirmation
+    # （以写操作型 skill 替身驱动）。
+    print("[*] 已启动；semi_auto 下只读 verify 自动执行，等待 sqlmap + 证据门 + "
+          "Verifier T2 终审 ...")
     state = _wait_state(client, rec, eng_id, {"done", "failed"}, timeout=1200)
     if state != "done":
         raise DemoError(f"Part B engagement 终态为 {state}（预期 done）")
+
+    resp = client.get(f"/api/engagements/{eng_id}/confirmations")
+    rec.record("GET confirmations B", resp)
+    assert resp.json()["confirmations"] == [], (
+        "semi_auto 下只读验证不应进确认队列"
+    )
+    auto_lines = [
+        line for line in (eng_dir / "audit.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        if '"action_read_only_auto"' in line and '"verify-sqli"' in line
+    ]
+    assert auto_lines, "审计链缺少 action_read_only_auto(verify-sqli)"
+    print(f"[*] 只读验证自动执行（action_read_only_auto ×{len(auto_lines)}，"
+          "零人工批准）")
 
     resp = client.get(f"/api/engagements/{eng_id}/findings")
     rec.record("GET findings B", resp)

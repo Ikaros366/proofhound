@@ -7,13 +7,24 @@
   ``auto``（直接执行）/ ``confirm``（进确认队列等人工）/ ``forbidden``
   （未知等级，fail-closed）：
 
-  ============  ======  ========  ==========
-  模式           L0      L1        L2
-  ============  ======  ========  ==========
-  supervised    auto    confirm   confirm
-  semi_auto     auto    auto      confirm
-  unattended    auto    auto      auto
-  ============  ======  ========  ==========
+  **M9c③：L2 内部再分「只读验证」与「写操作」**。``mutating`` 来自 skill
+  manifest 的同名字段（**缺省 true = fail-closed**：未声明即按写操作对待）。
+
+  ============  ======  ========  ==========  ==================
+  模式           L0      L1        L2 写操作    L2 只读验证
+  ============  ======  ========  ==========  ==================
+  supervised    auto    confirm   confirm     confirm
+  semi_auto     auto    auto      confirm     **auto**
+  unattended    auto    auto      auto        auto
+  ============  ======  ========  ==========  ==================
+
+  即：**semi_auto 下，只有声明为只读的验证动作可自动执行**；写操作（状态
+  变更）永远保留人工确认。supervised 一律 confirm（细分级只在"要不要问人"
+  上做区分，不放宽最严格档）；unattended 本就全自动，细分不改变其裁定。
+
+  > **为什么这一刀安全**：区分的是「是否改变目标状态」，而**不是**放宽任何
+  > 硬闸——scope 强校验、token 预算、凭据脱敏、append-only 审计在任何裁定下
+  > 一律照旧。且只读声明是 skill 的**显式契约**，未声明一律按写操作处理。
 
 - 模式切换**只允许单向收紧自由进行**：unattended→semi_auto→supervised 随时
   可切；向宽松切换（如 supervised→unattended）必须显式调用
@@ -61,22 +72,26 @@ _MODE_STRICTNESS: dict[AutonomyMode, int] = {
     AutonomyMode.UNATTENDED: 2,
 }
 
-#: 闸门矩阵（§5.9.2）：模式 × 风险等级 → 裁定
-_GATE_MATRIX: dict[AutonomyMode, dict[str, GateDecision]] = {
+#: 闸门矩阵（§5.9.2 + M9c③）：模式 × 风险等级 × 是否改变目标状态 → 裁定。
+#: 键 ``mutating`` = 写操作行（缺省），``read_only`` = 只读验证行。
+#: 两行只在 semi_auto × L2 上不同——这正是 M9c③ 的全部改动面。
+_GATE_MATRIX: dict[AutonomyMode, dict[str, dict[str, GateDecision]]] = {
     AutonomyMode.SUPERVISED: {
-        "L0": GateDecision.AUTO,
-        "L1": GateDecision.CONFIRM,
-        "L2": GateDecision.CONFIRM,
+        "L0": {"mutating": GateDecision.AUTO, "read_only": GateDecision.AUTO},
+        "L1": {"mutating": GateDecision.CONFIRM, "read_only": GateDecision.CONFIRM},
+        "L2": {"mutating": GateDecision.CONFIRM, "read_only": GateDecision.CONFIRM},
     },
     AutonomyMode.SEMI_AUTO: {
-        "L0": GateDecision.AUTO,
-        "L1": GateDecision.AUTO,
-        "L2": GateDecision.CONFIRM,
+        "L0": {"mutating": GateDecision.AUTO, "read_only": GateDecision.AUTO},
+        "L1": {"mutating": GateDecision.AUTO, "read_only": GateDecision.AUTO},
+        # M9c③：只读验证可自动（不改变目标状态，无需人工确认）；
+        # 写操作仍须人工确认。
+        "L2": {"mutating": GateDecision.CONFIRM, "read_only": GateDecision.AUTO},
     },
     AutonomyMode.UNATTENDED: {
-        "L0": GateDecision.AUTO,
-        "L1": GateDecision.AUTO,
-        "L2": GateDecision.AUTO,
+        "L0": {"mutating": GateDecision.AUTO, "read_only": GateDecision.AUTO},
+        "L1": {"mutating": GateDecision.AUTO, "read_only": GateDecision.AUTO},
+        "L2": {"mutating": GateDecision.AUTO, "read_only": GateDecision.AUTO},
     },
 }
 
@@ -95,13 +110,19 @@ class AutonomyGate:
         self.mode = AutonomyMode(mode)  # 非法模式名在此即抛 ValueError
         self.audit = audit
 
-    def decide(self, risk_level: str) -> GateDecision:
+    def decide(self, risk_level: str, *, mutating: bool = True) -> GateDecision:
         """对给定风险等级的动作做出闸门裁定。
 
-        未知/未声明的风险等级一律 ``forbidden``（fail-closed）——宁可拒做，
-        不可放过未分级的动作。
+        - 未知/未声明的风险等级一律 ``forbidden``（fail-closed）——宁可拒做，
+          不可放过未分级的动作；
+        - ``mutating``（M9c③）：该动作是否**改变目标状态**。**缺省 True**
+          （fail-closed：调用方不声明即按写操作对待，故既有调用方零行为变化）。
+          只在 semi_auto × L2 上区分：只读验证 → auto，写操作 → confirm。
         """
-        return _GATE_MATRIX[self.mode].get(risk_level, GateDecision.FORBIDDEN)
+        by_level = _GATE_MATRIX[self.mode].get(risk_level)
+        if by_level is None:
+            return GateDecision.FORBIDDEN
+        return by_level["mutating" if mutating else "read_only"]
 
     def is_tightening(self, to: AutonomyMode) -> bool:
         """``to`` 是否比当前模式更严格。"""
@@ -149,9 +170,29 @@ class AutonomyGate:
         return record
 
 
-def gate_matrix() -> dict[str, dict[str, str]]:
-    """导出闸门矩阵（文档/健康检查用）：模式 → 等级 → 裁定字符串。"""
+def _export(mutating: bool) -> dict[str, dict[str, str]]:
+    """按 ``mutating`` 维度导出「模式 → 等级 → 裁定字符串」。"""
+    key = "mutating" if mutating else "read_only"
     return {
-        mode.value: {level: decision.value for level, decision in row.items()}
+        mode.value: {level: by_mut[key].value for level, by_mut in row.items()}
         for mode, row in _GATE_MATRIX.items()
     }
+
+
+def gate_matrix() -> dict[str, dict[str, str]]:
+    """导出闸门矩阵（文档/健康检查用）：模式 → 等级 → 裁定字符串。
+
+    **形态与 M9c③ 之前逐字节一致**（取 ``mutating=True`` 行）——`GET /health`
+    的 `autonomy_gate` 字段与控制台渲染依赖该扁平形态，故不因新增分级而改形。
+    只读验证的裁定见 :func:`gate_matrix_read_only`。
+    """
+    return _export(mutating=True)
+
+
+def gate_matrix_read_only() -> dict[str, dict[str, str]]:
+    """导出**只读验证**行（M9c③）：模式 → 等级 → 裁定字符串。
+
+    与 :func:`gate_matrix` 仅差 ``semi_auto × L2``（``confirm`` → ``auto``）——
+    这正是「只读验证可自动、写操作留人工」的全部差异面。
+    """
+    return _export(mutating=False)

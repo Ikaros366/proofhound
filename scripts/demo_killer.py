@@ -355,11 +355,19 @@ def run_demo(
               "跳过行为验证/Verifier/报告")
         return
 
-    # ---- 断言 3：白名单 4 条全批准（sqli×1 + xss×1 + idor×2） ----
-    assert approved_marks == {DVWA_SQLI_MARK, DVWA_XSS_MARK, *IDOR_MARKS}, (
-        f"批准标记不齐: {approved_marks}"
+    # ---- 断言 3：三类只读 L2 验证自动执行（semi_auto 下不进确认队列） ----
+    # M9c③ 起内置三条 verify-* 均为 mutating=false，闸门直接放行；
+    # 人工闸细分只对「写操作」保留确认（唯一差异格 = semi_auto × L2 只读）。
+    assert not _audit_events(eng_dir, "action_approved"), (
+        f"semi_auto 下不应出现人工批准: {approved_marks}"
     )
-    print(f"[*] 断言通过：白名单 4 条全批准（{sorted(approved_marks)}）")
+    auto_actions = {
+        e.get("action") for e in _audit_events(eng_dir, "action_read_only_auto")
+    }
+    for _skill in ("verify-sqli", "verify-xss", "verify-idor"):
+        assert _skill in auto_actions, f"审计链缺少 action_read_only_auto({_skill})"
+    print(f"[*] 断言通过：三类只读验证自动执行（action_read_only_auto="
+          f"{sorted(auto_actions)}，零人工批准）")
 
     # ---- 断言 4：三类 probe/command 事件（需求④） ----
     sqlmap_runs = [
