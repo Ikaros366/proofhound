@@ -31,9 +31,23 @@ A/B 两族端点唯一差别就是**参数名是否命中提示表**，其余行
 确认漏洞（红线 2）。Confirmed 级数字必须跑真实 verify 链路（Docker +
 Chromium + T2），不在本脚本默认范围。
 
+## M10a Step 1：真可确认后端
+
+原 fixture 的"真漏洞"端点只是**模拟**特征（取值含引号 → 500），只能测发现层。
+M10a Step 1 把后端换成真的：sqli 走 sqlite 拼接查询（sqlmap 可确认）、
+xss 保持不转义反射（canary 可确认）、idor 引入身份归属（双会话属性违反可确认），
+D 族换成**真安全**（含 `/d/safe4` 的真授权校验、`/d/safe2` 去掉模拟 SQL 错误）。
+
+**不变式**：端点表/参数名、首页链接、表单字段、爬行状态码一律不动；D 族
+"两个探测取值响应长度相同"的性质保持（粗筛只比长度）→ 离线三臂数字应逐格不变。
+
 用法：
     .venv/bin/python scripts/bench_triage.py            # 离线确定性：三臂消融
     .venv/bin/python scripts/bench_triage.py --model    # rules+model 臂接真实 T1 档
+
+    # M10a：端到端真实确认链路（Docker + Chromium + T2）→ Confirmed 级数字
+    .venv/bin/python scripts/bench_triage.py --live
+    .venv/bin/python scripts/bench_triage.py --live --arm rules+model+prefilter
 
 产物落 evidence/bench_triage/<时间戳>/（gitignored）。
 """
@@ -42,6 +56,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sqlite3
 import sys
 import threading
 import time
@@ -146,9 +162,89 @@ ENDPOINTS: tuple[Endpoint, ...] = (
 # =====================================================================
 
 
-def _quote_hits(value: str) -> bool:
-    """注入特征：引号未转义（模拟拼接式 SQL）。纯字符串判定，不连数据库。"""
-    return "'" in value or '"' in value
+# =====================================================================
+# 二·补 M10a Step 1：真可确认后端（sqlite + 身份归属）
+# =====================================================================
+#
+# 动因：原 fixture 的"真漏洞"端点只是**模拟**特征（取值含引号 → 500），只能测
+# 发现层，无法让真实确认链路（sqlmap / 无头浏览器 / 双会话属性判定）真的确认
+# 或真的驳回。M10a 要拿 **Confirmed 级**误报率，后端因此必须是真的。
+#
+# 不变式（必须保持，否则离线 triage 口径漂移）：
+#   1. 端点表与参数名不变 → rules 臂与送审摘要不变；
+#   2. 首页链接与表单字段不变 → 确定性爬行产出的 Signal 不变；
+#   3. 爬行取到的状态码仍为 200；
+#   4. D 族（安全对照）"两个探测取值(1 / 999999)响应长度相同"的性质不变
+#      → 粗筛裁定不变（粗筛只比长度，见 verify/prefilter.py::decide）；
+#   5. 所有响应体 >= 64 字节（MIN_COMPARABLE_BYTES）→ 长度仍有信息量。
+
+#: 主会话身份（越权方）——Cookie 值复用既有 ``TOKEN``。
+PRIMARY_IDENTITY = "attacker"
+#: 第二身份（数据所有者）——``SessionConfig.reference`` 用它做属性对照。
+OWNER_IDENTITY = "owner"
+#: 第二身份的 Cookie 值（>=16 字符，沿用与 TOKEN 同样的脱敏演练长度）。
+REFERENCE_TOKEN = "bench0reference0token"
+
+_DB_LOCK = threading.Lock()
+_DB = sqlite3.connect(":memory:", check_same_thread=False)
+_DB.execute("CREATE TABLE records (id INTEGER PRIMARY KEY, label TEXT, body TEXT)")
+_DB.executemany(
+    "INSERT INTO records (id, label, body) VALUES (?, ?, ?)",
+    [
+        (i, f"记录 {i}", f"第 {i} 条记录的正文内容，供行为验证读取与比对。")
+        for i in range(1, 6)
+    ],
+)
+_DB.commit()
+
+#: 对象归属表：对象 id → 所有者身份。
+#: IDOR 端点（/a/idor、/b/idor、/b/idor2）**不做**授权校验 → 真漏洞；
+#: ``/d/safe4`` **做**校验 → 真安全对照。
+_OBJECT_OWNER = {i: OWNER_IDENTITY for i in range(1, 6)}
+
+
+def _sqlite_rows(value: str, label: str, param: str) -> tuple[int, str]:
+    """拼接式 SQL 查询（**刻意可注入**）→ ``(状态码, 正文)``。
+
+    A/B/C 三族共用本函数、**形态同构**（同一后端、同一 vuln 语义、唯一变量是
+    参数名），但 ``label``/``param`` 让正文**逐端点不同**——这是硬要求，不是
+    装饰：正文逐字节相同的多个端点会被 katana 当作**重复响应丢弃**，端点根本
+    进不了 crawler。实测（未带 label 时）：16 个端点只有 9 个被爬到，
+    sqli 5→1、xss 2→1、idor 3→1。回归网见
+    ``tests/test_bench_fixture.py::test_no_two_endpoints_share_a_body``。
+
+    语法错误返回 500 + 真实 sqlite 错误文本，供 sqlmap 的 error-based 技术使用。
+    """
+    sql = f"SELECT label, body FROM records WHERE id = {value}"
+    try:
+        with _DB_LOCK:
+            row = _DB.execute(sql).fetchone()
+    except sqlite3.Error as exc:
+        return 500, _page(f"{label} · SQL 错误", f"{param}={value} 数据库错误：{exc}")
+    if row is None:
+        return 200, _page(f"{label} · 无结果", f"{param}={value} 没有匹配的记录。")
+    return 200, _page(
+        f"{label} · 查询结果", f"{param}={value} 记录 {row[0]}：{row[1]}"
+    )
+
+
+def _object_page(value: str, label: str, param: str) -> str:
+    """对象详情页（IDOR 端点用：**不区分身份**，故越权成立）。
+
+    ``label``/``param`` 的理由同 :func:`_sqlite_rows`：避免多端点正文雷同
+    而被 crawler 当重复响应丢弃。
+    """
+    try:
+        oid = int(value)
+    except (TypeError, ValueError):
+        oid = -1
+    if oid not in _OBJECT_OWNER:
+        return _page(f"{label} · 不存在", f"{param}={value} 对象不存在。")
+    return _page(
+        f"{label} · 对象详情",
+        f"{param}={value} 对象 {oid}：所有者 {_OBJECT_OWNER[oid]}，"
+        "金额 800，状态已发货。",
+    )
 
 
 def _page(title: str, body: str, links: tuple[str, ...] = ()) -> str:
@@ -177,10 +273,18 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _identity(self) -> str | None:
+        """Cookie ``phsess`` → 身份名（主会话 attacker / 第二会话 owner）。
+
+        长度与形态刻意与脱敏演练保持一致；未知值原样返回（便于人工探测）。
+        """
         cookie = self.headers.get("Cookie") or ""
         for segment in cookie.split(";"):
             name, _, value = segment.strip().partition("=")
             if name == "phsess" and value:
+                if value == TOKEN:
+                    return PRIMARY_IDENTITY
+                if value == REFERENCE_TOKEN:
+                    return OWNER_IDENTITY
                 return value
         return None
 
@@ -212,93 +316,65 @@ class _FixtureHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # ---- A 族：表内参数名 ----
-        if path == "/a/sqli":
-            value = first("id")
-            if _quote_hits(value):
-                self._respond(
-                    500, _page("SQL error", "You have an error in your SQL syntax")
-                )
-                return
-            # 真漏洞端点的真实行为：取值被反射进响应（长度随取值变化）
-            self._respond(
-                200,
-                _page(
-                    f"商品详情 {value}",
-                    f"商品编号 id={value}，库存充足，可立即下单，支持七天无理由退换。",
-                ),
-            )
-            return
-        if path == "/a/sqli2":
-            value = first("page")
-            if _quote_hits(value):
-                self._respond(500, _page("SQL error", "SQL syntax error near"))
-                return
-            self._respond(200, _page(f"第 {value} 页", f"当前页码 page={value}，共 42 条记录"))
-            return
-        if path == "/a/xss":
-            value = first("name")
-            self._respond(200, _page("搜索结果", f"你好，{value}，以下是找到的内容"))
-            return
-        if path == "/a/idor":
-            value = first("id")
-            self._respond(
-                200,
-                _page(f"订单 {value}", f"订单明细 id={value} 金额 800 状态已发货"),
-            )
+        # ---- A/B/C sqli 族：真 sqlite 拼接注入（A 表内 / B 表外，行为同构） ----
+        if path in ("/a/sqli", "/a/sqli2", "/b/sqli", "/b/sqli2", "/b/sqli3"):
+            key, label = {
+                "/a/sqli": ("id", "商品详情"),
+                "/a/sqli2": ("page", "分页结果"),
+                "/b/sqli": ("article_id", "文章正文"),
+                "/b/sqli2": ("bh", "编号查询"),
+                "/b/sqli3": ("sku", "商品清单"),
+            }[path]
+            status, body = _sqlite_rows(first(key), label, key)
+            self._respond(status, body)
             return
 
-        # ---- B 族：表外参数名（行为与 A 族同构） ----
-        if path in ("/b/sqli", "/b/sqli2", "/b/sqli3"):
-            key = {"/b/sqli": "article_id", "/b/sqli2": "bh", "/b/sqli3": "sku"}[path]
-            value = first(key)
-            if _quote_hits(value):
-                self._respond(500, _page("SQL error", "SQL syntax error near"))
-                return
-            self._respond(
-                200,
-                _page(
-                    f"文章 {value}",
-                    f"正文内容 {key}={value}，共 3 页，预计阅读 5 分钟。",
-                ),
+        # ---- A/B xss 族：**不转义**反射（真漏洞，无头浏览器 canary 可确认） ----
+        if path in ("/a/xss", "/b/xss"):
+            # 两族都**不转义**（真漏洞，canary 可确认），但标题逐端点不同——
+            # 同正文会被 katana 当重复响应丢弃（见 _sqlite_rows 注记）。
+            key, title = (
+                ("name", "网络搜索结果") if path == "/a/xss" else ("ref", "来源页")
             )
-            return
-        if path == "/b/xss":
-            value = first("ref")
-            self._respond(200, _page("来源页", f"你来自 {value}，即将为你跳转"))
-            return
-        if path in ("/b/idor", "/b/idor2"):
-            key = "no" if path == "/b/idor" else "token"
             value = first(key)
-            self._respond(
-                200,
-                _page(f"对象 {value}", f"明细 {key}={value} 客户张三 联系方式已隐藏"),
-            )
+            self._respond(200, _page(title, f"你好，{value}，以下是找到的内容"))
             return
 
-        # ---- D 族：安全对照（有响应差异，但无漏洞） ----
+        # ---- A/B idor 族：对象归属 owner，但端点**不做**授权校验（真漏洞） ----
+        if path in ("/a/idor", "/b/idor", "/b/idor2"):
+            key, label = {
+                "/a/idor": ("id", "订单详情"),
+                "/b/idor": ("no", "对象详情"),
+                "/b/idor2": ("token", "凭据详情"),
+            }[path]
+            self._respond(200, _object_page(first(key), label, key))
+            return
+
+        # ---- D 族：安全对照（**真安全**，但仍保留"诱出候选"的形态） ----
         if path == "/d/safe":
-            value = first("id")
-            # 安全对照：取值被忽略（定长模板），无回显
+            # 公开资源：取值被忽略、无回显、定长 → 无注入、无反射。
+            # 注意它对**两个身份返回同一份内容**，IDOR 判定器分不出"公开资源"
+            # 与"B 的私有对象被 A 拿到"——这正是刻意留给 Verifier 终审的陷阱。
             self._respond(200, _page("公开页", "公开内容，任何人都可以访问。"))
             return
         if path == "/d/safe2":
-            value = first("article_id")
-            if _quote_hits(value):
-                self._respond(500, _page("SQL error", "SQL syntax error near"))
-                return
+            # 真安全：取值被忽略，且**不**产生 SQL 错误。
+            # （原实现"引号 → 500"是模拟特征，会让 sqlmap 误判为可注入，已移除）
             self._respond(200, _page("帮助页", "静态帮助内容，取值被忽略。"))
             return
         if path == "/d/safe3":
+            # 真安全：反射**已转义** → canary 不会执行（xss 不应 Confirmed）。
             value = first("name").replace("<", "&lt;").replace(">", "&gt;")
             self._respond(200, _page("搜索", f"你好 {value}"))
             return
         if path == "/d/safe4":
-            value = first("no")
-            if self._identity() != "owner" and value == "2002":
-                self._respond(403, _page("Forbidden", "无权限"))
+            # 真安全：**做**授权校验。非所有者得到**定长**通用页——刻意定长，
+            # 既保持粗筛"取值不影响响应长度"的裁定不变，也不泄漏对象存在性；
+            # 且与 owner 的对象页内容不同 → IDOR 属性违反不成立。
+            if self._identity() != OWNER_IDENTITY:
+                self._respond(200, _page("工单页", "无权查看该工单详情。"))
                 return
-            self._respond(200, _page("工单页", "工单处理中，详情请登录后查看。"))
+            self._respond(200, _object_page(first("no"), "工单详情", "no"))
             return
 
         self._respond(404, _page("404", "not found"))
@@ -309,10 +385,18 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8", "replace") if length else ""
         form = urllib.parse.parse_qs(raw, keep_blank_values=True)
         if parsed.path in ("/c/form-sqli", "/c/form-sqli2"):
-            if any(_quote_hits(v) for values in form.values() for v in values):
-                self._respond(500, _page("SQL error", "SQL syntax error near"))
-                return
-            self._respond(200, _page("查询结果", "无结果"))
+            # 真 POST 注入：字段值同样拼进 SQL（M8a form_page 路径的可确认版）
+            if parsed.path == "/c/form-sqli":
+                fields, label = ("bh",), "表单查询"
+            else:
+                fields, label = ("article_id", "sku"), "表单查询二"
+            value, param = "1", fields[0]
+            for name in fields:
+                if form.get(name):
+                    value, param = form[name][0], name
+                    break
+            status, body = _sqlite_rows(value, label, param)
+            self._respond(status, body)
             return
         self._respond(404, _page("404", "not found"))
 
@@ -771,6 +855,378 @@ def render_markdown(rows, meta) -> str:
     return "\n".join(lines) + "\n"
 
 
+# =====================================================================
+# 六、M10a：--live 端到端确认链路 → Confirmed 级指标
+# =====================================================================
+#
+# 离线三臂只回答"发现层的门开多大"（候选级）。本节回答另一半问题：
+# **这些候选里有多少真的能被确认为漏洞、有多少误报会穿过确认链路**——
+# 这是 M9c 两个开关"要不要默认开启"的事实前提。
+#
+# 指标口径（维护者裁定，M10a Step 2）：
+#   - 粒度 = (端点路径, vuln_type)：**类型错配计误报**（如在与身份无关的
+#     sqli 端点上 Confirmed 了一个 IDOR——ground truth 说那里只有 sqli）；
+#   - ``verify_blocked``（T2 读超时 / 缺第二会话 / 基准不成立）**单列一行，
+#     不计入 precision/recall 分母**——超时是"未能判定"，不是"确证不成立"。
+
+#: 4 臂 = 两个生产开关（M9c）的 2x2 组合。
+_LIVE_ARMS: tuple[tuple[str, bool, bool], ...] = (
+    ("rules", False, False),
+    ("rules+model", True, False),
+    ("rules+prefilter", False, True),
+    ("rules+model+prefilter", True, True),
+)
+
+
+def expected_pairs() -> dict[str, set[str]]:
+    """ground truth：端点路径 → 该端点**真实存在**的漏洞类型集合。"""
+    out: dict[str, set[str]] = {}
+    for ep in ENDPOINTS:
+        if ep.vuln:
+            out.setdefault(ep.path, set()).add(ep.vuln)
+    return out
+
+
+def _live_workspace(root: Path, port: int) -> Path:
+    """live 工作区：scope.yaml（仅 fixture 主机/端口）+ 符号链接复用仓库资产。"""
+    workspace = root / "workspace"
+    workspace.mkdir(parents=True, exist_ok=False)
+    (workspace / "scope.yaml").write_text(
+        f"networks: [127.0.0.0/8]\nports: [{port}]\n", encoding="utf-8"
+    )
+    for name in ("templates", "skills", "tools.d"):
+        (workspace / name).symlink_to(REPO_ROOT / name)
+    return workspace
+
+
+def _audit_lines(eng_dir: Path) -> list[dict]:
+    path = eng_dir / "audit.jsonl"
+    if not path.is_file():
+        return []
+    return [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _wait_terminal(client, eng_id: str, timeout: float) -> str:
+    """等 engagement 到 done/failed；超时返回当前态（由调用方如实记录）。"""
+    deadline = time.monotonic() + timeout
+    state = "unknown"
+    while time.monotonic() < deadline:
+        state = client.get(f"/api/engagements/{eng_id}").json()["state"]
+        if state in ("done", "failed"):
+            return state
+        time.sleep(2.0)
+    return state
+
+
+def score_live(findings: list[dict], events: list[dict]) -> dict:
+    """按 (端点, vuln_type) 粒度算 Confirmed 级指标（纯函数，可离线复核）。"""
+    truth = expected_pairs()
+    controls = {ep.path for ep in ENDPOINTS if ep.vuln is None}
+
+    blocked_ids: set[str] = set()
+    reasons: dict[str, int] = {}
+    for event in events:
+        if event.get("event") != "verify_blocked":
+            continue
+        fid = event.get("finding_id")
+        if fid:
+            blocked_ids.add(fid)
+        reason = (event.get("reason") or "").strip()
+        key = reason[:60] if reason else "(无原因)"
+        reasons[key] = reasons.get(key, 0) + 1
+
+    confirmed = [f for f in findings if f.get("state") == "confirmed"]
+    tp: list[tuple[str, str]] = []
+    fp: list[tuple[str, str]] = []
+    for finding in confirmed:
+        path = urllib.parse.urlparse(finding.get("asset") or "").path
+        vuln_type = finding.get("vuln_type") or "?"
+        (tp if vuln_type in truth.get(path, set()) else fp).append((path, vuln_type))
+
+    # 12 条 ground truth 配对的终态漏斗（候选根本没产出 / 被驳回 / 未能判定 / 已确认）
+    funnel: dict[str, str] = {}
+    for path, types in sorted(truth.items()):
+        for vuln_type in sorted(types):
+            hit = [
+                f for f in findings
+                if urllib.parse.urlparse(f.get("asset") or "").path == path
+                and f.get("vuln_type") == vuln_type
+            ]
+            if not hit:
+                state = "无候选"
+            else:
+                finding = hit[0]
+                state = finding.get("state") or "?"
+                if state != "confirmed" and finding.get("id") in blocked_ids:
+                    state = "未能判定"
+            funnel[f"{path} [{vuln_type}]"] = state
+
+    total = len(tp) + len(fp)
+    return {
+        "tp": sorted(f"{p} [{v}]" for p, v in tp),
+        "fp": sorted(f"{p} [{v}]" for p, v in fp),
+        "tp_n": len(tp),
+        "fp_n": len(fp),
+        "recall": len(tp) / sum(len(v) for v in truth.values()),
+        "precision": (len(tp) / total) if total else None,
+        "fp_rate": (len(fp) / total) if total else None,
+        "unresolved_n": len(blocked_ids),
+        "unresolved_reasons": reasons,
+        "type_mismatch": sorted(
+            f"{p} [{v}]" for p, v in fp if p in truth
+        ),
+        "controls_confirmed": sorted({p for p, _ in fp if p in controls}),
+        "funnel": funnel,
+    }
+
+
+def _live_cost(events: list[dict]) -> dict:
+    """单题成本：token 取自 ``llm_call`` 审计（M9c 同一口径）。"""
+    calls = [e for e in events if e.get("event") == "llm_call"]
+    by_tier: dict[str, int] = {}
+    prompt = completion = 0
+    for event in calls:
+        tier = str(event.get("tier") or "?")
+        tokens = (event.get("prompt_tokens") or 0) + (event.get("completion_tokens") or 0)
+        by_tier[tier] = by_tier.get(tier, 0) + tokens
+        prompt += event.get("prompt_tokens") or 0
+        completion += event.get("completion_tokens") or 0
+    return {
+        "llm_calls": len(calls),
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+        "by_tier": by_tier,
+    }
+
+
+def run_live_arm(
+    name: str,
+    triage_model: bool,
+    prefilter: bool,
+    *,
+    env_file: str,
+    base: str,
+    port: int,
+    root: Path,
+    timeout: float,
+) -> dict:
+    """跑一个臂：真实编排栈（Docker 沙箱 + T1/T2 + Chromium），semi_auto 无人工闸。
+
+    M9c③ 起内置三条 verify-* 均为只读，semi_auto 下闸门直接放行、不进确认队列，
+    故本函数无需处理确认队列——这正是要测的"无人过滤"形态。
+    """
+    from fastapi.testclient import TestClient
+
+    from proofhound.api import create_app
+
+    os.environ["PROOFHOUND_TRIAGE_MODEL"] = "1" if triage_model else "0"
+    os.environ["PROOFHOUND_VERIFY_PREFILTER"] = "1" if prefilter else "0"
+
+    arm_dir = root / name.replace("+", "_")
+    workspace = _live_workspace(arm_dir, port)
+    app = create_app(workspace, env_file=env_file, confirm_timeout=900.0)
+    started = time.monotonic()
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/engagements",
+            json={
+                "target": base,
+                "scope_paths": ["scope.yaml"],
+                "cookie": f"phsess={TOKEN}",
+                "reference_cookie": f"phsess={REFERENCE_TOKEN}",
+                "autonomy_mode": "semi_auto",
+            },
+        )
+        if created.status_code != 201:
+            raise RuntimeError(
+                f"创建 engagement 失败: HTTP {created.status_code} {created.text[:300]}"
+            )
+        payload = created.json()
+        if not payload.get("with_reference_session"):
+            raise RuntimeError("engagement 未挂上第二身份会话（reference）")
+        eng_id = payload["id"]
+        client.post(f"/api/engagements/{eng_id}/run")
+        state = _wait_terminal(client, eng_id, timeout)
+        findings = client.get(f"/api/engagements/{eng_id}/findings").json()["findings"]
+    wall = time.monotonic() - started
+
+    events = _audit_lines(workspace / "engagements" / eng_id)
+    score = score_live(findings, events)
+    cost = _live_cost(events)
+    pending = [e for e in events if e.get("event") == "action_read_only_auto"]
+    print(
+        f"    终态={state} findings={len(findings)} 审计={len(events)} "
+        f"只读自动放行={len(pending)} 候选上限={sum(1 for e in events if e.get('event') == 'triage_capped')}",
+        flush=True,
+    )
+    return {
+        "arm": name,
+        "triage_model": triage_model,
+        "verify_prefilter": prefilter,
+        "final_state": state,
+        "wall_s": wall,
+        "findings_n": len(findings),
+        "read_only_auto_n": len(pending),
+        "score": score,
+        "cost": cost,
+    }
+
+
+def render_live_markdown(rows: list[dict], meta: dict) -> str:
+    lines = ["# ProofHound M10a 基线：Confirmed 级误报率 / 检出率 / 单题成本", ""]
+    lines.append(f"- 时间：{meta['stamp']}")
+    lines.append(f"- 指标粒度：**{meta['granularity']}**（类型错配计误报）")
+    lines.append(f"- 超时口径：{meta['blocked_policy']}")
+    lines.append(
+        f"- ground truth：{meta['ground_truth_pairs']} 条真漏洞配对 + 4 个安全对照"
+    )
+    lines.append("")
+    lines.append(
+        "| 臂 | TRIAGE_MODEL | VERIFY_PREFILTER | 检出率 | 精确率 | 误报率 | TP | FP "
+        "| 未能判定 | token | wall(s) |"
+    )
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|")
+    for row in rows:
+        s = row["score"]
+        precision = f"{s['precision']:.1%}" if s["precision"] is not None else "—"
+        fp_rate = f"{s['fp_rate']:.1%}" if s["fp_rate"] is not None else "—"
+        lines.append(
+            f"| `{row['arm']}` | {int(row['triage_model'])} | "
+            f"{int(row['verify_prefilter'])} | **{s['recall']:.1%}** | {precision} | "
+            f"{fp_rate} | {s['tp_n']} | {s['fp_n']} | {s['unresolved_n']} | "
+            f"{row['cost']['total_tokens']} | {row['wall_s']:.0f} |"
+        )
+    lines.append("")
+    for row in rows:
+        s = row["score"]
+        lines.append(f"### 臂 `{row['arm']}` 明细")
+        lines.append("")
+        lines.append(f"- 终态：{row['final_state']}；只读自动放行 {row['read_only_auto_n']} 次")
+        lines.append(
+            f"- 单题成本：{row['cost']['total_tokens']} token "
+            f"（{row['cost']['llm_calls']} 次调用，分档 {row['cost']['by_tier']}）"
+        )
+        lines.append("")
+        lines.append(f"**实测 TP**（{s['tp_n']}）：{s['tp'] or '无'}")
+        lines.append("")
+        lines.append(f"**误报 FP**（{s['fp_n']}）：{s['fp'] or '无'}")
+        lines.append("")
+        if s["type_mismatch"]:
+            lines.append(
+                f"**类型错配**（端点确有漏洞，但 Confirmed 的类型与 ground truth 不符）："
+                f"{s['type_mismatch']}"
+            )
+            lines.append("")
+        if s["controls_confirmed"]:
+            lines.append(f"**对照端点被 Confirmed**：{s['controls_confirmed']}")
+            lines.append("")
+        lines.append(
+            f"**未能判定（verify_blocked）**：{s['unresolved_n']} 条"
+            f"（{s['unresolved_reasons'] or '无'}）"
+        )
+        lines.append("")
+        lines.append("**12 条真漏洞 + 4 对照的终态漏斗**：")
+        lines.append("")
+        for key, state in s["funnel"].items():
+            lines.append(f"- `{key}` → {state}")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def run_live(args, out_dir: Path) -> int:
+    """M10a：4 臂 × 真实确认链路 → Confirmed 级指标。"""
+    try:
+        router = ModelRouter.from_env(args.env_file)
+    except LLMError as exc:
+        print(f"[配置错误] {exc}", file=sys.stderr)
+        return 2
+    for tier, label in ((Tier.T1, "T1"), (Tier.T2, "T2")):
+        if tier not in router.configs:
+            print(
+                f"[配置错误] --live 需要 {label} 档：PROOFHOUND_{label}_*",
+                file=sys.stderr,
+            )
+            return 2
+    try:
+        import docker
+
+        docker.from_env().ping()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[环境错误] Docker 不可用（沙箱执行是红线，不可跳过）: {exc}",
+              file=sys.stderr)
+        return 2
+
+    arms = [a for a in _LIVE_ARMS if args.arm is None or a[0] in args.arm]
+    if not arms:
+        print(
+            f"[配置错误] --arm 未匹配任何臂：{[a[0] for a in _LIVE_ARMS]}",
+            file=sys.stderr,
+        )
+        return 2
+
+    server, base = start_fixture()
+    port = int(urllib.parse.urlparse(base).port)
+    print(f"[*] --live：fixture {base}（真后端：sqlite 注入 / 未转义反射 / 身份归属）")
+    print(f"[*] 臂：{[a[0] for a in arms]}；单臂超时 {args.live_timeout:.0f}s")
+    rows: list[dict] = []
+    try:
+        for name, triage_model, prefilter in arms:
+            print(
+                f"\n=== 臂 {name}（PROOFHOUND_TRIAGE_MODEL={int(triage_model)} "
+                f"PROOFHOUND_VERIFY_PREFILTER={int(prefilter)}）===",
+                flush=True,
+            )
+            row = run_live_arm(
+                name, triage_model, prefilter,
+                env_file=args.env_file, base=base, port=port,
+                root=out_dir, timeout=args.live_timeout,
+            )
+            rows.append(row)
+            s = row["score"]
+            precision = (
+                f"{s['precision']:.1%}" if s["precision"] is not None else "—"
+            )
+            print(
+                f"[*] 臂 {name}: TP={s['tp_n']} FP={s['fp_n']} "
+                f"未能判定={s['unresolved_n']} 检出率={s['recall']:.1%} "
+                f"精确率={precision} token={row['cost']['total_tokens']} "
+                f"wall={row['wall_s']:.0f}s",
+                flush=True,
+            )
+    finally:
+        server.shutdown()
+
+    meta = {
+        "stamp": out_dir.name,
+        "mode": "live-confirmed",
+        "granularity": "（端点路径, vuln_type）",
+        "blocked_policy": "verify_blocked 单列，不计入 precision/recall 分母",
+        "arms": [a[0] for a in arms],
+        "ground_truth_pairs": sum(len(v) for v in expected_pairs().values()),
+        "env_switches": {
+            "PROOFHOUND_TRIAGE_MODEL": "按臂设置",
+            "PROOFHOUND_VERIFY_PREFILTER": "按臂设置",
+        },
+        "note": (
+            "Confirmed 级：仅 state=confirmed 计入 TP/FP；候选级数字见离线三臂"
+            "（同一 fixture，--live 为附加模式，不改变离线确定性）"
+        ),
+    }
+    (out_dir / "live_report.json").write_text(
+        json.dumps({"meta": meta, "arms": rows}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    markdown = render_live_markdown(rows, meta)
+    (out_dir / "live_report.md").write_text(markdown, encoding="utf-8")
+    print("\n" + markdown)
+    print(f"[*] 产物：{out_dir}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="ProofHound M9c triage 三臂消融基准")
     parser.add_argument("--env-file", default=str(REPO_ROOT / ".env"))
@@ -779,12 +1235,32 @@ def main() -> int:
         action="store_true",
         help="rules+model 臂改用真实 T1 档（需 PROOFHOUND_T1_*）；缺省用离线替身上界",
     )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="M10a：端到端真实确认链路（Docker + Chromium + T2）→ Confirmed 级指标",
+    )
+    parser.add_argument(
+        "--arm",
+        action="append",
+        default=None,
+        help=f"--live 只跑指定臂（可重复）；缺省跑全部：{[a[0] for a in _LIVE_ARMS]}",
+    )
+    parser.add_argument(
+        "--live-timeout",
+        type=float,
+        default=3600.0,
+        help="--live 单臂等待终态的秒数上限（缺省 3600）",
+    )
     args = parser.parse_args()
 
     global BENCH_DIR
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     BENCH_DIR = REPO_ROOT / "evidence" / "bench_triage" / stamp
     BENCH_DIR.mkdir(parents=True, exist_ok=True)
+
+    if args.live:
+        return run_live(args, BENCH_DIR)
 
     # --model：rules+model 臂改用真实 T1 档（模型实测）；缺省用离线替身（上界）
     real_router = None

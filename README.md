@@ -281,21 +281,52 @@ canary 确认、verify-idor 双会话属性验证）。
 .venv/bin/python scripts/bench_triage.py --model    # rules+model 臂接真实 T1 档（需 PROOFHOUND_T1_*）
 ```
 
-> **语义纪律**：该基准的误报率是**候选级**——发现侧产出候选不等于确认漏洞（红线 2）。Confirmed 级数字须跑真实
-> verify 链路（Docker + Chromium + T2）。发现侧的误报由确认链路（L2 闸门 + 行为验证 + 证据门 + Verifier）消化，
-> 而不是靠发现侧保守到看不见漏洞。
+> ⚠️ **这张表是「能力上界」论证，不是真实模型的稳定能力**：离线 `model` 臂用的是**按 ground truth
+> 回候选的替身**（构造上必然接近满分），`--model` 那次的 12/12 也是**单次采样**。M10a 端到端实测显示：
+> 真实 T1 每次只捞到 6 条表外端点里的 **~3 条，且每次不是同样 3 条**。故「33.3% → 100%」回答的是
+> **发现层的门开多大**，不能读作模型表现。
+
+### Confirmed 级基线（端到端真实确认链路）
+
+同一 fixture 已升级为**真可确认**后端（sqlite 拼接注入 / 不转义反射 / 身份归属），由 `--live` 跑完整确认
+链路（Docker 沙箱 + Chromium + T2）。粒度 = **(端点路径, vuln_type)**、类型错配计误报；`verify_blocked`
+（T2 超时等）**单列、不计入分母**：
+
+| 臂 | TRIAGE_MODEL | VERIFY_PREFILTER | 检出率 | 精确率 | 误报率 | TP | FP | 未能判定 | token |
+|---|---|---|---|---|---|---|---|---|---|
+| `rules` | 0 | 0 | 33.3% | **100%** | **0.0%** | 4 | 0 | 0 | 26,557 |
+| `rules+model` | 1 | 0 | 58.3% | **100%** | **0.0%** | 7 | 0 | 0 | 59,052 |
+| `rules+prefilter` | 0 | 1 | 25.0% | **100%** | **0.0%** | 3 | 0 | 1 | 22,662 |
+| `rules+model+prefilter` | 1 | 1 | **66.7%** | **100%** | **0.0%** | **8** | 0 | 0 | 59,858 |
+
+**结论**：确认链路（证据门 + 独立 Verifier）在 4 臂上**误报率全 0**——4 个安全对照端点的全部候选都被
+驳回，且理由是实质性的（"无证据证明该对象确属 reference 身份私有"）。`PROOFHOUND_TRIAGE_MODEL`
+带来 **+3~+5 个 Confirmed**，代价约 2.2× token。
+
+```bash
+.venv/bin/python scripts/bench_triage.py --live                          # 4 臂（需 Docker+Chromium+T1+T2）
+.venv/bin/python scripts/bench_triage.py --live --arm rules+model+prefilter
+```
+
+> ⚠️ **基准的明示限制（M10a 未解决，留给后续）**：上表每臂只跑**一次**，而**单条 Confirmed 的判定本身
+> 是随机的**——同一个真 IDOR（`/a/idor`）在 4 个臂里出现 **4 种结果**（confirmed / rejected / 未能判定 /
+> rejected），分歧点是 Verifier 对「对象私有性」**证据够不够**的判定标准（它只收结构化摘要、看不到响应体，
+> 该要件在摘要下**欠定**）。故臂间 1~2 条 TP 的差异**无法区分是开关效应还是采样噪声**。
+> **重复测量与 Verifier 的 IDOR 判据收紧均未做。**
 
 **两个发现层开关缺省关闭**，开启后行为变更：`PROOFHOUND_TRIAGE_MODEL=1`（模型驱动假设生成）、
-`PROOFHOUND_VERIFY_PREFILTER=1`（贵验证档前置廉价粗筛）。
+`PROOFHOUND_VERIFY_PREFILTER=1`（贵验证档前置廉价粗筛）。Confirmed 级实测支持**开启
+`PROOFHOUND_TRIAGE_MODEL`**；`PROOFHOUND_VERIFY_PREFILTER` 的效应落在上述噪声内，**尚不足以定论**。
 
 ### 下一步（待维护者裁决）
 
 按依赖排序，前三项各自独立可交付：
 
-1. **基线数字补完**——当前基准只到候选级。用同一 fixture 端到端跑通真实确认链路，拿到
-   **Confirmed 级误报率与单题成本**。这是 M9c 两个开关「要不要默认开启」以及一切后续
-   「发现侧继续放开」论证的事实前提。
-   *工作量小（复用既有 fixture 与装配），但需要 Docker + Chromium + T2。*
+1. ~~**基线数字补完**~~ **已完成（M10a）**——同一 fixture 已升级为真可确认，`--live` 跑通
+   4 臂真实确认链路，拿到 Confirmed 级误报率 / 检出率 / 单题成本（见上节）。**残留两项**：
+   ① 每臂单次采样、方差未量化（同一真 IDOR 4 臂 4 结果）；② Verifier 的 IDOR 判据需收紧
+   （"reference 可访问 + 攻击者也可访问"是否足以构成属性违反，属**产品语义裁决**，需先定
+   "什么才算 IDOR 成立"）。**不解决 ① 之前，臂间 1~2 条的差异不可判。**
 2. **验证类型扩展：SSRF**——发现层已不是瓶颈（模型已达 100%），瓶颈转为**可确认的漏洞类别数**。
    选 SSRF 而非 LFI 的理由是确认手段的确定性：SSRF 靠**回调服务器收到请求**判定，是二值事实；
    LFI 靠回显 canary 文件，受目标环境与路径知识影响，判定更易含糊。建议**分两步走**：

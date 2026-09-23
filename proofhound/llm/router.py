@@ -47,6 +47,19 @@ def _env_names(tier: Tier) -> tuple[str, str, str]:
     return prefix + "BASE_URL", prefix + "API_KEY", prefix + "MODEL"
 
 
+#: 各档缺省读超时（秒）。T0/T1 保持 60；**T2 放宽到 180**。
+#:
+#: M10a 实测依据：前沿推理档（kimi-k3）的 Verifier 终审延迟落在 55~65s，与
+#: 60s 缺省线**重叠**，导致间歇性 ``verify_blocked``（fail-closed，设计正确但
+#: 把"未能判定"和"确证不成立"混在一起）。同一臂内实测：12 条真漏洞里 **3 条**
+#: 纯因超时丢失（Confirmed 级检出率 50%，本可 75%），而同一次运行里其它 T2 调用
+#: 均正常返回——即**逐次随机**，不是环境整体不可用。
+#:
+#: 注意 ``urllib`` 的 timeout 是**单一读超时**（连接与读取共用），故放宽同时抬高
+#: 了故障发现延迟，属刻意取舍。可用 ``PROOFHOUND_<TIER>_TIMEOUT`` 覆盖。
+DEFAULT_TIMEOUTS: dict[Tier, float] = {Tier.T0: 60.0, Tier.T1: 60.0, Tier.T2: 180.0}
+
+
 @dataclass
 class TierConfig:
     """单档模型接入配置。"""
@@ -86,6 +99,7 @@ class TierConfig:
         prefix = f"PROOFHOUND_{tier.name}_"
         temperature = _get(prefix + "TEMPERATURE")
         max_tokens = _get(prefix + "MAX_TOKENS")
+        timeout = _get(prefix + "TIMEOUT")
         try:
             return cls(
                 base_url=_get(base_name).rstrip("/"),
@@ -93,10 +107,13 @@ class TierConfig:
                 model=_get(model_name),
                 temperature=float(temperature) if temperature else None,
                 max_tokens=int(max_tokens) if max_tokens else None,
+                timeout=(
+                    float(timeout) if timeout else DEFAULT_TIMEOUTS.get(tier, 60.0)
+                ),
             )
         except ValueError:
             raise LLMError(
-                f"模型档位 {tier.value} 的 TEMPERATURE/MAX_TOKENS 必须为数值"
+                f"模型档位 {tier.value} 的 TEMPERATURE/MAX_TOKENS/TIMEOUT 必须为数值"
             ) from None
 
 
