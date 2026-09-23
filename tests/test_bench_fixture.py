@@ -212,7 +212,9 @@ def test_no_two_endpoints_share_a_body(base):
     """
     bodies: dict[str, str] = {}
     for url in _endpoint_urls():
-        status, body = _get(base + url)
+        # M11c：带**攻击者会话**取数——与 katana 爬行视角一致（IDOR 端点对匿名
+        # 请求返回 403 通用页，匿名视角下它们会被误判为"正文重复"）
+        status, body = _get(base + url, bench.TOKEN)
         assert status == 200, (url, status)
         bodies[url] = body
 
@@ -294,11 +296,16 @@ def test_idor_endpoints_deny_unauthenticated(base):
 
     动机：若匿名也能拿到对象页，"公开资源"与"B 的私有对象被 A 拿到"在未认证
     对照下**同形**，判据无法区分（这正是 Verifier 索要而拿不到的那个对照缺失的
-    根因）。刻意用 200（旧系统常见"登录页 200"形态）而非 403，保留最不利情形。
+    根因）。
+
+    M11c 修正：**403 拒绝**（而非 200）。首版用 200 + 登录页，结果 M11b 的对照
+    判据（只否定、不肯定）判 ``blocked`` 而非 ``protected``，真 IDOR 因此系统性
+    测不到判定结果。403 是"未认证被拒"的明确表达，判据随之进入设计预期分支
+    （302 亦被实测否决：会被 urllib 跟随到未注册的 /login → 404，语义模糊）。
     """
     for path, key in (("/a/idor", "id"), ("/b/idor", "no"), ("/b/idor2", "token")):
         status, body = _get(f"{base}{path}?{key}=1", None)  # 不带任何凭据
-        assert status == 200, (path, status)
+        assert status == 403, (path, status)
         assert "所有者" not in body, f"{path} 向未认证请求泄漏了对象归属"
         assert "未认证会话" in body
 

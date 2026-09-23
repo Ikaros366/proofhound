@@ -377,7 +377,13 @@ class _FixtureHandler(BaseHTTPRequestHandler):
             # 必须在正文层面工作。attacker（已认证非属主）仍拿到对象页 → 漏洞
             # 语义与 ground truth 不变。
             if self._identity() is None:
-                self._respond(200, _page("请先登录", "未认证会话无权查看该页面内容。"))
+                # M11c：改用 **403 拒绝**——"未认证被拒"的明确表达。原实现用
+                # 200 + 登录页，会被 M11b 对照判据判 blocked（只否定不肯定），
+                # 导致真 IDOR 系统性测不到判定结果；302 则会被测试/工具的
+                # urllib 跟随到未注册的 /login（404），语义模糊且多端点正文相同。
+                self._respond(
+                    403, _page("请先登录", "未认证会话无权查看该页面内容。")
+                )
                 return
             self._respond(200, _object_page(first(key), label, key))
             return
@@ -1070,6 +1076,10 @@ def run_live_arm(
                 "scope_paths": ["scope.yaml"],
                 "cookie": f"phsess={TOKEN}",
                 "reference_cookie": f"phsess={REFERENCE_TOKEN}",
+                # M11c：归属比对期望值——对象页展示的是 `OWNER_IDENTITY`
+                # （"owner"），而 reference 凭据是随机值，两者不同源，必须显式
+                # 声明，否则归属判 mismatched（真 IDOR 会被"缺归属证据"驳回）
+                "reference_identity": OWNER_IDENTITY,
                 "autonomy_mode": "semi_auto",
             },
         )
