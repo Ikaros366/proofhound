@@ -143,6 +143,9 @@ EOF
 .venv/bin/python -m proofhound.findings show <finding_id> --dir engagements/<engagement_id>
 # CLI 构建报告（--no-llm 跳过叙述生成）
 .venv/bin/python -m proofhound.report build --dir engagements/<engagement_id> --out report.docx
+# 单题成本归属（只读审计聚合，零 LLM；--json 供脚本消费）
+.venv/bin/python -m proofhound.cost --dir engagements/<engagement_id>
+.venv/bin/python -m proofhound.cost --dir engagements/<engagement_id> --finding <finding_id>
 ```
 
 一键三漏洞全证据链演示（Killer Demo，前置条件：Docker + DVWA 运行中、`.env`
@@ -318,6 +321,33 @@ canary 确认、verify-idor 双会话属性验证）。
 `PROOFHOUND_VERIFY_PREFILTER=1`（贵验证档前置廉价粗筛）。Confirmed 级实测支持**开启
 `PROOFHOUND_TRIAGE_MODEL`**；`PROOFHOUND_VERIFY_PREFILTER` 的效应落在上述噪声内，**尚不足以定论**。
 
+### 成本可见性（单题成本口径）
+
+`llm_call` 审计事件自 M11a 起带**归属信息**（`caller` / `finding_id` / `retry`），
+故成本可按维度拆开看。口径：**按「调用方 + 阶段」归属，含修复重试**（重试同时单列）。
+
+```bash
+.venv/bin/python -m proofhound.cost --dir engagements/<engagement_id>          # Markdown 摘要
+.venv/bin/python -m proofhound.cost --dir engagements/<engagement_id> --json   # 机器可读
+```
+
+| 维度 | 说明 |
+|---|---|
+| 按调用方 | `triage` / `planner` / `verifier` / `narrative` |
+| 按阶段 | `discovery` / `planning` / `verification` / `report` |
+| 按 Finding | **仅 Verifier** 终审可归到单条 Finding（其余调用点是批次级，不摊派） |
+| 按档位 | `t0` / `t1` / `t2` |
+
+控制台的 engagement 详情页有同一份**只读**面板；API 为
+`GET /api/engagements/{id}/cost`（`include_calls=false` 只回聚合值）。
+
+> ⚠️ **读这张表的三个前提**：① **旧数据无可归属信息**——M11a 之前的 `llm_call` 没有 `caller`，
+> 会归入 `unknown` 桶并**计入总数（不丢弃）**，报告同时给出**可归属比例**；跑在旧 engagement 上
+> 时该比例会是 0%，这不是 bug 而是事实的显式呈现。② **重试已含在总 token 内**，`retry_tokens`
+> 是其中可单列的部分，不要与总数相加。③ **这是"用量"不是"钱"**——没有单价与计费换算，
+> `estimated` 事件（响应无 usage，按 4 字符≈1 token 估算）的精度低于服务商 usage；
+> 适合同模型同目标下的相对比较（开关 A/B、阶段占比、重试抖动），不适合当作账单。
+
 ### 下一步（待维护者裁决）
 
 按依赖排序，前三项各自独立可交付：
@@ -332,14 +362,15 @@ canary 确认、verify-idor 双会话属性验证）。
    LFI 靠回显 canary 文件，受目标环境与路径知识影响，判定更易含糊。建议**分两步走**：
    先把 `vuln_type` 白名单从 `{sqli,xss,idor}` 放开一个类型、用基准测模型候选质量，
    再决定是否投入建验证器——而不是先建验证器再给它找活干。
-3. **成本可见性**——单题成本目前只在基准脚本里算得出来，系统内没有视图。M9c 引入了模型 triage 的
-   token 开销，成本不透明会直接影响「要不要默认开启」的判断。
+3. ~~**成本可见性**~~ **已完成（M11a）**——口径已定为「按调用方 + 阶段归属、含修复重试」，
+   `llm_call` 审计补归属字段，CLI / API / 控制台只读面板三处出口（见上节）。**残留**：无货币化
+   （只有用量，无单价）；无跨 engagement 聚合视图；自动降级（§5.3）仍未做。
 
 搁置：PDF 报告管线、stored/DOM 型 XSS、垂直越权/多步业务流验证、MCP 暴露、持续监测（均非当前瓶颈）；
 **skill 机制进一步收敛（Phase 3）明确不做**——`SkillRegistry` 经 M9d 已不再是安全真相源，且
 `web-scan`/`recon-crawl` 的 SOP 仍被 T1 规划器真实读取，进一步收敛只有审美收益却要动 168 个测试函数。
 
-已知限制摘要（完整清单见 [AGENTS.md](AGENTS.md)「已知限制」）：行为验证为 sqli/xss/IDOR 三条垂直切片（各有限定场景——sqli 覆盖 GET 参数与 POST 表单、XSS 仅 reflected/GET、IDOR 仅水平越权 GET 对象且需双身份会话）；发现自动化覆盖 GET 查询参数端点与 POST 表单页；API 无认证；沙箱出口白名单仅覆盖 HTTP(S)；控制台为轮询无 WebSocket；报告仅 docx。
+已知限制摘要（完整清单见 [AGENTS.md](AGENTS.md)「已知限制」）：行为验证为 sqli/xss/IDOR 三条垂直切片（各有限定场景——sqli 覆盖 GET 参数与 POST 表单、XSS 仅 reflected/GET、IDOR 仅水平越权 GET 对象且需双身份会话）；发现自动化覆盖 GET 查询参数端点与 POST 表单页；API 无认证；沙箱出口白名单仅覆盖 HTTP(S)；控制台为轮询无 WebSocket；报告仅 docx。**成本口径为"用量"非"钱"**，且 M11a 之前的审计无可归属信息（归 `unknown` 桶、报告给出可归属比例）；单条 Finding 的成本只含 Verifier 终审（其余调用点是批次级，不摊派）。**IDOR 判据的收紧方案已裁决但尚未实现**（需未认证对照探测 + 归属证据 + 由代码做归属提取），故「同一真 IDOR 在不同配置下结果不同」的方差问题仍未解决。
 
 ## 贡献
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Callable, TypeVar
 
 from proofhound.compliance.audit import AuditLog
+from proofhound.llm.callmeta import call_with_meta
 from proofhound.llm.client import LLMError
 from proofhound.llm.usage import BudgetExceededError
 
@@ -55,6 +56,7 @@ def complete_structured(
     *,
     audit: AuditLog | None = None,
     caller: str = "",
+    finding_id: str | None = None,
     max_chars: int | None = None,
 ) -> T:
     """结构化输出调用 + 一次修复重试。
@@ -64,9 +66,17 @@ def complete_structured(
       调用点自己的错误类型——原失败语义由此自动保留；
     - 首轮的 ``LLMError``/``BudgetExceededError``/``ContextOverflowError``
       （调用前检查在调用点）不触发重试，原样上抛——非结构化调用不受影响。
+    - M11a：``caller``/``finding_id`` 透传给路由器写进 ``llm_call`` 审计
+      （成本归属）；修复重试那一次带 ``retry=True``，故首轮与重试在审计上
+      **可确定性区分**，无需推断事件顺序。
     """
     tier_value = tier.value if hasattr(tier, "value") else str(tier)
-    raw = router.complete(tier, messages)
+    raw = call_with_meta(
+        router.complete,
+        tier,
+        messages=messages,
+        meta={"caller": caller, "finding_id": finding_id, "retry": False},
+    )
     try:
         return parse(raw)
     except Exception as exc:
@@ -87,7 +97,13 @@ def complete_structured(
         raise first_error
 
     try:
-        retry_raw = router.complete(tier, repair_messages)  # 计量/预算硬闸在路由层
+        # 计量/预算硬闸在路由层；tier 原样透传
+        retry_raw = call_with_meta(
+            router.complete,
+            tier,
+            messages=repair_messages,
+            meta={"caller": caller, "finding_id": finding_id, "retry": True},
+        )
     except BudgetExceededError:
         raise  # 预算硬闸覆盖重试：原样上抛，不回退
     except LLMError:

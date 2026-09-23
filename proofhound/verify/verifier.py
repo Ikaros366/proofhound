@@ -138,7 +138,10 @@ class Verifier:
             messages,
             self._parse_verdict,
             audit=self.audit,
+            # M11a 成本归属：阶段 verification；finding_id 让「单条 Finding 的
+            # 确认成本」可算（其余三个调用点是批次/engagement 级，无此归属）
             caller="verifier",
+            finding_id=finding.id,
             max_chars=self.context_policy.max_chars,
         )
         model = self._t2_model_name()

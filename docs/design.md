@@ -231,6 +231,38 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 >
 > **M8d 落地注记**（2026-08-15）：Killer Demo 一键三漏洞全证据链演示入口 `scripts/demo_killer.py`——单 engagement 覆盖 DVWA（sqli + xss_r）与 IDOR fixture（1001 漏洞 / 1002 对照）双目标（fixture 门户页追加 DVWA 深链供 katana 单种子跨端口爬行、合并 Cookie 头承载双站会话，均为 demo 层对既有机制的复用）；配套增量：`_verify_sqli` 的 `Verification` 补 `claim`/`expected`/`actual` 四段式字段（纯增量可选字段，证据门/Verifier/判定语义零改动，三条链路四段式自此齐整，旧数据 null 容忍），其余编排/证据门/构造器零改动。
 
+> **M11a IDOR 判据裁决规格（2026-09-23 裁决，**尚未实现**，留待 M11b）**：M10a 实测同一真
+> IDOR 在 4 臂出现 4 种结果（已知限制 35），当时归因为「Verifier 判定随机」。M11a 逐条复核
+> 4 臂全部 11 条 IDOR 终审原文后**修正该归因**：11 条里 7 条 reject 有 **6 条判得正确**
+> （它们是对 `/a/sqli`、`/b/sqli2`、`/d/safe` 之类**非 IDOR 端点**的类型误报，见限制 37），
+> 真 IDOR 的驳回理由则**逐字同构**——① 无对象归属证据；② A/B 响应 sha256 完全相同，更平凡的
+> 解释是"公开内容"；③ 缺一个能**排除公开端点**的对照。**分歧点因此是单一且明确的**：Verifier
+> 是否把"B 是 reference/victim ⇒ 对象属 B"当作**方法论已定义的前提**接受。决定性证据：同一
+> `/b/idor2` 在同一次运行的 `rules+model` 臂被 reject（"无证据建立属主关系"）、在
+> `rules+model+prefilter` 臂被 confirm（"属主由方法论定义"）——**同一模型、同一数据、两种标准**。
+>
+> 维护者裁决三条（**本里程碑只落规格，不实现**）：
+>
+> 1. **增加「未认证 / 第三身份」对照探测**：对同 URL 追加一次无凭据（或第三身份）请求，若其
+>    响应与 B 基准等价，则判定为**公开资源**并驳回。这是**纯确定性代码判定**（不新增 LLM
+>    调用、零额外 token），直接消掉 Verifier 反复索要的那个对照（其原话：
+>    "缺少第三对照（未认证请求、A 请求自有对象、或响应中含可归属 B 的私有字段的证据）
+>    来排除此解释"）。
+> 2. **要求归属证据**：「reference 可访问 + 攻击者拿到等价响应」**不足以**构成属性违反，
+>    必须有对象归属证据。
+> 3. **归属由确定性代码提取，Verifier 只收结论 + 行号锚点**：归属事实（如响应中的
+>    「所有者/owner/uid」类字段及归属判定）由**纯函数**从响应中提取并归一化，写入送审摘要的
+>    **结论 + 证据文件#行号锚点**；**响应体原文一行不进 prompt**——红线 3 的输入边界**零放松**
+>    （这是"要求归属证据"与"红线 3 不喂原始输出"之间唯一自洽的落法：红线 3 管的是**LLM 上下文**
+>    不得含原始输出，不是禁止代码读取磁盘上的证据文件）。
+>
+> **落地影响面（M11b 预估）**：`verify/idor.py`（新增对照探测与归属提取纯函数 + 判据收紧）、
+> `core/orchestrator.py::_verify_idor`（多一次探测、四段式与判定 JSON 增归属/对照字段）、
+> `verify/verifier.py` 对抗 SOP（写入"归属证据缺失即驳回"与"公开资源对照"两条复核要点）。
+> **基准 fixture 的既有弱点（限制 36）在方案 2 下会显性化**：`_object_page` 正文含
+> 「所有者 owner」，故归属证据可被提取 → 当前 fixture 在收紧后仍能 Confirmed；但真靶场若不
+> 自报归属，则按此规格会被驳回（宁漏勿滥），该取舍已由维护者确认保留。
+
 #### 5.4.3 Baseline 对照
 
 任何判定前先探测目标默认行为：请求随机不存在路径、发送无效参数值，建立 baseline 档案（通配路由、自定义 404、全 200 站点等）。payload 响应与 baseline 存在可归因差异才计为信号。
@@ -694,6 +726,65 @@ Confirmed** 的明确增益，代价约 2.2× token / 2.1× 时长。
 **不改**：确认链路、证据门判定语义、状态机铁律、闸门矩阵、两个开关的缺省值
 （`PROOFHOUND_TRIAGE_MODEL` / `PROOFHOUND_VERIFY_PREFILTER` 仍缺省关闭）。
 
+## 7.8 M11a 落地注记（2026-09-23：成本可见性）
+
+**动因**。M10a 之后，两个生产开关要不要默认开启取决于「单题成本」，但**成本数字根本不可
+复现**：同一份数据实测得出 5,897/4,270、4,197/11,349 等三组不同值（连大小关系都反）。根因
+经查是两件事叠加——① **口径未定**（按臂？含修复重试？按批次？）；② `llm_call` 审计事件
+**根本不带归属信息**（只有 tier/model/tokens/耗时），连「Verifier 花了多少」都算不出来。
+故本里程碑先定口径、再补归属，最后才出口。
+
+**口径（维护者裁决）**：按**调用方 + 阶段**归属、**含修复重试**。
+
+**Step 1：归属元数据**。`llm_call` 审计新增三个字段：
+
+| 字段 | 含义 | 取值 |
+|---|---|---|
+| `caller` | 调用方 | `triage` / `planner` / `verifier` / `narrative`（未登记 → 聚合归 `unknown`） |
+| `finding_id` | 该次调用服务的 Finding | **仅 Verifier 有值**（唯一逐 Finding 的贵调用；其余三处是批次/engagement 级） |
+| `retry` | 是否 M6a 修复重试那一次 | `True` 仅重试 |
+
+阶段映射：`triage→discovery`、`planner→planning`、`verifier→verification`、
+`narrative→report`。`retry` 由 `repair.py` 在重试调用上显式置位——**不发散推断事件顺序**
+（首轮与重试在审计上可确定性区分）。
+
+**Step 2：纯函数聚合**（`proofhound/llm/cost.py`，零 LLM 零网络）。维度 = 调用方 / 阶段 /
+Finding / 档位，**四个维度各自求和都等于总数**（单一口径，不存在第二套算法）。三条口径纪律：
+
+- **修复重试计入主口径**（它是真实成本），同时因带 `retry=True` 而可**确定性单列**
+  （`retry_calls`/`retry_tokens`）——既不含糊也不丢信息；
+- **`estimated` 单列计数**：响应无 usage 时按 4 字符≈1 token 估算（已知限制 6），估算与真实
+  **不混算**；
+- **旧数据归 `unknown` 桶而非丢弃**：M11a 之前的 `llm_call` 缺 `caller`，若丢弃则总量对不上
+  ——这正是"数字不可复现"的来源。另出**可归属比例**（1 − unknown 占比），把"这个数字覆盖了
+  多少调用"一并说清（旧 engagement 会是 0%，属**诚实的可见降级**）。
+
+**Step 3：三处出口**。CLI `python -m proofhound.cost --dir <eng> [--json] [--finding F-x]`；
+API `GET /api/engagements/{id}/cost`（只读、`include_calls` 可选、响应零凭据）；控制台**只读**
+成本面板。**口径统一**：`tokens_used` 与 `/cost` 改为同源同值（原先 `_tokens_used()` 自己遍历
+审计求和，属第二套口径），数值语义与改造前逐字节等价。
+
+> **实现期踩坑（重要，省后来者时间）**：
+>
+> 1. **降级逻辑必须放在 repair 层，而不只是 router 层**。首版只在 `ModelRouter.complete` 内
+>    做「目标不接受 kwargs 就不传」的判定，但 `complete_structured`（repair.py）**直接调用**
+>    `router.complete(tier, messages, caller=...)`，绕过了那层判定——57 个既有测试当场
+>    `TypeError`。修法是把判定抽成 `llm/callmeta.py` 的共享助手，**两个调用点都走它**。
+>    教训：**判定要放在所有调用路径的共同必经点上**，否则"已兼容"是假的。
+> 2. **`call_with_meta` 的参数顺序会静默错位**。首版签名是 `(func, messages, meta, *extra)`，
+>    调用写成 `call_with_meta(router.complete, messages, meta_dict, tier)` 时，`tier` 落进了
+>    `meta` 槽位、`messages` 只收到一个参数——症状是替身拿到 `(messages,)` 后报
+>    `TypeError: string indices must be integers`（因为把 `tier` 字符串当 dict 下标）。
+>    修法是把 messages 固定为「最后一个位置参数」（`func(*leading, messages, **meta)`），
+>    **meta 变关键字专用**，物理上不可能再错位。回归网：`test_cost.py` 的
+>    `test_callmeta_leading_args_forwarded`。
+> 3. **既有测试替身有 ~20 处 `def complete(self, tier, messages)`**（无 `**kwargs`）。选
+>    「签名判定 + 确定性降级」而非「改 20 个替身」，既守住"旧测试尽量零改动"纪律，又把
+>    降级语义锁进测试（`test_old_style_client_still_works_and_audits_none`）。
+> 4. **审计字段的诚实性 > 数字好看**。旧数据无法归属是事实，故选择「归 unknown + 报可归属
+>    比例」而不是摊派或丢弃；`finding_id` 只给 Verifier（其余调用点是批次级，按比例摊派到
+>    单条 Finding 是编造）——已记为限制 38。
+
 ## 8. 开发路线图
 
 | 里程碑 | 内容 | 验收标准 |
@@ -707,6 +798,7 @@ Confirmed** 的明确增益，代价约 2.2× token / 2.1× 时长。
 | M9c 发现层去锁：模型驱动假设生成 + 廉价粗筛 + 中性基准（2026-09-22 已完成） | ① 中性基准基座 `scripts/bench_triage.py`（自建 stdlib fixture，A/B 两族行为同构、唯一变量是参数名是否命中提示表；三臂消融 rules/model/rules+model；确定性 in-process 爬行，零 Docker）；② `proofhound/llm/triage.py` T1 档模型假设生成（白名单 `{sqli,xss,idor}` + 输入边界 + 接地性 + fail-closed + M6a 一次修复重试）；③ 接线 `triage_rules`/`triage_model` 双开关（model 缺省关闭，规则路径逐字节等价）；④ `proofhound/verify/prefilter.py` 廉价粗筛 + cap 移到贵验证档；⑤ M9c③ 人工闸细分（`mutating` 声明 + 闸门矩阵「模式 × 等级 × 是否改变状态」，唯一差异格 = semi_auto × L2） | 基准实测：纯规则表发现率 33.3%（漏 8/12，其中 6 条为关键词盲区）→ `rules+model` **100%**，粗筛后误报率 **0%**；新测试 87 个 + 旧 776 全绿（共 863，旧测试零改动）；粗筛实测负结果（丢弃式筛选是负收益）已收窄为建议性并锁进测试 |
 | M9b 红线 4 重定义：模型身份 → 校验独立性（2026-09-22 已完成） | 删除 T1==T2 同模型启动警告（改记 `llm_tiers_share_model` 审计）；红线 4 改约束「独立 agent + 独立上下文 + 输入边界」，不约束模型身份；新增独立性锁死测试 | T1/T2 同模型下功能全通且无警告；输入白名单/超限 fail-closed/输出契约三条在同模型下依然成立；「必须用不同模型」表述全树零残留 |
 | M10a 基线数字补完：真可确认 fixture + 端到端 `--live` + T2 读超时修复（2026-09-23 已完成） | ① `scripts/bench_triage.py` fixture 换真后端（sqlite 拼接注入 / 不转义反射 / 身份归属 / 真安全对照），**离线数字逐格不变**；② `--live` 附加模式跑 4 臂真实确认链路，口径 = (端点×类型)、类型错配计误报、`verify_blocked` 单列不计入分母；③ `llm/router.py` 增 `DEFAULT_TIMEOUTS`（T2 180s）+ `PROOFHOUND_<TIER>_TIMEOUT` | Confirmed 级 4 臂：精确率 **100%**、误报率 **0%**、检出率 33.3%/58.3%/25.0%/**66.7%**；T2 超时丢失从单臂 3/12 降到 4 臂合计 1/48；新测试 37 个 + 旧 853 全绿（共 890，旧测试零改动）；**明示限制**：单次采样、方差未量化（同一真 IDOR 4 臂 4 结果） |
+| M11a 成本可见性：单题成本口径 + 归属（2026-09-23 已完成） | ① `llm_call` 审计补 `caller`/`finding_id`/`retry`（`llm/callmeta.py` 确定性签名分派，旧替身零改动）；② `proofhound/llm/cost.py` 纯函数聚合（调用方/阶段/Finding/档位四维各自求和 == 总数；修复重试计入主口径且可确定性单列；`estimated` 单列；旧事件归 `unknown` 不丢弃 + 出可归属比例）；③ 三处出口 CLI/API/控制台只读面板；④ `tokens_used` 与 `/cost` 口径统一 | 新测试 39 个 + 旧 890 全绿（共 **929**，旧测试零改动）；对 M10a 已产出 engagement 独立复算出与 published 表**完全相同**的数字（59,052 token / 17 次调用 / t1 12,956 + t2 46,096）；**不含** IDOR 判据实现（已裁决留 M11b，见限制 40） |
 | M5 产品化（按需）——M5a 已完成（2026-08-07） | **M5a ✅**：本机 Web API（FastAPI 后端，无前端）+ 自主模式三档闸门（矩阵代码化）+ 动作确认队列（持久化 + operator 审计）；待做：M5b 前端控制台（自治模式切换、确认队列、证据浏览）、MCP 暴露、持续监测、增量复测 | — |
 
 ## 9. 风险与开放问题

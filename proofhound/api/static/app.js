@@ -345,6 +345,7 @@ function renderDetail(view, engId) {
     confsSig: null,
     findingsSig: null,
     auditTotal: -1,
+    costCalls: -1,  // M11a：总调用数不变则跳过成本面板重绘
     loosen: null,           // {mode, operator, note} 放宽切换表单
     confInputs: {},         // cid -> {operator, note}（轮询重建时保留输入）
     deciding: false,
@@ -370,17 +371,19 @@ function renderDetail(view, engId) {
   confPanel.id = 'conf-panel';
   const findingsPanel = el('div', 'panel');
   const reportPanel = el('div', 'panel');
+  const costPanel = el('div', 'panel');
   const auditPanel = el('div', 'panel');
-  view.append(backLink, title, errSlot, statusPanel, confPanel, findingsPanel, reportPanel, auditPanel);
+  view.append(backLink, title, errSlot, statusPanel, confPanel, findingsPanel, reportPanel, costPanel, auditPanel);
 
   setupReportPanel(reportPanel, engId, st);
 
   async function refresh() {
-    const [detail, confs, findings, audit] = await Promise.all([
+    const [detail, confs, findings, audit, cost] = await Promise.all([
       api(`/api/engagements/${engId}`),
       api(`/api/engagements/${engId}/confirmations`),
       api(`/api/engagements/${engId}/findings`),
       api(`/api/engagements/${engId}/audit?tail=${AUDIT_TAIL}`),
+      api(`/api/engagements/${engId}/cost?include_calls=false`),
     ]);
     errSlot.replaceChildren();
     st.lastDetail = detail;
@@ -388,6 +391,7 @@ function renderDetail(view, engId) {
     updateStatusBar(detail);
     updateConfirmations(confs.confirmations || []);
     updateFindings(findings.findings || []);
+    updateCost(cost);
     updateAudit(audit);
   }
 
@@ -788,6 +792,56 @@ function renderDetail(view, engId) {
       setTimeout(() => anchorRow.scrollIntoView({ block: 'center' }), 0);
     }
     return wrap;
+  }
+
+  // -- 成本归属（M11a；只读，总调用数不变则跳过重绘）--
+  function updateCost(cost) {
+    const total = cost.total || {};
+    if (total.calls === st.costCalls) return;
+    st.costCalls = total.calls;
+    costPanel.replaceChildren();
+    costPanel.appendChild(el('h3', null, '成本归属（只读）'));
+
+    const summary = el('div', 'status-bar');
+    summary.appendChild(statusItem('总调用', String(total.calls ?? 0)));
+    summary.appendChild(statusItem('总 token', String(total.total_tokens ?? 0)));
+    summary.appendChild(statusItem('修复重试',
+      `${total.retry_calls ?? 0} 次 / ${total.retry_tokens ?? 0} token`));
+    if (total.estimated_calls) {
+      summary.appendChild(statusItem('估算事件', `${total.estimated_calls} 次`));
+    }
+    costPanel.appendChild(summary);
+
+    const attr = cost.attributability;
+    if (typeof attr === 'number' && attr < 1) {
+      costPanel.appendChild(el('div', 'hint',
+        `可归属比例 ${(attr * 100).toFixed(1)}%——其余为 M11a 之前的审计事件`
+        + `（无 caller 记录），已归入 unknown 桶而非丢弃。`));
+    }
+
+    [['按调用方', cost.by_caller], ['按阶段', cost.by_phase],
+     ['按档位', cost.by_tier], ['按 Finding', cost.by_finding]].forEach(([label, bucket]) => {
+      const rows = Object.keys(bucket || {}).sort();
+      if (!rows.length) return;
+      costPanel.appendChild(el('h4', null, label));
+      costPanel.appendChild(costTable(rows.map((k) => [k, bucket[k]])));
+    });
+  }
+
+  function costTable(pairs) {
+    const table = el('table', 'data cost-table');  // 复用既有 table.data 样式
+    const head = el('tr');
+    ['归属', '调用', 'token', '重试次', '重试token', '估算次'].forEach((h) => {
+      head.appendChild(el('th', null, h));
+    });
+    table.appendChild(head);
+    pairs.forEach(([name, e]) => {
+      const tr = el('tr');
+      [name, e.calls, e.total_tokens, e.retry_calls, e.retry_tokens, e.estimated_calls]
+        .forEach((v) => tr.appendChild(el('td', null, String(v))));
+      table.appendChild(tr);
+    });
+    return table;
   }
 
   // -- 审计流（tail 轮询，total 不变则跳过重绘）--

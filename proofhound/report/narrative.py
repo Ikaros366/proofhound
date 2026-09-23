@@ -186,7 +186,7 @@ class NarrativeGenerator:
                 rejected_count=len(rejected_ids),
             ),
             audit=self.audit,
-            caller="narrative",
+            caller="narrative",  # M11a 成本归属：阶段 report（engagement 级）
             max_chars=self.context_policy.max_chars,
         )
         tokens: int | None = None

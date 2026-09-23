@@ -117,7 +117,7 @@ class Planner:
                 messages,
                 self._parse_and_validate,
                 audit=self.audit,
-                caller="planner",
+                caller="planner",  # M11a 成本归属：阶段 planning（批次级，无 finding）
                 max_chars=self.context_policy.max_chars,
             )
         except PlanValidationError as exc:

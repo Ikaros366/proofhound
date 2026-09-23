@@ -23,6 +23,7 @@ from enum import Enum
 from pathlib import Path
 
 from proofhound.compliance.audit import AuditLog
+from proofhound.llm.callmeta import call_with_meta
 from proofhound.llm.client import LLMClient, LLMConfig, LLMError, load_dotenv
 from proofhound.llm.usage import (
     BudgetExceededError,
@@ -181,12 +182,26 @@ class ModelRouter:
             configs[tier] = TierConfig.from_env(tier, env_file)  # 部分缺失在此报错
         return cls(configs, **kwargs)
 
-    def complete(self, tier: Tier | str, messages: list[dict]) -> str:
+    def complete(
+        self,
+        tier: Tier | str,
+        messages: list[dict],
+        *,
+        caller: str | None = None,
+        finding_id: str | None = None,
+        retry: bool = False,
+    ) -> str:
         """经指定档位发起一次对话补全，返回 assistant 文本。
 
         失败：档位未配置 → :class:`LLMError`；预算超限 →
         :class:`BudgetExceededError`（不发 HTTP、不计用量）；HTTP/格式异常 →
         :class:`LLMError`。
+
+        M11a 归属元数据（**纯增量、可选、不改变任何既有行为**）：
+        ``caller``（调用方标识，如 planner/triage/narrative/verifier）、
+        ``finding_id``（该次调用服务的 Finding，可为 None）、``retry``
+        （True = M6a 修复重试的那一次）。三者原样写入 ``llm_call`` 审计，
+        供成本归属聚合（``llm/cost.py``，口径 = 调用方 + 阶段，含修复重试）。
         """
         tier = Tier(tier)
         config = self.configs.get(tier)
@@ -196,7 +211,14 @@ class ModelRouter:
         if self.budget is not None:
             self.budget.check(self.tracker, tier.value)  # 硬闸：调用前检查
 
-        result = self._clients[tier].complete_with_usage(messages)
+        client = self._clients[tier]
+        target = getattr(client, "complete_with_usage", None) or client.complete
+        result = call_with_meta(
+            target,
+            messages=messages,
+            meta={"caller": caller, "finding_id": finding_id, "retry": retry},
+            error_wrapper=lambda msg: LLMError(f"模型档位 {tier.value} 调用失败: {msg}"),
+        )
         usage = result.usage or {}
         prompt_tokens = usage.get("prompt_tokens")
         completion_tokens = usage.get("completion_tokens")
@@ -227,6 +249,11 @@ class ModelRouter:
                 completion_tokens=record.completion_tokens,
                 latency_ms=round(record.latency_ms, 1),
                 estimated=record.estimated,
+                # M11a 归属元数据：缺省 None → 成本聚合归入 unknown 桶
+                # （**绝不静默丢弃**，见 llm/cost.py）
+                caller=caller,
+                finding_id=finding_id,
+                retry=retry,
             )
         return result.content
 

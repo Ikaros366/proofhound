@@ -321,7 +321,7 @@ def build_candidates(
             messages,
             parse_hypotheses,
             audit=audit,
-            caller=caller,
+            caller=caller,  # M11a 成本归属：阶段 discovery（候选级，无 finding）
             max_chars=max_chars,
         )
         candidates, dropped = _ground(parsed, batch)

@@ -45,6 +45,7 @@ from proofhound.api.runner import (
     ScopeViolationError,
 )
 from proofhound.findings.finding import FindingStore
+from proofhound.llm.cost import report_from_audit
 from proofhound.llm.usage import BudgetExceededError
 
 DOCX_MEDIA_TYPE = (
@@ -66,14 +67,14 @@ def _findings_counts(eng: Engagement) -> dict:
 
 
 def _tokens_used(eng: Engagement) -> int:
-    """累计 LLM token 用量（由审计 llm_call 事件聚合，重启也可查）。"""
-    total = 0
-    for event in eng.audit.read_all():
-        if event.get("event") == "llm_call":
-            total += int(event.get("prompt_tokens") or 0) + int(
-                event.get("completion_tokens") or 0
-            )
-    return total
+    """累计 LLM token 用量（由审计 llm_call 事件聚合，重启也可查）。
+
+    M11a：改用 :func:`~proofhound.llm.cost.report_from_audit` 的同一聚合口径
+    ——``/cost`` 端点与列表/详情里的 ``tokens_used`` 因此**必然同源同值**，
+    不会再出现同一份数据两个数字。数值语义与改造前逐字节等价（缺失/None
+    字段按 0 计）。
+    """
+    return report_from_audit(eng.dir / "audit.jsonl").total.total_tokens
 
 
 def _engagement_summary(eng: Engagement) -> dict:
@@ -343,6 +344,21 @@ def create_app(
         if tail is not None:
             events = events[-tail:]
         return {"total": total, "events": events}
+
+    # ---- 成本（M11a）----
+
+    @app.get("/api/engagements/{eng_id}/cost")
+    def get_cost(eng_id: str, include_calls: bool = True) -> dict:
+        """单题成本归属（只读、纯文件聚合、零 LLM）。
+
+        口径 = 调用方 + 阶段（含修复重试，重试单列）；数据源 = ``llm_call``
+        审计。``include_calls=false`` 时只回聚合值（体积更小，供轮询）。
+        响应中不含任何凭据：本端点只读 tier/caller/finding_id/tokens 等结构化
+        字段。
+        """
+        eng = manager.get(eng_id)
+        report = report_from_audit(eng.dir / "audit.jsonl")
+        return report.as_dict(include_calls=include_calls)
 
     # ---- 确认队列 ----
 
