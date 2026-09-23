@@ -886,6 +886,44 @@ blocked / 归属非 matched 一律 reject，**不得自行放宽**）。
    于是在"双会话判定"这步就驳回、根本走不到 Verifier。修法是让**差异区等长**
    （token 注释定长 + 3 字符差异标记），相似度回到 0.99+。
 
+### 7.9.1 M11c-pre：测量 harness 修正（2026-09-23）
+
+**性质：这是测量 harness 的配置缺陷，不是生产判据缺陷。** 第一遍重复测量一跑起来就暴露：
+M11b 新增的判据在基准里**完全无法进入设计预期状态**，真 IDOR 被系统性判成"未能判定"或
+"缺归属证据"驳回——基准测到的不是判据行为，而是配置错误的副作用。两处缺陷：
+
+| # | 缺陷 | 机制 | 后果（实测） |
+|---|---|---|---|
+| 1 | 匿名拒答用 **200** | 对照判据**只否定、不肯定**：2xx 且既不逐字节相同、相似度也不达阈值 → `blocked` | `/a/idor` 对照相似度 0.747 < 0.9 → `blocked` → Finding 停 Hypothesis → **4 臂 IDOR 真阳性全丢** |
+| 2 | 未声明 `reference_identity` | 对象页展示 `所有者 owner`，reference 凭据是 `bench0reference0token`，两者**不同源** → 归属判 `mismatched` | 真 IDOR 被"缺归属证据"驳回 |
+
+**修法与否决记录**（三种形态都试过）：
+
+- 缺陷 1 改 **403**。**302 经实测否决**——`urllib`（测试与部分工具）会**跟随**重定向到
+  未注册的 `/login` → 404，语义模糊，且跟随后的 404 正文在多个端点间**相同**，会破坏
+  `test_no_two_endpoints_share_a_body`（该不变式防的是 katana 把正文重复的 URL 当重复响应
+  丢弃）。403 是 `verify/prefilter.py` 文档自己点名的"被拒"形态，语义清晰且 `HTTPError`
+  会带出被拒正文而不跟随。
+- 缺陷 2 在建 engagement 时补 `reference_identity=OWNER_IDENTITY`（与 `demo_killer` /
+  `demo_idor_fixture` 同一处理）。
+
+**为什么这是修 harness 而不是放宽判据**：`idor_control.py` 对"200 的含糊对照"判 `blocked`
+而不去猜，是**正确行为**（只否定、不肯定）。修 harness 是让被测系统进入其**设计预期状态**。
+
+**修复后验证（实测）**
+
+- 单臂 sanity（`evidence/bench_triage/20260923T150346Z`）：`/a/idor` → **confirmed**；
+  对照 = `protected`（403，similarity 0.747）；归属 = **`matched`**（字段 `所有者`，值 `owner`，
+  行锚点 1）——M11b 判据首次在基准里跑通 `protected + matched` 正向路径。
+- 新基线（各 1 次采样）：`rules` **33.3%（4/12，FP 0，未能判定 0）**；
+  `rules+model` **75.0%（9/12，FP 0）**——后者显著高于 M10a published 的 58.3%，
+  差额主要来自此前被上述缺陷压制的 IDOR 项。
+- **M10a 的 4 臂表因此降级为"历史数字"**（其 IDOR 项受缺陷 1 压制）。
+
+> **未完成**：**方差量化**。M11c 的 3 遍 × 4 臂只跑完 1 遍（且该遍后两臂被 `LLM HTTP 429`
+> 污染——T2 账户余额耗尽，属外部阻塞）。故"臂间 1~2 条 TP 差异是否可区分于采样噪声"
+> 与"`VERIFY_PREFILTER` 效应是否落在噪声内"**仍无答案**，上述新基线亦**不可用于臂间比较**。
+
 ## 8. 开发路线图
 
 | 里程碑 | 内容 | 验收标准 |
