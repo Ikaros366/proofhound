@@ -365,13 +365,17 @@ canary 确认、verify-idor 双会话属性验证）。
 > 但**本批数字与 M9a~M11b 的 `kimi-k3` 实测不可直接比较**。另外测量前停掉了宿主机上抢占
 > CPU 的无关容器，故 **wall 时间亦不可比**。
 
-**两个发现层开关缺省关闭**，开启后行为变更：`PROOFHOUND_TRIAGE_MODEL=1`（模型驱动假设生成）、
-`PROOFHOUND_VERIFY_PREFILTER=1`（贵验证档前置廉价粗筛）。
+**两个发现层开关当前均缺省关闭**，开启后行为变更：`PROOFHOUND_TRIAGE_MODEL=1`（模型驱动
+假设生成）、`PROOFHOUND_VERIFY_PREFILTER=1`（贵验证档前置廉价粗筛）。**M11c 的重复测量已经给出
+两者的可判性结论**（见上节）：
 
-- `PROOFHOUND_TRIAGE_MODEL`：修复后实测（单次采样）`rules` 33.3% → `rules+model` **75.0%**，
-  代价约 2.2× token。**方向明确、幅度大**，是当前证据最强的开关。
-- `PROOFHOUND_VERIFY_PREFILTER`：M10a 单次采样下其效应落在噪声内（且当时那两个臂的 IDOR 项
-  正被上述 harness 缺陷压制）。**方差未量化前不建议改缺省值** —— 需要 M11c 重复测量给出可判性结论。
+- `PROOFHOUND_TRIAGE_MODEL`：**建议默认开启**（33.3% → 66.7%，+4 Confirmed，三遍零方差、
+  区间不重叠 ⇒ 差异可判；代价 1.97× token）。注：M10a 单次采样曾读到 75.0%，**重复测量后的
+  稳定值是 66.7%**——单次采样的读数偏高，这正是要重复测量的原因。
+- `PROOFHOUND_VERIFY_PREFILTER`：**保持缺省关闭**（`rules` 下零效应；`rules+model` 下
+  [8,8,8]→[9,8,9] 区间重叠 ⇒ 不可判；代价 1.23× token）。
+
+> 缺省值**尚未改动**——数据支持开启 `TRIAGE_MODEL`，但改生产缺省属行为变更，待维护者裁决。
 
 ### 成本可见性（单题成本口径）
 
