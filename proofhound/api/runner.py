@@ -971,6 +971,7 @@ class EngagementManager:
             reference = SessionConfig(
                 cookies=raw_reference.get("cookies", {}),
                 headers=raw_reference.get("headers", {}),
+                identity=raw_reference.get("identity"),  # M11b：声明式归属身份
             )
         return SessionConfig(
             cookies=data.get("cookies", {}),
@@ -1023,9 +1024,14 @@ class EngagementManager:
                 session_data["cookies"] = parse_cookie(request.cookie)
             if request.reference_cookie is not None:
                 # M8c：第二身份会话（reference/victim，verify-idor 双会话验证用）
-                session_data["reference"] = {
+                reference: dict = {
                     "cookies": parse_cookie(request.reference_cookie)
                 }
+                # M11b：归属比对用的声明式身份标识（对象页展示的用户名/所有者名，
+                # 通常与会话凭据值**不同源**）。未给则 M11b 判据回退到凭据值。
+                if request.reference_identity is not None:
+                    reference["identity"] = request.reference_identity
+                session_data["reference"] = reference
             session_path = directory / "session.json"
             session_path.write_text(
                 json.dumps(session_data, ensure_ascii=False, indent=2) + "\n",

@@ -285,3 +285,51 @@ def test_endpoint_table_shape_unchanged():
     assert tuple(bench.OUT_OF_TABLE) == (
         "article_id", "sku", "ref", "bh", "no", "token", "product", "code",
     )
+
+# ------------------------------------------------- M11b：fixture 控制面语义
+
+
+def test_idor_endpoints_deny_unauthenticated(base):
+    """M11b：IDOR 端点对**未认证**请求返回定长通用页（不泄漏对象内容）。
+
+    动机：若匿名也能拿到对象页，"公开资源"与"B 的私有对象被 A 拿到"在未认证
+    对照下**同形**，判据无法区分（这正是 Verifier 索要而拿不到的那个对照缺失的
+    根因）。刻意用 200（旧系统常见"登录页 200"形态）而非 403，保留最不利情形。
+    """
+    for path, key in (("/a/idor", "id"), ("/b/idor", "no"), ("/b/idor2", "token")):
+        status, body = _get(f"{base}{path}?{key}=1", None)  # 不带任何凭据
+        assert status == 200, (path, status)
+        assert "所有者" not in body, f"{path} 向未认证请求泄漏了对象归属"
+        assert "未认证会话" in body
+
+
+def test_idor_endpoints_still_leak_to_authenticated_attacker(base):
+    """漏洞语义不变：已认证**非属主**仍拿到对象页（ground truth 未变）。"""
+    _, attacker = _get(f"{base}/a/idor?id=1", bench.TOKEN)
+    assert "所有者" in attacker
+    assert "未认证会话" not in attacker
+
+
+def test_footer_is_per_endpoint_not_credential(base):
+    """M11b：footer 是 per-endpoint 标记，**不再回显任何凭据**。
+
+    原实现硬编码 ``session=<主会话 token>``——页面在"谁在看"上说谎，且制造了
+    A/B 正文逐字节相同的伪迹（M10a 的 Verifier 据此质疑"更像公开内容"）。
+    """
+    _, body_a = _get(f"{base}/a/idor?id=1", bench.TOKEN)
+    _, body_b = _get(f"{base}/b/idor?no=1", bench.TOKEN)
+    for body in (body_a, body_b):
+        assert "<footer>ep=" in body
+        assert bench.TOKEN not in body
+        assert bench.REFERENCE_TOKEN not in body
+    # 端点标记唯一 → 正文可区分（katana 不会当重复响应丢弃）
+    assert body_a != body_b
+
+
+def test_control_probe_basis_owner_and_attacker_see_object(base):
+    """对照探测的判据基础：owner 与 attacker 都拿到对象页，**未认证拿不到**。"""
+    _, owner = _get(f"{base}/a/idor?id=1", bench.REFERENCE_TOKEN)
+    _, attacker = _get(f"{base}/a/idor?id=1", bench.TOKEN)
+    _, anon = _get(f"{base}/a/idor?id=1", None)
+    assert "所有者" in owner and "所有者" in attacker
+    assert "所有者" not in anon

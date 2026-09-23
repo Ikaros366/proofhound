@@ -101,6 +101,12 @@ from proofhound.verify.idor import fetch as idor_fetch_default
 from proofhound.verify.idor import has_substance as idor_has_substance
 from proofhound.verify.idor import judge as idor_judge
 from proofhound.verify.idor import judgment_dict as idor_judgment_dict
+from proofhound.verify.idor_control import (
+    body_sha256 as idor_body_sha256,
+    control_summary as idor_control_summary,
+    judge_control as idor_judge_control,
+    judge_ownership as idor_judge_ownership,
+)
 from proofhound.verify.prefilter import screen as prefilter_screen
 from proofhound.verify.verifier import Verifier, VerifierError
 
@@ -1014,7 +1020,13 @@ class Orchestrator:
         # 5. 证据门 → Verifier 终审 → 终态迁移（公共收尾，M8b 抽出复用）
         return self._gate_and_review(finding, skill, store)
 
-    def _gate_and_review(self, finding: Finding, skill, store: FindingStore) -> str:
+    def _gate_and_review(
+        self,
+        finding: Finding,
+        skill,
+        store: FindingStore,
+        summary: dict | None = None,
+    ) -> str:
         """REPRODUCED 之后的公共收尾（verify-sqli / verify-xss 共用）：
         证据门（§5.4.2）→ Verifier 终审（T2，§5.4.4）→ CONFIRMED/REJECTED。
 
@@ -1042,6 +1054,9 @@ class Orchestrator:
                 finding,
                 evidence_index=manifest.get("items", []),
                 diff_summary=finding.verification.baseline_diff,
+                # M11b：仅 verify-idor 传确定性结论块（对照/归属三态 + 锚点）；
+                # 其余链路给 None → prompt 载荷逐字节不变
+                extra_summary=summary,
             )
         except (VerifierError, LLMError, BudgetExceededError, ContextOverflowError) as exc:
             self.audit.record(
@@ -1336,7 +1351,107 @@ class Orchestrator:
             )
             return "blocked"
 
-        # 3. 确定性属性判定（阈值写死；判定依据全量结构化落盘）
+        # 3. **未认证对照探测**（M11b）：排除"公开/与会话无关的资源"这一
+        #    更平凡的解释。未配 session_third 时用空会话（**完全不发凭据**）。
+        #    scope 已在前方过 check_scope，此处请求同一 URL，无新增授权面。
+        control_session = getattr(scope, "session_third", None) or SessionConfig()
+        resp_c = self._idor_fetch(url, control_session)
+        self.audit.record(
+            "idor_probe_attempt",
+            finding_id=finding.id,
+            role="unauthenticated_control",
+            status=resp_c.status,
+            error=resp_c.error is not None,
+        )
+        c_path = self._idor_write_response(finding.id, "c", resp_c, secrets)
+        control = idor_judge_control(resp_b, resp_c)
+
+        # 4. **确定性属性归属提取**（M11b）：从 B 基准里提取"对象所有者"字段，
+        #    与 reference 身份比对。只产结论 + 行号锚点，响应体原文不进 prompt。
+        ownership = idor_judge_ownership(resp_b, scope.session_identity())
+
+        # 结论落盘（判定依据全量结构化，供离线复核与证据链）
+        summary = idor_control_summary(control, ownership)
+        s_path = self.evidence_dir / f"idor_{finding.id}_control.json"
+        s_path.write_bytes(
+            redact_bytes(
+                (
+                    json.dumps(
+                        {
+                            "finding_id": finding.id,
+                            "url": url,
+                            "control_body_sha256": idor_body_sha256(resp_c.body),
+                            "baseline_body_sha256": idor_body_sha256(resp_b.body),
+                            **summary,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+                secrets,
+            )
+        )
+        self.audit.record(
+            "idor_control_judged",
+            finding_id=finding.id,
+            control_verdict=control.verdict,
+            ownership_verdict=ownership.verdict,
+            similarity=round(control.similarity, 3),
+            same_bytes=control.same_bytes,
+        )
+
+        # 3a. 对照判定 public → **公开/与会话无关的资源**，属性违反不成立：
+        #     确定性驳回（零额外 LLM 成本；理由与证据锚点齐全）
+        if control.verdict == "public":
+            finding.transition(
+                FindingState.REJECTED,
+                actor=skill.name,
+                reason=(
+                    "未认证对照判定为**公开/与会话无关的资源**："
+                    + "；".join(control.reasons)
+                    + f"（判定依据见 {s_path.name}）"
+                ),
+            )
+            store.append(finding)
+            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+            return "rejected"
+
+        # 3b. 对照判定 blocked → 覆盖不全，**不驳回也不确认**（fail-closed）
+        if control.verdict == "blocked":
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=(
+                    "未认证对照无法判定（覆盖不全，不驳回）: "
+                    + "；".join(control.reasons)
+                ),
+            )
+            return "blocked"
+
+        # 3c. 对照 protected 但归属**无证据** → 按 M11a 裁决第 2 条驳回：
+        #     "reference 可访问 + 攻击者拿到等价响应"本身不构成属性违反
+        if ownership.verdict != "matched":
+            finding.transition(
+                FindingState.REJECTED,
+                actor=skill.name,
+                reason=(
+                    "未认证对照成立（资源受会话保护），但**缺对象归属证据**："
+                    f"归属判定={ownership.verdict}"
+                    + (
+                        f"（命中字段 {ownership.field}={ownership.value}，"
+                        "与 reference 身份不一致）"
+                        if ownership.verdict == "mismatched"
+                        else "（B 基准中未找到可归属 reference 身份的字段）"
+                    )
+                    + f"；判定依据见 {s_path.name}"
+                ),
+            )
+            store.append(finding)
+            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+            return "rejected"
+
+        # 5. 确定性属性判定（阈值写死；判定依据全量结构化落盘）
         judgment = idor_judge(resp_b, resp_a)
         j_path = self.evidence_dir / f"idor_{finding.id}_judgment.json"
         j_path.write_bytes(
@@ -1374,7 +1489,13 @@ class Orchestrator:
         cookie_mark_b = secret_marker(reference.cookie_header())
         finding.verification = Verification(
             method="dual-session-confirmed",
-            evidence_refs=[str(b_path), str(a_path), str(j_path)],
+            evidence_refs=[
+                str(b_path),
+                str(a_path),
+                str(j_path),
+                str(c_path),
+                str(s_path),
+            ],
             baseline_diff=(
                 f"B 会话基准 {resp_b.status}（reference/victim，实质数据 "
                 f"{len(resp_b.body.strip())} 字节）；A 会话对比 {resp_a.status}；"
@@ -1415,8 +1536,9 @@ class Orchestrator:
         )
         store.append(finding)
 
-        # 5. 证据门 → Verifier 终审 → 终态（与 verify-sqli/xss 同一收尾）
-        return self._gate_and_review(finding, skill, store)
+        # 6. 证据门 → Verifier 终审 → 终态（与 verify-sqli/xss 同一收尾）；
+        #    确定性结论块一并送审（protected + matched 才走到这里）
+        return self._gate_and_review(finding, skill, store, summary=summary)
 
     def _idor_write_response(
         self, finding_id: str, role: str, resp, secrets: list[str]

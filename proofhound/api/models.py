@@ -49,6 +49,7 @@ class CreateEngagementRequest(BaseModel):
     acknowledge_authorization: bool = False  # M9a：派生 scope 时必需的显式授权确认
     cookie: str | None = None  # 可选预置会话 Cookie 头（k=v; k=v 形式）
     reference_cookie: str | None = None  # M8c：可选第二身份会话（reference/victim，verify-idor 用）
+    reference_identity: str | None = None  # M11b：reference 身份的**声明式**标识（归属比对期望值）
     autonomy_mode: AutonomyMode = AutonomyMode.SEMI_AUTO  # 默认半自动（§5.9.2）
     budget: int | None = Field(default=None, ge=0)  # Run 级 token 预算；0 = 拒绝一切 LLM 调用
     extras: dict[str, str] | None = None  # 报告元信息额外键（M4.5 extras 透传：company_name 等）

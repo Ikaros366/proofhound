@@ -77,6 +77,38 @@ class Scope(BaseModel):
     # 预置会话（M3b，§5.3 认证旁路第①条）：授权配置中的 Cookie/请求头，
     # 供构造器注入工具参数；其值在审计/state/日志中只记 sha256 前 8 位。
     session: SessionConfig | None = None
+    # M11b：**第三身份**会话（可选）。verify-idor 的未认证对照探测在未配置时
+    # 自动退化为**完全不发凭据**的匿名请求——匿名探测已足以否定"公开资源"
+    # （见 verify/idor_control.py 的语义说明），故本字段是**可选增强**而非必需。
+    session_third: SessionConfig | None = None
+
+    def session_identity(self) -> str | None:
+        """reference 会话的身份标识（供归属比对的**期望值**）。
+
+        M11b 解析顺序：
+
+        1. **声明式** ``reference.identity``（推荐）——真系统的对象页展示的是
+           用户名/所有者名，而会话凭据常是随机 session id，两者**不同源**；
+           demo_idor_fixture 实测即是（正文 ``属主：b`` vs 凭据
+           ``8071f6e5d4c3b2a1``），只推凭据会让归属判定一律 ``absent``。
+        2. 回退：reference 会话的凭据值（``phsess`` 优先，否则第一个 cookie 值）
+           ——向后兼容既有配置。
+
+        都取不到时返回 ``None``，此时归属判定一律 ``absent``（**不做"有 owner
+        字段就算证据"的放松**）。给出 ``identity`` **不放宽**判据：归属字段名与
+        字段值仍须同时命中才算 ``matched``。
+        """
+        reference = self.session.reference if self.session else None
+        if reference is None:
+            return None
+        if reference.identity and reference.identity.strip():
+            return reference.identity.strip()
+        if reference.cookies.get("phsess"):
+            return reference.cookies["phsess"]
+        for value in reference.cookies.values():
+            if value:
+                return value
+        return None
 
     @classmethod
     def from_file(cls, path: str | Path) -> "Scope":

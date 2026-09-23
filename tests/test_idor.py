@@ -63,10 +63,31 @@ DUAL_SESSION = SessionConfig(
 CVSS_IDOR = "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N"
 
 
-def _padded_body(token: str, size: int = 400) -> str:
-    """含会话 token 的定长正文（相似度不受 token 差影响跌破阈值）。"""
-    core = f"<html><body><h1>发票 #1001</h1><p>金额 ¥8,800.00（属主 B）</p><!-- {token} -->"
-    return core + "x" * (size - len(core)) + "</body></html>"
+def _padded_body(token: str, size: int = 400, owner: str | None = None) -> str:
+    """定长正文：固定头部 + x 填充 + **等长尾部标记区**。
+
+    相似度契约（M11b 实测修正）：两身份的尾部标记必须**等长**，否则会整体错位、
+    把 x 填充与注释文本错误对齐，相似度跌破 0.9 阈值（实测 0.8725）。故 token
+    注释定长（与 token 值本身无关，纯标记），再加一个 3 字符的 ``data-s`` 差异。
+
+    ``owner`` 为**可归属字段** ``owner=<值>``，供确定性归属提取
+    （``verify/idor_control.py``）——它要求"归属字段名 + 值与 reference 身份
+    一致"两族同时命中；散文"（属主 B）"不构成证据（刻意的宁漏勿滥）。
+    """
+    head = "<html><body><h1>发票 #1001</h1><p>金额 ¥8,800.00（属主 B）</p>"
+    owner_part = f"<span>owner={owner}</span>" if owner else ""
+    # token 注释**定长**（16 个 x 与任何 token 值同长），使两身份尾部等长
+    tail = (
+        f"{owner_part}<i data-s=\"{token[:3]}\"></i><!-- token:xxxxxxxxxxxxxxxx -->"
+        "</body></html>"
+    )
+    return head + "x" * max(size - len(head) - len(tail), 0) + tail
+
+
+def _victim_identity() -> str:
+    """reference 会话的身份标识（= 归属提取的期望值来源）。"""
+    reference = DUAL_SESSION.reference
+    return reference.cookies["phsess"] if reference else ""
 
 
 # ---- idor.py 纯函数：相似度 / 键重叠 / 状态分类 / 实质数据 / 判定 ----
@@ -415,19 +436,52 @@ def _confirm_reply():
 
 
 def _canned_fetch(*, a_status=200, a_body=None, b_status=200, b_body=None,
-                  a_error=None, b_error=None):
-    """按会话 token 分角色的罐头 fetch（B=reference/victim，A=主会话）。"""
+                  a_error=None, b_error=None, c_status=403,
+                  c_body=None, c_error=None, owner="__default__",
+                  b_body_override=None):
+    """按会话分角色的罐头 fetch（B=reference/victim，A=主会话，C=未认证对照）。
+
+    M11b：新增第三个角色——**空会话**（scope 未配 session_third 时编排层用
+    ``SessionConfig()``，即完全不发凭据）。默认给 403 + 明显不同的正文，模拟
+    "未认证被拒"，使对照判 ``protected``（属性违反解释成立）。
+    """
     calls = []
 
     def _fake(url, session):
-        role = "b" if session.cookies.get("phsess") == B_TOKEN else "a"
+        phsess = session.cookies.get("phsess")
+        # M11b：对照角色 = 无任何 cookie（匿名探测）
+        if not session.cookies and not session.headers:
+            role = "control"
+        else:
+            role = "b" if phsess == B_TOKEN else "a"
         calls.append(role)
+
         if role == "b":
             if b_error is not None:
                 return IdorResponse(url=url, error=b_error)
+            if b_body_override is not None:
+                # 逐字替换（供"正文里塞哨兵串以验证不泄漏"这类用例）
+                body = b_body_override
+            else:
+                # owner 开关：默认注入 reference 身份（matched）；传 None 则不写
+                # 归属字段（absent）；传其他值则归属指向他人（mismatched）
+                owner_value = (
+                    _victim_identity() if owner == "__default__" else owner
+                )
+                # 统一走定长助手：显式正文也按同一契约生成（仅尾部标记不同），
+                # 否则相似度会跌破 0.9 阈值、测不到 Verifier 那条路径
+                body = _padded_body(B_TOKEN, owner=owner_value)
+            return IdorResponse(url=url, status=b_status, body=body)
+        if role == "control":
+            if c_error is not None:
+                return IdorResponse(url=url, error=c_error)
             return IdorResponse(
-                url=url, status=b_status,
-                body=b_body if b_body is not None else _padded_body(B_TOKEN),
+                url=url, status=c_status,
+                body=(
+                    c_body
+                    if c_body is not None
+                    else "<html><body>请先登录后再查看该内容。</body></html>"
+                ),
             )
         if a_error is not None:
             return IdorResponse(url=url, error=a_error)
@@ -513,14 +567,25 @@ def test_verify_idor_full_chain_confirmed(verify_env):
     assert finding.cvss_vector == CVSS_IDOR
     assert finding.cvss_score == base_score(CVSS_IDOR)
     assert finding.severity == severity_for_score(finding.cvss_score)
-    # 三条证据全部落盘：B 基准 / A 对比 / 判定 JSON
-    assert len(verification.evidence_refs) == 3
-    b_path, a_path, j_path = (Path(p) for p in verification.evidence_refs)
+    # M11b：五条证据全部落盘——B 基准 / A 对比 / 判定 JSON /
+    # C 未认证对照响应 / 对照与归属结论 JSON
+    assert len(verification.evidence_refs) == 5
+    paths = [Path(p) for p in verification.evidence_refs]
+    b_path, a_path, j_path, c_path, s_path = paths
     assert b_path.name == f"idor_{finding.id}_b_response.txt"
     assert a_path.name == f"idor_{finding.id}_a_response.txt"
     assert j_path.name == f"idor_{finding.id}_judgment.json"
-    for path in (b_path, a_path, j_path):
+    assert c_path.name == f"idor_{finding.id}_c_response.txt"
+    assert s_path.name == f"idor_{finding.id}_control.json"
+    for path in paths:
         assert path.is_file() and path.stat().st_size > 0
+    # 对照结论结构化落盘：protected + matched（M11b 判据）
+    control_doc = json.loads(s_path.read_text(encoding="utf-8"))
+    assert control_doc["unauthenticated_control"]["verdict"] == "protected"
+    assert control_doc["object_ownership"]["verdict"] == "matched"
+    # 两份响应指纹都记录（便于离线复核"是否逐字节相同"）
+    assert len(control_doc["baseline_body_sha256"]) == 64
+    assert len(control_doc["control_body_sha256"]) == 64
     # 判定 JSON 结构化记录（双状态码 + 相似度数值 + 阈值）
     judgment = json.loads(j_path.read_text(encoding="utf-8"))
     assert judgment["violation"] is True
@@ -528,11 +593,19 @@ def test_verify_idor_full_chain_confirmed(verify_env):
     assert judgment["similarity"] >= 0.9
     assert judgment["thresholds"]["similarity"] == 0.9
     assert judgment["thresholds"]["json_overlap"] == 0.8
-    # 双请求按次审计，角色成对
+    # M11b：三次请求按次审计，角色成对（新增未认证对照）
     attempts = _events(env.audit, "idor_probe_attempt")
-    assert [e["role"] for e in attempts] == ["reference", "attacker"]
-    assert all(e["status"] == 200 and e["error"] is False for e in attempts)
-    assert fake_fetch.calls == ["b", "a"]
+    assert [e["role"] for e in attempts] == [
+        "reference",
+        "attacker",
+        "unauthenticated_control",
+    ]
+    assert all(e["status"] in (200, 403) and e["error"] is False for e in attempts)
+    assert fake_fetch.calls == ["b", "a", "control"]
+    # 对照与归属的确定性结论进审计
+    judged = _events(env.audit, "idor_control_judged")
+    assert judged[0]["control_verdict"] == "protected"
+    assert judged[0]["ownership_verdict"] == "matched" 
     # 审计链完整：Verifier 带向量 + verify_completed 计数
     verdicts = _events(env.audit, "verifier_verdict")
     assert verdicts[0]["verdict"] == "confirm"
@@ -545,7 +618,7 @@ def test_verify_idor_full_chain_confirmed(verify_env):
         )
     )
     packed = {item["source_ref"] for item in manifest["items"]}
-    assert {str(b_path), str(a_path), str(j_path)} <= packed
+    assert {str(b_path), str(a_path), str(j_path), str(c_path), str(s_path)} <= packed
 
 
 def test_verify_idor_evidence_redacts_both_sessions(verify_env):
@@ -578,7 +651,7 @@ def test_verify_idor_a_forbidden_rejected(verify_env):
     env = verify_env
     _seed_idor(env.store, env.audit)
     orch = _make_orch(
-        env, _canned_fetch(a_status=403, a_body="Forbidden"), _confirm_reply()
+        env, _canned_fetch(a_status=403, a_body=""), _confirm_reply()
     )
     orch.run_verify_phase(skill_name="verify-idor")
 
@@ -635,7 +708,7 @@ def test_verify_idor_baseline_not_substantive_blocked(verify_env):
     """B 基准非 2xx（属主自己也访问不到）→ blocked 而非 rejected。"""
     env = verify_env
     _seed_idor(env.store, env.audit)
-    orch = _make_orch(env, _canned_fetch(b_status=404, b_body="not found"), _confirm_reply())
+    orch = _make_orch(env, _canned_fetch(b_status=404), _confirm_reply())
     orch.run_verify_phase(skill_name="verify-idor")
 
     finding = env.store.load_all()[0]
@@ -799,3 +872,236 @@ def test_runner_multi_verify_skills_gating_with_idor(api_workspace):
         phases = instances[0]
         assert phases.verified == ["verify-sqli", "verify-xss", "verify-idor"]
         assert seen_actions == ["verify-sqli", "verify-xss", "verify-idor"]
+
+# =====================================================================
+# M11b：未认证对照 + 确定性归属 的编排层测试
+# =====================================================================
+#
+# 判据是**确定性代码**，故这三条形态在编排层直接定终态（零额外 LLM）：
+# public → rejected、blocked → blocked（不驳回）、归属非 matched → rejected。
+# 本组测试把它们逐一钉死，并验证结论确实进了送审摘要（红线 3：只有结论+锚点）。
+
+
+def _control_doc(env, finding_id):
+    return json.loads(
+        (env.evidence_dir / f"idor_{finding_id}_control.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+def test_verify_idor_public_resource_rejected_without_llm(verify_env):
+    """未认证就能拿到与 B 基准**完全相同**的内容 → 公开资源，确定性驳回。
+
+    这是 M10a 那个 4 臂方差的正面解法：不再交给 Verifier 自由裁量，而是由
+    确定性对照判定驳回（零额外 LLM 调用）。
+    """
+    env = verify_env
+    seed = _seed_idor(env.store, env.audit)
+    # 对照正文 == B 基准正文（含 owner 字段）：未认证即可拿到 → 公开资源
+    same_body = _padded_body(B_TOKEN, owner=_victim_identity())
+    orch = _make_orch(env, _canned_fetch(c_status=200, c_body=same_body), _confirm_reply())
+
+    orch.run_verify_phase(skill_name="verify-idor")
+
+    finding = env.store.load_all()[0]
+    assert finding.state is FindingState.REJECTED
+    transitions = [e for e in _events(env.audit, "finding_state") if e["to"] == "rejected"]
+    assert transitions[0]["actor"] == "verify-idor"  # 确定性驳回，非 Verifier
+    assert "公开" in transitions[0]["reason"]
+    judged = _events(env.audit, "idor_control_judged")[0]
+    assert judged["control_verdict"] == "public"
+    assert judged["same_bytes"] is True
+    # 零 LLM：不给 Verifier 任何机会（这正是消除方差的机制）
+    assert _events(env.audit, "verifier_verdict") == []
+    assert _events(env.audit, "idor_control_judged")[0]["finding_id"] == seed.id
+
+
+def test_verify_idor_public_resource_rejected_by_similarity(verify_env):
+    """逐字节不同但高度相似 → 仍判公开并驳回（阈值判据同样生效）。"""
+    env = verify_env
+    _seed_idor(env.store, env.audit)
+    base_b = _padded_body(B_TOKEN, owner=_victim_identity())
+    near = _padded_body(B_TOKEN, owner=_victim_identity()).replace(
+        "金额 ¥8,800.00", "金额 ¥8,800.01"
+    )
+    orch = _make_orch(
+        env, _canned_fetch(c_status=200, c_body=near), _confirm_reply()
+    )
+    orch.run_verify_phase(skill_name="verify-idor")
+    finding = env.store.load_all()[0]
+    assert finding.state is FindingState.REJECTED
+    judged = _events(env.audit, "idor_control_judged")[0]
+    assert judged["control_verdict"] == "public"
+    assert judged["same_bytes"] is False
+    assert base_b != near  # 确认这两份正文不同，测的是阈值判据
+
+
+def test_verify_idor_control_blocked_on_network_error(verify_env):
+    """未认证对照请求失败 → **blocked**（覆盖不全，不驳回也不确认）。"""
+    env = verify_env
+    seed = _seed_idor(env.store, env.audit)
+    orch = _make_orch(
+        env, _canned_fetch(c_error="URLError: timed out"), _confirm_reply()
+    )
+    out = orch.run_verify_phase(skill_name="verify-idor")
+    assert [f.state.value for f in out] == ["hypothesis"]  # 停留 Hypothesis
+    blocked = _events(env.audit, "verify_blocked")
+    assert blocked and "未认证对照无法判定" in blocked[0]["reason"]
+    assert _events(env.audit, "verifier_verdict") == []
+
+
+def test_verify_idor_control_blocked_when_inconclusive(verify_env):
+    """未认证 2xx 但内容既不逐字节相同、相似度也低于阈值 → blocked（不猜）。"""
+    env = verify_env
+    _seed_idor(env.store, env.audit)
+    other = "".join(f"<p>other-{i}</p>" for i in range(30))
+    orch = _make_orch(
+        env, _canned_fetch(c_status=200, c_body=other), _confirm_reply()
+    )
+    orch.run_verify_phase(skill_name="verify-idor")
+    assert env.store.load_all()[0].state is FindingState.HYPOTHESIS
+    assert _events(env.audit, "verify_blocked")
+
+
+def test_verify_idor_ownership_absent_rejected(verify_env):
+    """对照 protected 但 B 基准里**没有**可归属 reference 的字段 → 驳回。
+
+    这正是 M11a 裁决第 2 条：单靠"reference 可访问 + 攻击者拿到等价响应"
+    不足以构成属性违反，必须有归属证据。
+    """
+    env = verify_env
+    _seed_idor(env.store, env.audit)
+    orch = _make_orch(env, _canned_fetch(owner=None), _confirm_reply())
+    orch.run_verify_phase(skill_name="verify-idor")
+    finding = env.store.load_all()[0]
+    assert finding.state is FindingState.REJECTED
+    transitions = [e for e in _events(env.audit, "finding_state") if e["to"] == "rejected"]
+    assert transitions[0]["actor"] == "verify-idor"
+    assert "归属" in transitions[0]["reason"]
+    judged = _events(env.audit, "idor_control_judged")[0]
+    assert judged["control_verdict"] == "protected"
+    assert judged["ownership_verdict"] == "absent"
+    assert _events(env.audit, "verifier_verdict") == []
+
+
+def test_verify_idor_ownership_mismatched_rejected(verify_env):
+    """归属字段指向**别人** → mismatched → 驳回（并记下命中字段与值）。"""
+    env = verify_env
+    _seed_idor(env.store, env.audit)
+    orch = _make_orch(
+        env, _canned_fetch(owner="somebody-else"), _confirm_reply()
+    )
+    orch.run_verify_phase(skill_name="verify-idor")
+    finding = env.store.load_all()[0]
+    assert finding.state is FindingState.REJECTED
+    judged = _events(env.audit, "idor_control_judged")[0]
+    assert judged["ownership_verdict"] == "mismatched"
+    transitions = [e for e in _events(env.audit, "finding_state") if e["to"] == "rejected"]
+    assert "somebody-else" in transitions[0]["reason"]
+
+
+def test_verify_idor_protected_and_matched_reaches_verifier(verify_env):
+    """protected + matched → 才放行进 Verifier（正向路径，确认成立）。"""
+    env = verify_env
+    _seed_idor(env.store, env.audit)
+    orch = _make_orch(env, _canned_fetch(), _confirm_reply())
+    orch.run_verify_phase(skill_name="verify-idor")
+    assert env.store.load_all()[0].state is FindingState.CONFIRMED
+    assert len(_events(env.audit, "verifier_verdict")) == 1
+
+
+def test_verify_idor_control_doc_records_both_fingerprints(verify_env):
+    """结论文件落盘：三态结论 + 两份响应指纹（供离线复核"是否逐字节相同"）。"""
+    env = verify_env
+    seed = _seed_idor(env.store, env.audit)
+    orch = _make_orch(env, _canned_fetch(), _confirm_reply())
+    orch.run_verify_phase(skill_name="verify-idor")
+    doc = _control_doc(env, seed.id)
+    assert doc["finding_id"] == seed.id
+    assert doc["unauthenticated_control"]["verdict"] == "protected"
+    assert doc["object_ownership"]["verdict"] == "matched"
+    assert doc["object_ownership"]["line_anchor"] is not None
+    assert len(doc["baseline_body_sha256"]) == 64
+    assert len(doc["control_body_sha256"]) == 64
+    assert doc["baseline_body_sha256"] != doc["control_body_sha256"]
+
+
+def test_verify_idor_control_doc_has_no_raw_body(verify_env):
+    """红线 3：结论文件与送审摘要都**不得**含响应体原文。"""
+    env = verify_env
+    seed = _seed_idor(env.store, env.audit)
+    marker = "SECRET-BODY-MARKER-12345"
+    body = _padded_body(B_TOKEN, owner=_victim_identity()).replace(
+        "（属主 B）", f"（属主 B{marker}）"
+    )
+    orch = _make_orch(env, _canned_fetch(b_body_override=body), _confirm_reply())
+    orch.run_verify_phase(skill_name="verify-idor")
+    raw = (env.evidence_dir / f"idor_{seed.id}_control.json").read_text(encoding="utf-8")
+    assert marker not in raw
+    assert "<html>" not in raw
+
+
+def test_verify_idor_verifier_receives_deterministic_summary(verify_env):
+    """确定性结论块必须进入 Verifier 的送审载荷（且仍无响应体原文）。"""
+    env = verify_env
+    _seed_idor(env.store, env.audit)
+    captured: list[dict] = []
+
+    class _CapturingRouter(MockRouter):
+        def complete(self, tier, messages):
+            captured.append(json.loads(messages[-1]["content"]))
+            return self.reply
+
+    orch = _make_orch(env, _canned_fetch(), _confirm_reply())
+    orch.router = _CapturingRouter(_confirm_reply())
+    orch.planner.router = orch.router  # Verifier 复用 planner 的 router
+    orch.run_verify_phase(skill_name="verify-idor")
+
+    assert captured, "Verifier 未被调用"
+    payload = captured[-1]
+    assert "deterministic_summary" in payload
+    summary = payload["deterministic_summary"]
+    assert summary["unauthenticated_control"]["verdict"] == "protected"
+    assert summary["object_ownership"]["verdict"] == "matched"
+    assert "<html>" not in json.dumps(summary, ensure_ascii=False)
+
+
+def test_verify_idor_third_session_used_when_configured(verify_env):
+    """scope 配了 session_third 时，对照请求带**第三身份**凭据（而非匿名）。"""
+    env = verify_env
+    _seed_idor(env.store, env.audit)
+    third = SessionConfig(cookies={"phsess": "eeeeeeeeffffffff"})
+    env.scope.session_third = third
+    seen: list[dict] = []
+
+    base_fetch = _canned_fetch()
+
+    def _spy(url, session):
+        seen.append(dict(session.cookies))
+        return base_fetch(url, session)
+
+    orch = _make_orch(env, _spy, _confirm_reply())
+    orch.run_verify_phase(skill_name="verify-idor")
+
+    # 三个请求依次是 B / A / 对照；对照必须带**第三身份**凭据
+    assert len(seen) == 3
+    assert seen[2] == {"phsess": "eeeeeeeeffffffff"}
+    assert seen[0] == {"phsess": B_TOKEN} and seen[1] == {"phsess": A_TOKEN}
+
+
+def test_verify_idor_anonymous_control_when_no_third_session(verify_env):
+    """未配 session_third 时，对照请求**完全不发凭据**（匿名）。"""
+    env = verify_env
+    _seed_idor(env.store, env.audit)
+    seen: list[dict] = []
+    base_fetch = _canned_fetch()
+
+    def _spy(url, session):
+        seen.append(dict(session.cookies))
+        return base_fetch(url, session)
+
+    orch = _make_orch(env, _spy, _confirm_reply())
+    orch.run_verify_phase(skill_name="verify-idor")
+    assert len(seen) == 3
+    assert seen[2] == {}  # 匿名

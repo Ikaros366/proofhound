@@ -18,7 +18,8 @@ engagement → POST /run → katana 沙箱爬行 → triage 自动产出 idor �
 成立 → REJECTED（对照组证明不误报）。
 
 断言（机制层，不断言漏洞结论之外的内容）：审计链完整（katana 执行 +
-idor_probe_attempt 成对 + action_approved + verifier_verdict +
+idor_probe_attempt 成对（M11b 起三条：reference/attacker/未认证对照）+
+action_read_only_auto + verifier_verdict +
 verify_completed）、判定 JSON 落盘含相似度数值、method=
 dual-session-confirmed、四段式齐全、双会话凭据全目录无原文（除
 session.json，0600）。
@@ -77,7 +78,8 @@ def _invoice_body(inv_id: str, identity: str) -> str:
     items = "".join(f"<li>明细行 {i}：服务费 ¥1,000.00</li>" for i in range(1, 9))
     return (
         f"<html><head><title>发票 #{inv_id}</title></head><body>"
-        f"<h1>发票 #{inv_id}</h1><p>金额 ¥8,000.00（属主：b）</p>"
+        # M11b：用真实归属字段名 ``所有者``（``属主`` 属泛化叙述词，刻意不收）
+        f"<h1>发票 #{inv_id}</h1><p>金额 ¥8,000.00（所有者：b）</p>"
         f"<ul>{items}</ul>"
         f"<footer>当前登录会话 phsess={token}（fixture 回显以演练脱敏）</footer>"
         f"</body></html>"
@@ -225,9 +227,29 @@ def run_demo(client: TestClient, eng_id: str, skip_l2: bool) -> None:
     for event in attempts:
         by_finding.setdefault(event["finding_id"], []).append(event)
     pair = by_finding[target["id"]]
-    assert [e["role"] for e in pair] == ["reference", "attacker"], pair
-    print(f"[*] 断言通过：idor_probe_attempt 成对（{target['id']}："
-          f"reference={pair[0]['status']} attacker={pair[1]['status']}）")
+    # M11b：除 reference/attacker 外，新增**未认证对照**请求（角色固定第三位）
+    assert [e["role"] for e in pair] == [
+        "reference",
+        "attacker",
+        "unauthenticated_control",
+    ], pair
+    print(f"[*] 断言通过：idor_probe_attempt 三条按次（{target['id']}："
+          f"reference={pair[0]['status']} attacker={pair[1]['status']} "
+          f"control={pair[2]['status']}）")
+
+    # ---- 断言 3b（M11b 新增）：确定性对照 + 归属结论 ----
+    control_doc = json.loads(
+        (eng_dir / f"idor_{target['id']}_control.json").read_text(encoding="utf-8")
+    )
+    ctrl = control_doc["unauthenticated_control"]
+    own = control_doc["object_ownership"]
+    assert ctrl["verdict"] == "protected", ctrl
+    assert own["verdict"] == "matched", own
+    assert own["line_anchor"] is not None, own
+    assert control_doc["baseline_body_sha256"] != control_doc["control_body_sha256"]
+    print(f"[*] 断言通过：未认证对照={ctrl['verdict']}（control 状态 "
+          f"{ctrl['control_status']}）· 对象归属={own['verdict']}"
+          f"（字段 {own['field']}，行 {own['line_anchor']}）")
 
     # ---- 断言 4：1001 → Confirmed（method + 四段式 + 判定 JSON 数值） ----
     assert target["state"] == "confirmed", f"1001 未 Confirmed: {target['state']}"
@@ -254,7 +276,9 @@ def run_demo(client: TestClient, eng_id: str, skip_l2: bool) -> None:
     else:
         assert control["state"] == "rejected", f"1002 对照组未 REJECTED: {control['state']}"
         c_attempts = by_finding.get(control["id"], [])
-        assert [e["role"] for e in c_attempts] == ["reference", "attacker"]
+        # M11b：三条按次审计（第三位是未认证对照）
+        assert [e["role"] for e in c_attempts][:2] == ["reference", "attacker"]
+        assert len(c_attempts) == 3 and c_attempts[2]["role"] == "unauthenticated_control"
         assert c_attempts[0]["status"] == 200 and c_attempts[1]["status"] == 403
         print(f"[*] 断言通过：对照组 1002 REJECTED（B=200 / A=403，判定不成立不误报）")
 
@@ -349,6 +373,9 @@ def main() -> int:
                         "scope_paths": ["scope.yaml"],
                         "cookie": f"phsess={A_TOKEN}",
                         "reference_cookie": f"phsess={B_TOKEN}",
+                        # M11b：对象页展示的属主标识是 ``b``（与会话凭据不同源），
+                        # 故显式声明归属比对期望值
+                        "reference_identity": "b",
                         "autonomy_mode": "semi_auto",
                     },
                 ),

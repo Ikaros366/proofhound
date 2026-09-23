@@ -54,6 +54,14 @@ SYSTEM_PROMPT = """\
 会话请求同 URL，判定 JSON 中相似度/键重叠达写死阈值且属性违反成立——IDOR 的
 唯一认可确认手段，仅单会话异常响应（无双会话对照）不得判 confirm；复核要点：
 B 基准是否成立（2xx 实质数据）、判定数值是否达阈值、对象是否确属 B 私有。
+**M11b 起另有三条硬性复核要点**（判据由确定性代码给出，见载荷的
+deterministic_summary；**你不得自行放宽**）：① 未认证对照结论若为 public
+（未认证请求拿到与 B 基准逐字节相同或高度相似的内容），说明该资源与会话无关，
+**必须判 reject**；② 若为 blocked（未认证请求失败或内容无法比对），说明覆盖
+不全，**必须判 reject**（不得以"摘要不足以论证"之外的理由确认）；③ 对象归属
+结论必须为 matched——absent（无归属证据）或 mismatched（归属字段指向他人）
+均**必须判 reject**。仅当对照结论为 protected **且** 归属结论为 matched 时，
+才可进入上述常规复核。
 
 CVSS 评分职责（仅 confirm 时）：你必须同时给出 cvss_vector（CVSS v3.1 base 向量，
 恰好包含 8 个指标，形如 CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H）与
@@ -118,15 +126,24 @@ class Verifier:
         *,
         evidence_index: list[dict],
         diff_summary: str | None = None,
+        extra_summary: dict | None = None,
     ) -> VerifierVerdict:
         """对 Finding 做对抗校验，返回并落盘裁定（同时记审计）。
 
         失败语义：输出非法抛 :class:`VerifierError`；prompt 超限抛
         :class:`ContextOverflowError`；预算/LLM 异常原样上抛——调用方
         必须 fail-closed（Finding 停留原态，不得晋级 Confirmed）。
+
+        ``extra_summary``（M11b，可选）：**确定性代码**产出的结论块，目前仅
+        verify-idor 传（未认证对照三态 + 对象归属三态 + 行号锚点）。它**不是**
+        原始输出——里面没有响应体正文，只有代码归一化后的枚举与数值，故红线 3
+        的输入边界不放松。给 ``None`` 时 prompt 载荷与 M11b 之前逐字节相同。
         """
         messages = self._make_messages(
-            finding, evidence_index=evidence_index, diff_summary=diff_summary
+            finding,
+            evidence_index=evidence_index,
+            diff_summary=diff_summary,
+            extra_summary=extra_summary,
         )
         chars = messages_chars(messages)
         if chars > self.context_policy.max_chars:
@@ -173,6 +190,7 @@ class Verifier:
         *,
         evidence_index: list[dict],
         diff_summary: str | None,
+        extra_summary: dict | None = None,
     ) -> list[dict]:
         verification = finding.verification
         payload = {
@@ -205,6 +223,10 @@ class Verifier:
             "evidence_pack_index": evidence_index,  # manifest items：file/sha256/锚点
             "diff_summary": diff_summary,
         }
+        # M11b：确定性结论块**仅在给定时并入**——sqli/xss 链路的载荷因此与
+        # M11b 之前逐字节相同（不新增键），避免动到既有两条链路的 prompt。
+        if extra_summary is not None:
+            payload["deterministic_summary"] = extra_summary
         return [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},

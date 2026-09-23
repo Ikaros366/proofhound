@@ -248,12 +248,33 @@ def _object_page(value: str, label: str, param: str) -> str:
 
 
 def _page(title: str, body: str, links: tuple[str, ...] = ()) -> str:
+    """页面渲染。footer 带 **per-endpoint 标记**（``ep=<路径去斜杠>``）。
+
+    M11b：原先硬编码 ``session=TOKEN``（attacker 凭据）——两个问题：
+    ① 页面在"谁在看"上说谎（owner 会话的响应回显 attacker 的 token）；
+    ② 它**冒充了端点差异**——三个 IDOR 端点的可见文本实际相同，仅靠这行硬编码
+    标记才逐字节可区分，于是 M10a 的 Verifier 反复援引的"两份响应 sha256 完全
+    相同 → 更像公开内容"**部分是该缺陷制造的伪迹**。
+
+    改为 per-endpoint 标记后：正文差异来自**端点身份**（路径唯一），不依赖任何
+    凭据、与内容语义无关，且长度稳定（标记长度随路径变化，但同端点恒定）。
+    脱敏演练随之取消：凭据脱敏由生产链路自身测试覆盖，不该由基准 fixture 承担
+    ——尤其是当它需要伪造正文差异时。
+    """
     nav = "".join(f'<a href="{href}">{href}</a>' for href in links)
     return (
         f"<html><head><title>{title}</title></head><body>"
         f"<h1>{title}</h1><nav>{nav}</nav><div>{body}</div>"
-        f"<footer>session={TOKEN}</footer></body></html>"
+        f"<footer>ep={_current_ep()}</footer></body></html>"
     )
+
+
+#: 当前请求路径的端点标记（由 ``do_GET`` 逐请求设置）
+_CURRENT_EP: list[str] = ["root"]
+
+
+def _current_ep() -> str:
+    return _CURRENT_EP[0]
 
 
 class _FixtureHandler(BaseHTTPRequestHandler):
@@ -292,6 +313,8 @@ class _FixtureHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+        # M11b：footer 标记当前端点（每个端点路径唯一 → 正文唯一）
+        _CURRENT_EP[0] = path.strip("/").replace("/", "-") or "root"
 
         def first(key: str) -> str:
             return (query.get(key) or [""])[0]
@@ -340,13 +363,22 @@ class _FixtureHandler(BaseHTTPRequestHandler):
             self._respond(200, _page(title, f"你好，{value}，以下是找到的内容"))
             return
 
-        # ---- A/B idor 族：对象归属 owner，但端点**不做**授权校验（真漏洞） ----
+        # ---- A/B idor 族：对象归属 owner，端点**不做**授权校验（真漏洞） ----
         if path in ("/a/idor", "/b/idor", "/b/idor2"):
             key, label = {
                 "/a/idor": ("id", "订单详情"),
                 "/b/idor": ("no", "对象详情"),
                 "/b/idor2": ("token", "凭据详情"),
             }[path]
+            # M11b：**未认证**请求得定长通用页——否则"公开资源"与"B 的私有对象
+            # 被 A 拿到"在未认证对照下同形，判据无法区分（这正是 Verifier 索要
+            # 的那个对照缺失的根因）。刻意用 200 而非 403：旧系统常见"登录页
+            # 200"形态，且保持"匿名也能拿到 200"这一**最不利**情形，迫使判据
+            # 必须在正文层面工作。attacker（已认证非属主）仍拿到对象页 → 漏洞
+            # 语义与 ground truth 不变。
+            if self._identity() is None:
+                self._respond(200, _page("请先登录", "未认证会话无权查看该页面内容。"))
+                return
             self._respond(200, _object_page(first(key), label, key))
             return
 

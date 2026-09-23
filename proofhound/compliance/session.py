@@ -38,6 +38,11 @@ class SessionConfig(BaseModel):
     cookies: dict[str, str] = Field(default_factory=dict)
     headers: dict[str, str] = Field(default_factory=dict)
     reference: SessionConfig | None = None
+    #: M11b：归属比对用的**声明式**身份标识（如 ``b``/``alice``/``owner``）。
+    #: 真系统的对象页展示用户名，而会话凭据常是随机 session id——两者不同源，
+    #: 故操作员可显式声明；未声明时回退到凭据值。给出它**不放宽**任何判据：
+    #: 归属字段名与字段值仍须同时命中才算 ``matched``。
+    identity: str | None = None
 
     def cookie_header(self) -> str:
         """渲染 Cookie 请求头值：``k1=v1; k2=v2``（无 cookie 时为空串）。"""

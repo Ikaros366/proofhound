@@ -401,9 +401,12 @@ def run_demo(
     control = produced["idor-1002"][0]
     assert control["state"] == "rejected", f"1002 对照组未 REJECTED: {control['state']}"
     c_pair = by_finding[control["id"]]
-    assert [e["role"] for e in c_pair] == ["reference", "attacker"]
+    # M11b：三条按次审计（第三位是未认证对照）；前两条仍必须是 B 基准与 A 对比
+    assert [e["role"] for e in c_pair][:2] == ["reference", "attacker"], c_pair
+    assert len(c_pair) == 3 and c_pair[2]["role"] == "unauthenticated_control", c_pair
     assert c_pair[0]["status"] == 200 and c_pair[1]["status"] == 403
-    print(f"[*] 断言通过：对照组 1002 REJECTED（B=200 / A=403，判定不成立不误报）")
+    print(f"[*] 断言通过：对照组 1002 REJECTED（B=200 / A=403 / 对照="
+          f"{c_pair[2]['status']}，判定不成立不误报）")
 
     # ---- 断言 7：三 skill verify_completed + Verifier 带向量 + 预算无异常（需求⑦） ----
     for skill in ("verify-sqli", "verify-xss", "verify-idor"):
@@ -530,6 +533,9 @@ def main() -> int:
                         "scope_paths": ["scope.yaml"],
                         "cookie": cookie_header,
                         "reference_cookie": f"phsess={B_TOKEN}",
+                        # M11b：发票页展示的属主标识是 ``b``（与随机会话凭据
+                        # 不同源），故显式声明归属比对期望值
+                        "reference_identity": "b",
                         "autonomy_mode": "semi_auto",
                     },
                 ),

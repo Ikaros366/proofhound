@@ -231,7 +231,7 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 >
 > **M8d 落地注记**（2026-08-15）：Killer Demo 一键三漏洞全证据链演示入口 `scripts/demo_killer.py`——单 engagement 覆盖 DVWA（sqli + xss_r）与 IDOR fixture（1001 漏洞 / 1002 对照）双目标（fixture 门户页追加 DVWA 深链供 katana 单种子跨端口爬行、合并 Cookie 头承载双站会话，均为 demo 层对既有机制的复用）；配套增量：`_verify_sqli` 的 `Verification` 补 `claim`/`expected`/`actual` 四段式字段（纯增量可选字段，证据门/Verifier/判定语义零改动，三条链路四段式自此齐整，旧数据 null 容忍），其余编排/证据门/构造器零改动。
 
-> **M11a IDOR 判据裁决规格（2026-09-23 裁决，**尚未实现**，留待 M11b）**：M10a 实测同一真
+> **M11a IDOR 判据裁决规格（2026-09-23 裁决；**M11b 已实现**，落地注记见 §7.9）**：M10a 实测同一真
 > IDOR 在 4 臂出现 4 种结果（已知限制 35），当时归因为「Verifier 判定随机」。M11a 逐条复核
 > 4 臂全部 11 条 IDOR 终审原文后**修正该归因**：11 条里 7 条 reject 有 **6 条判得正确**
 > （它们是对 `/a/sqli`、`/b/sqli2`、`/d/safe` 之类**非 IDOR 端点**的类型误报，见限制 37），
@@ -256,9 +256,12 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 >    （这是"要求归属证据"与"红线 3 不喂原始输出"之间唯一自洽的落法：红线 3 管的是**LLM 上下文**
 >    不得含原始输出，不是禁止代码读取磁盘上的证据文件）。
 >
-> **落地影响面（M11b 预估）**：`verify/idor.py`（新增对照探测与归属提取纯函数 + 判据收紧）、
-> `core/orchestrator.py::_verify_idor`（多一次探测、四段式与判定 JSON 增归属/对照字段）、
-> `verify/verifier.py` 对抗 SOP（写入"归属证据缺失即驳回"与"公开资源对照"两条复核要点）。
+> **落地形态（M11b 已实现）**：判据落在**新模块** `proofhound/verify/idor_control.py`
+> （`judge_control` 三态 + `judge_ownership` 三态，纯函数），`_verify_idor` 据此在**编排层**
+> 直接定终态（public → REJECTED、blocked → blocked、归属非 matched → REJECTED、protected +
+> matched → 进 Verifier），零额外 LLM 成本；`Scope.session_third` 为**可选**第三身份，未配时
+> 对照用完全不带凭据的匿名请求；`Verifier.review` 增**可选** `extra_summary`（仅 verify-idor
+> 传，sqli/xss 载荷逐字节不变），SOP 写入三条硬性复核要点。详见 §7.9。
 > **基准 fixture 的既有弱点（限制 36）在方案 2 下会显性化**：`_object_page` 正文含
 > 「所有者 owner」，故归属证据可被提取 → 当前 fixture 在收紧后仍能 Confirmed；但真靶场若不
 > 自报归属，则按此规格会被驳回（宁漏勿滥），该取舍已由维护者确认保留。
@@ -785,6 +788,104 @@ API `GET /api/engagements/{id}/cost`（只读、`include_calls` 可选、响应�
 >    比例」而不是摊派或丢弃；`finding_id` 只给 Verifier（其余调用点是批次级，按比例摊派到
 >    单条 Finding 是编造）——已记为限制 38。
 
+## 7.9 M11b 落地注记（2026-09-23：IDOR 判据收紧）
+
+**动因**。M10a 的 Confirmed 级 4 臂表显示同一个真 IDOR（`/a/idor`）在 4 个臂里出现
+**4 种结果**（confirmed / rejected / 未能判定 / rejected），当时归因为「Verifier 判定
+随机、判据欠定」（已知限制 35）。M11a 逐条复核 4 臂**全部 11 条 IDOR 终审原文**后把
+归因**修正为规格歧义**：7 条 reject 里 **6 条判得正确**（那些是对 `/a/sqli`、
+`/b/sqli2`、`/d/safe` 之类**非 IDOR 端点**的类型误报），真 IDOR 的驳回理由则**逐字
+同构**——① 无对象归属证据；② A/B 响应 sha256 完全相同，更平凡的解释是"公开内容"；
+③ 缺一个能排除公开端点的对照。决定性证据：同一 `/b/idor2` 在**同一次运行**的两个臂里
+被判了两种标准（`rules+model` reject"无证据建立属主关系"、`rules+model+prefilter`
+confirm"属主由方法论定义"）。
+
+**维护者裁决三条**（M11a 落规格、M11b 实现；§5.4.2 有同一份裁决记录）：
+
+1. **加未认证对照探测**：对同 URL 追加一次不带凭据的请求，公开资源即驳回；
+2. **要求归属证据**：仅"reference 可访问 + 攻击者拿到等价响应"不足以构成属性违反；
+3. **归属由确定性代码提取**，Verifier 只收「结论 + 行号锚点」，红线 3 零放松。
+
+### 实现（本里程碑只改判据，不动证据门/状态机铁律/闸门矩阵）
+
+**① 新模块 `proofhound/verify/idor_control.py`**（纯函数、零网络零 LLM）：两个
+**否定性**判据。
+
+- `judge_control(baseline, control)`：未认证对照的**三态**判定——
+  - `public`：未认证 2xx **且**（与 B 基准正文**逐字节相同** 或 相似度 ≥ 0.9）
+    → 公开/与会话无关的资源，属性违反不成立；
+  - `protected`：未认证非 2xx（3xx/4xx/5xx）→ 资源与会话相关，解释成立；
+  - `blocked`：对照请求网络错误，或 2xx 但既不逐字节相同、相似度也低于阈值
+    → **判定不了**（覆盖不全）。
+  **为什么"不同但不相似"判 blocked 而不是 protected**：那同样符合"两个身份看到
+  不同数据"这一**合法**形态，把它当越权证据是会误报的方向。本层**只否定、不肯定**
+  ——只有"相同/高度相似"才是可据此**否定**违反的硬证据。
+- `judge_ownership(baseline, victim_identity)`：从 B 基准提取对象归属，**两族同时
+  命中**才算证据——① 字段名像归属字段（`owner`/`所有者`/`created_by`/...，且不在
+  `current_user`/`session_user` 这类"当前登录者"排除表内）；② 该字段的**值**等于
+  reference 身份标识。三态：`matched` / `mismatched`（指向他人）/ `absent`。
+  **`victim_identity` 缺失时一律 `absent`**——没有期望值就无法把字段值认定为归属
+  证据（**不做"有 owner 字段就算证据"的放松**，那会把任意第三方归属也当证据）。
+
+**② 编排层（`_verify_idor`）——确定性判据进代码，不交给 LLM**。这是消除方差的
+关键：三种形态在编排层**直接定终态并落审计**（零额外 LLM 成本），不给模型"自由
+裁量"的空间。
+
+| 形态 | 终态 | 依据 |
+|---|---|---|
+| 对照 `public` | `REJECTED(actor=verify-idor)` | 公开资源，属性违反不成立 |
+| 对照 `blocked` | `blocked`（停 Hypothesis） | 覆盖不全，**既不驳回也不确认** |
+| 对照 `protected` + 归属 `absent`/`mismatched` | `REJECTED(actor=verify-idor)` | 裁决第 2 条：缺归属证据 |
+| 对照 `protected` + 归属 `matched` | 进证据门 → Verifier 终审 | 常规路径 |
+
+结论同时落盘 `idor_{id}_control.json`（三态枚举 + 行号锚点 + **两份响应 sha256**），
+并计入 `verification.evidence_refs`；审计增 `idor_control_judged`。
+
+**③ 第三身份可选**。`Scope.session_third`（可选）——未配置时对照用**完全不发凭据**
+的匿名请求（`SessionConfig()`）。**匿名已足以否定"公开资源"**（未认证都能拿到，当然
+不是私有对象），故第三身份是**可选增强**而非必需，链路不会因缺它而 blocked。
+
+**④ Verifier 只收结论 + 锚点**。`Verifier.review(..., extra_summary=...)`——这是
+**可选关键字**，仅 verify-idor 传，sqli/xss 两条链路的 prompt 载荷**逐字节不变**
+（新键仅在给定时并入）。摘要里只有三态枚举、数值、字段名/匹配字面量/行号，**没有
+响应体原文**：红线 3 的输入边界零放松。SOP 同时写入三条硬性复核要点（对照 public /
+blocked / 归属非 matched 一律 reject，**不得自行放宽**）。
+
+### 实现期踩坑（诚实记录，省后来者时间）
+
+1. **基准 fixture 的 footer 是缺陷，且它冒充了端点差异**。`_page()` 硬编码
+   `session=<主会话 TOKEN>`——两个后果：① 页面在"谁在看"上说谎（owner 会话的响应
+   回显 attacker 的 token）；② **三个 IDOR 端点的可见文本实际相同**，仅靠这行硬编码
+   标记才逐字节可区分，于是 M10a 的 Verifier 反复援引的"A/B 两份响应 sha256 完全
+   相同 → 更像公开内容"**部分是该缺陷制造的伪迹**。M11b 把 footer 改为
+   **per-endpoint 标记**（`ep=<路径去斜杠>`）：正文差异来自端点身份、不依赖任何凭据、
+   长度稳定（同端点恒定）。**脱敏演练随之取消**——凭据脱敏由生产链路自身测试覆盖，
+   不该由基准 fixture 承担，尤其当它需要**伪造**正文差异时。
+2. **IDOR 端点原先不拒匿名**，使"公开资源"与"私有对象被 A 拿到"在未认证对照下**同形**
+   ——这正是 Verifier 索要却拿不到那个对照的根因。改为未认证得定长通用页（**刻意用
+   200 而非 403**：旧系统常见"登录页 200"形态，保留"匿名也能拿到 200"这一最不利情形，
+   迫使判据在正文层面工作）。attacker（已认证非属主）**仍拿到对象页**，故 ground
+   truth 与漏洞语义不变。
+3. **一个连带后果（已在基准中如实体现，不掩盖）**：`verify/prefilter.py` 的探测是
+   **不带凭据**的（`_http_get` 无 session），故 IDOR 端点拒匿名后，粗筛对它们的两个
+   探测取值都只能看到同一份"请先登录"页 → 判 `UNLIKELY`。于是基准的「粗筛后」两列
+   变了：`rules` 33.3%→25.0%、`model` 91.7%→75.0%、`rules+model` 100%→75.0%。
+   **主指标（发现率/误报率）逐格不变**（33.3% / 50.0%、91.7% / 0.0%、100% / 50.0%）。
+   **这不是功能回归**：`ScreenResult.passed` 恒为 True，`advisory` 只增一个审计计数，
+   粗筛**从不丢候选**（M9c② 已实测丢弃是负收益）。同时它暴露一条**真实限制**——
+   粗筛在"需认证目标"上只能看到登录/拒绝页，判别力下降（已记入已知限制 41）。
+4. **归属提取的两处实现缺陷（靠实测而非推理发现）**：首版文本正则包含 `属主`/`所属`
+   这类**泛化叙述词**，把散文 `（属主 B）` 抓成字段 `属主=B）`，且它先于真正的
+   `owner=` 出现，于是 `mismatched` 取到了散文；修法是①从正则里剔除泛化叙述词、
+   ②先扫 **JSON 形态**再扫文本形态（结构化字段更可信）、③空格分支的字符类**必须
+   排除全角标点**（实测 `所有者 owner，金额 800` 会被吃成值 `owner，金额`——前两次
+   修法都以为 strip 能解决，实际标点已被正则吃掉，strip 已太晚）。
+5. **测试罐头的正文契约很敏感**。`test_idor.py` 的 `_padded_body` 依赖"A/B 正文主体
+   逐字节相同、只在尾部标记不同"来维持相似度 > 0.9。我把 owner 字段插在**中段**时，
+   B 的填充区整体右移约 50 字符、与 A 的 token 注释错位，相似度实测掉到 **0.8725**，
+   于是在"双会话判定"这步就驳回、根本走不到 Verifier。修法是让**差异区等长**
+   （token 注释定长 + 3 字符差异标记），相似度回到 0.99+。
+
 ## 8. 开发路线图
 
 | 里程碑 | 内容 | 验收标准 |
@@ -799,6 +900,7 @@ API `GET /api/engagements/{id}/cost`（只读、`include_calls` 可选、响应�
 | M9b 红线 4 重定义：模型身份 → 校验独立性（2026-09-22 已完成） | 删除 T1==T2 同模型启动警告（改记 `llm_tiers_share_model` 审计）；红线 4 改约束「独立 agent + 独立上下文 + 输入边界」，不约束模型身份；新增独立性锁死测试 | T1/T2 同模型下功能全通且无警告；输入白名单/超限 fail-closed/输出契约三条在同模型下依然成立；「必须用不同模型」表述全树零残留 |
 | M10a 基线数字补完：真可确认 fixture + 端到端 `--live` + T2 读超时修复（2026-09-23 已完成） | ① `scripts/bench_triage.py` fixture 换真后端（sqlite 拼接注入 / 不转义反射 / 身份归属 / 真安全对照），**离线数字逐格不变**；② `--live` 附加模式跑 4 臂真实确认链路，口径 = (端点×类型)、类型错配计误报、`verify_blocked` 单列不计入分母；③ `llm/router.py` 增 `DEFAULT_TIMEOUTS`（T2 180s）+ `PROOFHOUND_<TIER>_TIMEOUT` | Confirmed 级 4 臂：精确率 **100%**、误报率 **0%**、检出率 33.3%/58.3%/25.0%/**66.7%**；T2 超时丢失从单臂 3/12 降到 4 臂合计 1/48；新测试 37 个 + 旧 853 全绿（共 890，旧测试零改动）；**明示限制**：单次采样、方差未量化（同一真 IDOR 4 臂 4 结果） |
 | M11a 成本可见性：单题成本口径 + 归属（2026-09-23 已完成） | ① `llm_call` 审计补 `caller`/`finding_id`/`retry`（`llm/callmeta.py` 确定性签名分派，旧替身零改动）；② `proofhound/llm/cost.py` 纯函数聚合（调用方/阶段/Finding/档位四维各自求和 == 总数；修复重试计入主口径且可确定性单列；`estimated` 单列；旧事件归 `unknown` 不丢弃 + 出可归属比例）；③ 三处出口 CLI/API/控制台只读面板；④ `tokens_used` 与 `/cost` 口径统一 | 新测试 39 个 + 旧 890 全绿（共 **929**，旧测试零改动）；对 M10a 已产出 engagement 独立复算出与 published 表**完全相同**的数字（59,052 token / 17 次调用 / t1 12,956 + t2 46,096）；**不含** IDOR 判据实现（已裁决留 M11b，见限制 40） |
+| M11b IDOR 判据收紧：未认证对照 + 确定性归属（2026-09-23 已完成） | ① 新模块 `verify/idor_control.py`（纯函数）：`judge_control` 三态（public/protected/blocked，**只否定不肯定**）+ `judge_ownership` 三态（matched/mismatched/absent，要求"归属字段名 + 值等于 reference 身份"两族同时命中，身份未知一律 absent）；② `_verify_idor` 确定性定终态（public→REJECTED、blocked→blocked、归属非 matched→REJECTED，**零额外 LLM**）并落 `idor_{id}_control.json`（三态 + 行号锚点 + 两份响应 sha256）；③ `Scope.session_third` 可选第三身份（未配则匿名对照）；④ `Verifier.review(extra_summary=...)` 只传结论 + 锚点（sqli/xss 载荷逐字节不变）；⑤ fixture：footer 改 per-endpoint 标记（**修掉硬编码凭据回声及其制造的 A/B 逐字节相同伪迹**）、IDOR 端点拒匿名（200 定长通用页） | 新测试 **40** 个（`test_idor_control.py` 28 纯函数 + `test_idor.py` M11b 编排 8 + `test_bench_fixture.py` 控制面 4）+ 旧 929 全绿（共 **969**；`test_idor.py` **披露式修正**——双会话罐头补归属字段与等长差异区、识别新对照角色，断言意图不变）；离线基准**主指标逐格不变**（33.3%/50.0%、91.7%/0.0%、100%/50.0%），「粗筛后」两列按实变化并已记录成因（新增已知限制 41） |
 | M5 产品化（按需）——M5a 已完成（2026-08-07） | **M5a ✅**：本机 Web API（FastAPI 后端，无前端）+ 自主模式三档闸门（矩阵代码化）+ 动作确认队列（持久化 + operator 审计）；待做：M5b 前端控制台（自治模式切换、确认队列、证据浏览）、MCP 暴露、持续监测、增量复测 | — |
 
 ## 9. 风险与开放问题

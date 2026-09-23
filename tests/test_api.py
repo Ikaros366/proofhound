@@ -531,6 +531,44 @@ def test_reference_cookie_stored_and_never_in_response(client, workspace):
     assert "with_reference_session" in audit.text
 
 
+def test_reference_identity_persisted_and_read_back(client, workspace):
+    """M11b：reference_identity 落 session.json 的 reference.identity 并可读回。
+
+    用途：归属比对的**声明式**期望值（对象页展示的用户名常与会话凭据不同源）。
+    """
+    eng_id = _create(
+        client,
+        cookie=f"PHPSESSID={COOKIE_VALUE}",
+        reference_cookie=f"phsess={REF_COOKIE_VALUE}",
+        reference_identity="alice",
+    )
+    session_data = json.loads(
+        _eng_dir(workspace, eng_id).joinpath("session.json").read_text(encoding="utf-8")
+    )
+    assert session_data["reference"]["identity"] == "alice"
+    # 读回路径（EngagementManager._load_session）
+    eng = client.app.state.manager.get(eng_id)
+    loaded = client.app.state.manager._load_session(eng)
+    assert loaded.reference.identity == "alice"
+    # 凭据纪律不变：任何响应体不得出现 cookie 原文
+    detail = client.get(f"/api/engagements/{eng_id}")
+    assert REF_COOKIE_VALUE not in detail.text
+    assert "alice" not in detail.text  # 身份标识也不回显
+
+
+def test_reference_identity_absent_behaves_as_before(client, workspace):
+    """未给 reference_identity 时 session.json 不含该键（旧行为逐字节等价）。"""
+    eng_id = _create(
+        client,
+        cookie=f"PHPSESSID={COOKIE_VALUE}",
+        reference_cookie=f"phsess={REF_COOKIE_VALUE}",
+    )
+    session_data = json.loads(
+        _eng_dir(workspace, eng_id).joinpath("session.json").read_text(encoding="utf-8")
+    )
+    assert "identity" not in session_data["reference"]
+
+
 def test_without_reference_cookie_behaves_as_before(client, workspace):
     """不传 reference_cookie = 单会话（现有行为不变，session.json 无 reference 键）。"""
     eng_id = _create(client, cookie=f"PHPSESSID={COOKIE_VALUE}")
