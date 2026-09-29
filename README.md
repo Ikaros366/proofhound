@@ -463,7 +463,7 @@ canary 确认、verify-idor 双会话属性验证）。
 
 按依赖排序，前三项各自独立可交付：
 
-> **2026-09-29 进度更新**：下面第 1、3 项已完成；**第 2 项（SSRF）两步均已完成（M15 第一步 + M16 第二步）**——SSRF 现为第 4 类可确认漏洞。期间插队完成了三条工程化加固（M12 沙箱隔离硬化、M13 可复现安装 + CI、M14 API 认证，见上表），它们来自第三方评审的 P0 清单而非本清单；又按维护者对「未授权访问 / 接口暴露」的裁定切出 **M16-a（katana JS 翻接口，只做发现侧，已完成）**、M16-b（dirsearch 接入，未开工）、M16-c（`unauth-exposure` 判定通道，未开工）。**现在有三个待裁决项**：① 是否把 `PROOFHOUND_TRIAGE_MODEL` 改为默认开启（数据支持，见第 1 项与「重复测量与方差」节）；② ~~是否投入建 `verify-ssrf`~~（**已落地**，见第 2 项）；③ **`KatanaParams.jsluice`（katana `-jsl`）的缺省值**（M16-a 实现侧的保守选择，见下面第 4 项）。
+> **2026-09-29 进度更新**：下面第 1、3 项已完成；**第 2 项（SSRF）两步均已完成（M15 第一步 + M16 第二步）**——SSRF 现为第 4 类可确认漏洞。期间插队完成了三条工程化加固（M12 沙箱隔离硬化、M13 可复现安装 + CI、M14 API 认证，见上表），它们来自第三方评审的 P0 清单而非本清单；又按维护者对「未授权访问 / 接口暴露」的裁定切出 **M16-a（katana JS 翻接口，只做发现侧，已完成）**、M16-b（dirsearch 接入，未开工）、M16-c（`unauth-exposure` 判定通道，未开工）。**现在有三个待裁决项**：① 是否把 `PROOFHOUND_TRIAGE_MODEL` 改为默认开启（数据支持，见第 1 项与「重复测量与方差」节）；② ~~是否投入建 `verify-ssrf`~~（**已落地**，见第 2 项）；③ **`KatanaParams.jsluice`（katana `-jsl`）的缺省值**（M16-a 实现侧的保守选择，见下面第 5 项）。
 
 1. ~~**基线数字补完**~~ **已完成（M10a + M11b + M11c）**——真可确认 fixture + `--live` 4 臂
    真实确认链路（M10a）；IDOR 判据收紧（M11b）；**方差已量化**（M11c，3 遍 × 4 臂，见上节）。
@@ -518,6 +518,23 @@ canary 确认、verify-idor 双会话属性验证）。
    需要更激进的 JS 解析时显式 `jsluice=True`。
    裁决后请同步 `proofhound/tools/build.py` 的 docstring、AGENTS 里程碑行、CHANGELOG 与
    design.md §7.13。
+
+5. **`KatanaParams.jsluice`（katana `-jsl`）的缺省值**——M16-a 落地时定为**缺省关**，
+   现提请裁决（该缺省值是实现侧的保守选择，尚未经维护者正式裁定；与上面两个开关并列）。
+   **数据（实测：12MB 真实 bundle + 沙箱同档 512m 容器）**：`-jc` 峰值内存 **248MiB**、
+   `-jc -jsl` **447MiB**（后者已用掉 `mem_limit=512m` 的约 87%）；耗时两者均 ~13~16s
+   （**无可测差异**——katana 有约 13s 固定开销地板）。
+   **提取量**：6 组 JS 形态 × 3~5 次重复，`-jsl` 与 `-jc` 的**并集相同**；唯一实测增量是
+   拼接串的占位符形态（`-jc` 出 `?id=`、`-jsl` 出 `?id=EXPR`），两者都过不了下游键名启发式。
+   **建议：保持缺省关**——零提取增量换 +200MiB 内存与 OOM 风险，而硬化档余量已很薄；
+   需要更激进的 JS 解析时显式 `jsluice=True`。
+   裁决后请同步 `proofhound/tools/build.py` 的 docstring、AGENTS 里程碑行、CHANGELOG 与
+   design.md §7.13。
+
+> **测试基线随机器而异**：本机 `.gitignore` 排除的 `templates/custom_enterprise_template.docx`
+> **存在**，故 2 个企业模板测试在本机**真跑**（不 skip）——本机实测基线为
+> **1136 passed / 0 skipped**；文档中"1134 passed / 2 skipped"是**缺该模板的机器**上的读数。
+> 两个数都对，差别只在那一个本地模板文件在不在。
 
 搁置：PDF 报告管线、stored/DOM 型 XSS、垂直越权/多步业务流验证、MCP 暴露、持续监测（均非当前瓶颈）；
 **skill 机制进一步收敛（Phase 3）明确不做**——`SkillRegistry` 经 M9d 已不再是安全真相源，且
