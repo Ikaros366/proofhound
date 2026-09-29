@@ -296,7 +296,9 @@ def test_health_includes_version_and_confirm_timeout(client):
     resp = client.get("/api/health")
     assert resp.status_code == 200
     data = resp.json()
-    assert data["version"] == "0.2.0"
+    # 0.3.0 披露：版本号 0.2.0 -> 0.3.0。断言**意图不变**——仍锁死
+    # /api/health 回报的版本号，只是把新版本号纳入锁定。
+    assert data["version"] == "0.3.0"
     assert data["confirm_timeout"] == 30.0
     assert data["autonomy_gate"]["semi_auto"]["L2"] == "confirm"
 
