@@ -54,4 +54,7 @@ def test_unknown_tool():
 
 
 def test_known_tools():
-    assert known_tools() == ["httpx", "katana", "sqlmap"]  # M3d：katana 构造器接入
+    # M16-b 披露：新增 dirsearch 构造器，故把新条目纳入本清单的锁定。
+    # 断言意图**不变**——仍是逐字面量锁死"已注册的构造器有哪些"；
+    # 不加这一项，该测试就锁不住 dirsearch 构造器是否被后续改动误删。
+    assert known_tools() == ["dirsearch", "httpx", "katana", "sqlmap"]

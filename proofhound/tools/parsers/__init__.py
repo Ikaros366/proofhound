@@ -5,6 +5,7 @@
 结构化 Signal 交给编排器（红线 3）。
 """
 
+from proofhound.tools.parsers.dirsearch_json import parse_dirsearch_json
 from proofhound.tools.parsers.httpx_json import parse_httpx_jsonl
 from proofhound.tools.parsers.katana_jsonl import parse_katana_jsonl
 from proofhound.tools.parsers.sqlmap_stdout import (
@@ -17,12 +18,14 @@ from proofhound.tools.parsers.sqlmap_stdout import (
 # 注意：sqlmap_stdout 是验证结论解析器（产 SqlmapReport 而非 Signal），
 # 不登记进本注册表——该表契约是 Signal 解析器，供 scan 阶段自动桥接。
 PARSER_REGISTRY = {
+    "dirsearch_json": parse_dirsearch_json,
     "httpx_json": parse_httpx_jsonl,
     "katana_jsonl": parse_katana_jsonl,
 }
 
 __all__ = [
     "PARSER_REGISTRY",
+    "parse_dirsearch_json",
     "SqlmapReport",
     "SqlmapTechnique",
     "parse_httpx_jsonl",

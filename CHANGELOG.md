@@ -6,7 +6,91 @@
 
 ## [未发布]
 
-M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c / M15 / M16 / M16-a（内部消化，按维护者要求**不 bump 版本号**：`0.2.0` 保持不变）。
+M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c / M15 / M16 / M16-a / M16-b（内部消化，按维护者要求**不 bump 版本号**：`0.2.0` 保持不变）。
+
+### 变更（M16-b dirsearch 接入 + 速率/并发/时间窗授权语义）
+
+**做了什么**：把 dirsearch 接进发现链路，**并先补上"本次允许发多少请求"的授权语义**——
+无差别字典爆破在没有这一维授权之前不应上线（实测：dirsearch 在 `-t 25` 下的**自然吞吐是
+836 rps**，自带 9681 词词表全量 12308 请求仅需 15s）。
+
+**先做的前置件：请求量授权语义（`Scope.request_budget`）**
+
+- 既有 scope 只表达"允许打哪些目标"（域名/IP/端口），**不表达"本次允许发多少请求"**。
+  新增四个维度：`rate_rps` / `concurrency` / `max_requests` / `window_minutes`。
+- **缺省是保守值**（50 rps / 5 并发 / 5000 请求）——**维护者裁定的"开箱即用但保守"**，
+  **刻意不采用 fail-closed 的"缺省即拒绝"**，理由与残余风险见 AGENTS.md 限制 54。
+- **缺省放行不等于无痕放行**：`Scope.request_budget_source()` 返回
+  `"explicit"` / `"default"`，审计与调用方可分辨是谁给的授权。
+- **非法值一律显式抛错**（越界即 `ValidationError`），绝不静默回落到放宽值。
+
+**dirsearch 构造器（`DirsearchParams` / `_build_dirsearch`）**
+
+- 速率/并发/时间窗**只从 scope 预算来**：`build_command("dirsearch", params,
+  request_budget=scope.resolved_request_budget())`。
+- **预算不得夹带在 params 里**——夹带即报错（实现期踩到的真缺陷：`params` 里的显式
+  2 rps 曾被构造器自己的缺省静默覆盖成 50，正是"以为授了限速、其实没生效"）。
+- 给**不消费**预算的工具传预算也报错（不假装限速生效）。
+- **永不产** `-r`（递归）/ `-F`（跟随重定向）/ `-l`（目标文件）⇒ 请求面与越界面结构性收敛。
+- 恒在项：`-q` / `--no-color` / `-O json` / `-o /tmp/ds_report.json`；wrapper 负责把报告
+  `cat` 回 stdout（沙箱 rootfs 只读、`/tmp` 是随容器销毁的 tmpfs，不 cat 则报告蒸发，
+  红线 3 的证据就拿不到）。
+
+**时间窗是"两道"**：① 工具自限时 `--max-time = floor(窗口×0.7)`；
+② 沙箱超时 `min(300, 窗口秒数)`。**两道都不放宽授权窗口**。
+**为何只给 70%**：实测 `window_minutes=1` ⇒ `--max-time 60` **未触发**自截（扫描跑到
+沙箱超时 61.4s 才被杀），而 `--max-time 8` 能触发；取 70% 后 1 分钟窗口实测 wall 43.4s
+且工具自报 `Runtime exceeded the maximum`。
+
+**解析器（`parsers/dirsearch_json.py`）——零新增 Signal kind**
+
+- 产既有 `kind="web-probe"`，走 M3a 起就在的 `web-exposure` 映射（**零 triage 改动**）。
+- **判据字段 vs 证据字段分离**（M16-a 的教训）：`results[].url`/`status` 决定候选；
+  `contentLength`/`contentType`/`elapsed`/`redirect` 只进 `note`，**不参与任何判定**。
+- fail-closed 容错：坏 JSON / 结构不符 / 非 http(s) URL（含 `file://`）一律丢弃并计数，
+  绝不猜、绝不造候选。
+
+**依赖闭包（installer 扩展 + manifest `closure`）**
+
+- dirsearch 是本项目**第一个依赖闭包非空**的 pip 工具（sqlmap 零依赖）。旧 pip 配方跑
+  `--no-deps`，**装了也跑不起来**（缺 requests/cryptography 等）。
+- manifest 新增 `closure`（26 条依赖，逐条 `==` 钉版 + sha256），installer 新增闭包安装
+  路径：逐条下载并重算哈希 → 写 `--require-hashes` requirements → `--no-index` 安装。
+- **交叉选平台**：沙箱镜像 `python:3.12-alpine` 是 musllinux，宿主是 glibc，必须
+  `--platform musllinux_1_2_x86_64 --only-binary=:all:`（见限制 55）。
+- 向后兼容：`closure` 缺省 `None` ⇒ `sqlmap` 等旧配方**行为不变**。
+
+**离线预置（不入库）**：`scripts/make_dirsearch_preset.py` 一次性生成
+`tools.d/dirsearch/`（wrapper + `lib/`，**20.6 MiB / 834 文件**，含自带 `db/dicc.txt`
+143573 bytes / 9681 词）。`tools.d/*` 被 `.gitignore` 整片排除（运行时状态，与
+httpx/katana/sqlmap 同待遇），故依赖闭包**不进公开仓库**；`--wheels DIR` 可完全离线重建。
+
+**实测（真靶 + 真沙箱，产物 `evidence/demo_dirsearch/<ts>/`）**
+
+| 项 | 实测 |
+|---|---|
+| 限速是否落到行为 | 缺省(50)=**836.7 rps** vs 显式(2)=**2.1 rps**，**比值 402×** |
+| 时间窗（1 分钟） | wall **43.4s**，工具自报 `Runtime exceeded the maximum` |
+| 峰值内存 | **35~56 MiB** = `mem_limit=512m` 的 **7~11%** |
+| 对照 M16-a katana | `-jc` 248MiB / `-jc -jsl` 447MiB ⇒ dirsearch 属**轻量档** |
+| 解析管道 | 30 词小词表 → 5 条 `web-probe` Signal → **5 条 `web-exposure` 候选**（坏条目 0） |
+| scope 兜底 | 靶侧 42 条请求 Host **全部**授权地址（外域 0）；注入 2 条外域记录全被拒 + 留 `triage_out_of_scope` 审计，**外域候选 0** |
+
+**明确不做（诚实边界）**：判定通道（M16-c）、`GATE_MATRIX` / 状态机铁律 / Verifier 输入
+边界 / 红线 3 / 红线 4 的**任何**改动、httpx/katana 回填同一套授权语义、`sqlmap` 的 pip
+路径改造、`request_budget` 写入 `command_executed` 审计（**本轮未做**，见下）。
+
+**未做/未验证（如实标注）**：① **`request_budget` 尚未写进 `command_executed` 审计**——
+授权语义目前落在 argv（`--max-rate`/`-t`/`--max-time`）与 `scope.request_budget_source()`
+上，未改 `sandbox.py`；② 未系统扫描时间窗自限时的触发边界（70% 是单点实测得出的经验值）；
+③ 未在 DVWA 真实前端上跑 dirsearch（本轮回合验收用的是自建单页靶）；④ `window_minutes > 5`
+时实际生效的是 300s 沙箱上限，与"授权 8 分钟"存在口径差（限制 56）。
+
+**测试**：新增 `tests/test_dirsearch.py` / `test_dirsearch_parser.py` /
+`test_dirsearch_manifest.py` 共 **83** 个；全量 **1219 passed / 0 skipped**。
+**披露的旧测试改动 1 处**：`tests/test_build.py::test_known_tools` 的期望清单加入
+`dirsearch`——断言**意图不变**（仍是逐字面量锁死已注册构造器清单），只是把新条目纳入锁定；
+不加这一项，该测试就锁不住 dirsearch 构造器是否被后续改动误删。其余旧测试**零改动**。
 
 ### 变更（M16-a katana 从 JS 里翻接口 —— 只做发现侧）
 

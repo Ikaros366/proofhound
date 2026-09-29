@@ -4,6 +4,12 @@
 - ``install`` 为按优先级排列的安装配方列表，安装器自上而下依次尝试；
 - ``binary`` 配方的 ``sha256`` 在 schema 层强制必填，缺失即校验失败，
   对应"白名单源 + 强制 SHA256 校验"的工具安装纪律。
+- M16-b：``pip`` 配方可带 ``closure``（依赖闭包），逐条列 ``package`` + ``sha256``。
+  为**向后兼容**，``closure`` 缺省为 ``None``（沿用旧的"只装单个发行件"路径，sqlmap
+  即此形态）。**显式声明 ``closure`` 即走闭包路径**：installer 会把本体 + 闭包一并
+  下载、逐条校验哈希，并用 ``--require-hashes`` 安装（见 ``installer.py``）。
+  ``closure`` 为空列表 ``[]`` 表示"本体无依赖"，此时也走闭包路径——语义上比
+  ``None`` 更明确。
 """
 
 from __future__ import annotations
@@ -15,6 +21,23 @@ import yaml
 from pydantic import BaseModel, Field, model_validator
 
 
+class ClosureEntry(BaseModel):
+    """依赖闭包里的一条发行件（M16-b）：``name==version`` + 强制 sha256。
+
+    ``sha256`` **必填**——闭包是用来"把整条依赖链钉死到具体发行件"的，缺哈希
+    等于让 pip 自己挑文件，那就失去了钉版的意义（本仓库的安装纪律不允许）。
+    """
+
+    package: str
+    sha256: str = Field(min_length=64, max_length=64)
+
+    @model_validator(mode="after")
+    def _pinned(self) -> "ClosureEntry":
+        if "==" not in self.package:
+            raise ValueError("closure 的 package 必须 == 固定版本")
+        return self
+
+
 class InstallRecipe(BaseModel):
     """一条安装配方。``type`` 决定其余字段的必填项。"""
 
@@ -23,6 +46,8 @@ class InstallRecipe(BaseModel):
     url: str | None = None  # binary：官方 release 地址（须白名单源）
     sha256: str | None = None  # binary：强制校验；pip（M3b）：可选，提供即强制
     package: str | None = None  # go/apt/pip：包管理器兜底
+    # M16-b：pip 的依赖闭包（None = 旧路径"只装本体"；含 [] = 闭包路径"本体无依赖"）
+    closure: list[ClosureEntry] | None = None
 
     @model_validator(mode="after")
     def _check_required_fields(self) -> "InstallRecipe":
@@ -37,6 +62,8 @@ class InstallRecipe(BaseModel):
             raise ValueError(f"{self.type} 配方必须提供 package")
         if self.type == "pip" and self.sha256 and "==" not in (self.package or ""):
             raise ValueError("pip 配方带 sha256 时 package 必须 == 固定版本")
+        if self.closure is not None and self.type != "pip":
+            raise ValueError("closure 只对 pip 配方有意义（其他配方不拉依赖链）")
         return self
 
 

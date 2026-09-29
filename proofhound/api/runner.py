@@ -815,7 +815,7 @@ def default_phases_factory(rt: EngagementRuntime) -> OrchestratorPhases:
     # manifest 是包内数据（版本/安装配方的权威来源），从包装载而非 workspace
     manifests_dir = Path(__file__).resolve().parent.parent / "tools" / "manifests"
     installer = ToolInstaller(workspace / "tools.d")
-    for tool in ("httpx", "sqlmap", "katana"):
+    for tool in ("httpx", "sqlmap", "katana", "dirsearch"):
         installer.ensure(load_manifest(manifests_dir / f"{tool}.yaml"))
     # M9a：默认 restricted——容器接入 proofhound-egress（internal，无网关/NAT），
     # HTTP(S) 强制经白名单正向代理出站，白名单 = scope（+ 安装白名单源）。

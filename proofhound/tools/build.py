@@ -10,6 +10,11 @@ argv 由本模块按工具名分派到确定性构造函数拼装，参数经 Py
 - M3b 预置会话：params 里只声明 ``with_session: true``，真实凭据由构造器
   从 ``session``（Scope 上的 SessionConfig）注入——LLM 永不接触凭据原文；
   ``with_session=True`` 而无 session 即校验失败（fail-closed）。
+- **M16-b 请求量授权**：按字典**主动发请求**的工具（dirsearch）不自己定速率/并发/总量
+  ——这些来自 ``Scope.request_budget``（未声明则用保守缺省值，审计记
+  ``source="default"``）。构造器负责把预算翻成工具旗标，并据 ``max_requests``
+  **截词表**（确定性硬闸）；同时提供 :func:`dirsearch_timeout_for` 把时间窗折算成
+  沙箱超时，供调用方与硬上限 300s 取小。
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import re
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from proofhound.compliance.scope import RequestBudget
 from proofhound.compliance.session import SessionConfig
 
 
@@ -236,16 +242,183 @@ def _build_katana(
     return argv
 
 
+# M16-b：dirsearch 扩展名白名单（旗标注入防护——多个扩展名用逗号分隔，
+# 只允许字母数字）。
+_EXTENSIONS_RE = re.compile(r"^[A-Za-z0-9]+(?:,[A-Za-z0-9]+)*$")
+
+# M16-b：沙箱超时硬上限（与既有默认一致；时间窗只会把它**收窄**，永不放宽）。
+SANDBOX_TIMEOUT_CAP = 300
+
+
+class DirsearchParams(BaseModel):
+    """dirsearch 字典爆路径参数（M16-b，L1 主动发现类）。
+
+    **请求量三维全部来自 scope，不由 LLM 给**：``rate_rps`` / ``concurrency`` /
+    ``max_requests`` 由调用方从 ``Scope.request_budget`` 取（未声明即保守缺省值）
+    传进来。理由：速率与请求总量是**授权语义**，不是规划参数——LLM 不参与
+    （红线 1：命令由构造器按 manifest/scope 拼装）。
+
+    恒在项（构造器写死，不接受参数覆盖）：
+
+    - ``-q``（安静：进度条不进证据）、``--no-color``（证据里不留 ANSI 转义）；
+    - ``-O json`` + ``-o /tmp/ds_report.json``——报告写进容器唯一可写处（tmpfs），
+      wrapper 负责 ``cat`` 回 stdout（**rootfs 只读 + tmpfs 随容器销毁，不 cat 则
+      报告蒸发**，红线 3 的证据就拿不到）；
+    - ``-t <concurrency>`` / ``--max-rate <rate_rps>``——**授权语义的落点**；
+    - ``--max-time <秒>``——仅在 scope 声明了时间窗时产（授权时间窗的落点）。
+
+    **永不产** ``-r``/``--recursive``（递归爆破会成倍放大请求量，且越出面随重定向
+    扩大）与 ``-F``/``--follow-redirects``（默认即不跟随，明确不放开）。
+    ``--wordlists`` 恒指向容器内的内置字典（``/opt/tools/dicc.txt``）或显式挂载路径。
+    """
+
+    target: str = Field(min_length=1)  # 单目标 URL
+    rate_rps: int = Field(ge=1, le=200)  # 来自 scope.request_budget
+    concurrency: int = Field(ge=1, le=20)  # 来自 scope.request_budget
+    max_requests: int = Field(ge=1, le=50000)  # 来自 scope.request_budget
+    window_seconds: int | None = Field(default=None, ge=1, le=1440 * 60)
+    extensions: str = "php,asp,aspx,jsp,html,htm"
+    wordlist: str = "/opt/tools/dicc.txt"
+    with_session: bool = False  # 注入预置会话（-H Cookie）
+
+    @field_validator("target")
+    @classmethod
+    def _no_flag_injection(cls, value: str) -> str:
+        if value.strip().startswith("-"):
+            raise ValueError("target 不得以 - 开头（旗标注入防护）")
+        return value.strip()
+
+    @field_validator("extensions")
+    @classmethod
+    def _valid_extensions(cls, value: str) -> str:
+        value = value.strip()
+        if not _EXTENSIONS_RE.match(value):
+            raise ValueError("extensions 只允许字母数字，逗号分隔")
+        return value
+
+    @field_validator("wordlist")
+    @classmethod
+    def _valid_wordlist(cls, value: str) -> str:
+        value = value.strip()
+        if value.startswith("-") or not value:
+            raise ValueError("wordlist 非法（旗标注入防护）")
+        return value
+
+
+def dirsearch_wordlist_head(params: "DirsearchParams") -> int:
+    """按请求总量上限算出**允许读入的词条数**（确定性硬闸）。
+
+    dirsearch 会把每个词条与 ``-e`` 的每个扩展名各拼一个路径，故按
+    ``max_requests // (1 + len(extensions))`` 反推允许的词条数。
+
+    **这是保守上界，不是精确请求计数**：实现期实测 ``dicc.txt``（9681 词条）+
+    默认 6 扩展，靶侧实际只收到 **12308** 次请求——远低于 ``9681 * 7 = 67767``
+    这个朴素上界（dirsearch 1.7.0 的扩展名展开与去重行为未完全逆向）。因此该公式
+    只会**截得更狠**，方向是 fail-closed（宁可少发请求），符合授权语义。
+    反之，工具在重定向/校准等场景下仍可能发出词表之外的少量请求，故
+    ``max_requests`` 是**词表侧硬闸**，不是逐请求的精确配额。
+    """
+    n_ext = len([e for e in params.extensions.split(",") if e]) if params.extensions else 0
+    per_word = 1 + n_ext
+    return max(1, params.max_requests // per_word)
+
+
+def build_dirsearch_params(
+    target: str,
+    budget: RequestBudget,
+    *,
+    wordlist: str = "/opt/tools/dicc.txt",
+    extensions: str = "php,asp,aspx,jsp,html,htm",
+    with_session: bool = False,
+) -> dict:
+    """组装 dirsearch 的入参 dict（**含**从预算来的四要素）。
+
+    预算必须**显式传入**（调用方用 ``scope.resolved_request_budget()``）——不给
+    缺省值，避免"忘了传就静默用别的值"。
+    """
+    return {
+        "target": target,
+        "rate_rps": budget.rate_rps,
+        "concurrency": budget.concurrency,
+        "max_requests": budget.max_requests,
+        "window_seconds": budget.max_seconds(),
+        "extensions": extensions,
+        "wordlist": wordlist,
+        "with_session": with_session,
+    }
+
+
+#: 工具自限时占授权时间窗的比例。实测（M16-b 验收）：`--max-time 60` 在
+#: 1 分钟窗口上**未触发**自截——扫描一直跑到沙箱超时（61.4s）才被杀；
+#: 而 `--max-time 8` 是能触发的。故留 30% 余量让 dirsearch 自己收尾并落报告，
+#: 避免"第一道没赶上、报告也没写出来"的双输形态。
+_TOOL_SELF_LIMIT_RATIO = 0.7
+
+
+def _tool_self_limit_seconds(window_seconds: int) -> int:
+    """把授权时间窗折算成**工具自限时**秒数（至少 1 秒，且不超过窗口本身）。"""
+    return max(1, min(window_seconds, int(window_seconds * _TOOL_SELF_LIMIT_RATIO)))
+
+
+def dirsearch_timeout_for(scope) -> int:
+    """本次 dirsearch 执行的沙箱超时：``min(300, 时间窗)``。
+
+    M16-b：授权时间窗是**用户意图**，工具自限时（``--max-time``）是**第一道**；
+    沙箱超时是**第二道**（容器层面强杀）。两道取小，**时间窗只会收窄超时、永不放宽**。
+    """
+    seconds = scope.resolved_request_budget().max_seconds()
+    if seconds is None:
+        return SANDBOX_TIMEOUT_CAP
+    return max(1, min(SANDBOX_TIMEOUT_CAP, seconds))
+
+
+def _build_dirsearch(
+    params: dict,
+    *,
+    egress_proxy_url: str | None = None,
+    session: SessionConfig | None = None,
+) -> list[str]:
+    p = DirsearchParams.model_validate(params)
+    argv = ["dirsearch", "-u", p.target]
+    if egress_proxy_url:
+        argv += ["--proxy", egress_proxy_url]
+    if p.with_session:
+        for header in _session_headers(_require_session(True, session)):
+            argv += ["-H", header]
+    argv += [
+        "-t", str(p.concurrency),
+        "--max-rate", str(p.rate_rps),
+    ]
+    # 授权时间窗 → 工具自限时（第一道；沙箱超时是第二道，见 dirsearch_timeout_for）。
+    # 取窗口的 70%（见 _tool_self_limit_seconds 的实测理由）：让工具**先于**沙箱超时
+    # 自己收尾并落报告；沙箱超时仍用完整窗口秒数兜底硬杀。
+    if p.window_seconds is not None:
+        argv += ["--max-time", str(_tool_self_limit_seconds(p.window_seconds))]
+    argv += [
+        "--wordlists", p.wordlist,
+        "-e", p.extensions,
+        "-q", "--no-color",
+        "-O", "json",
+        "-o", "/tmp/ds_report.json",
+    ]
+    # 恒在项缺席声明（写死在下方注释，不产旗标）：
+    #   -r/--recursive        递归爆破成倍放大请求量 —— 永不产
+    #   -F/--follow-redirects 默认即不跟随重定向 —— 永不产
+    return argv
+
+
 _BUILDERS = {
     "httpx": _build_httpx,
     "sqlmap": _build_sqlmap,
     "katana": _build_katana,
+    "dirsearch": _build_dirsearch,
 }
 
 _PARAMS_MODELS = {
     "httpx": HttpxParams,
     "sqlmap": SqlmapParams,
     "katana": KatanaParams,
+    "dirsearch": DirsearchParams,
 }
 
 
@@ -255,11 +428,44 @@ def build_command(
     *,
     egress_proxy_url: str | None = None,
     session: SessionConfig | None = None,
+    request_budget: RequestBudget | None = None,
 ) -> list[str]:
-    """按工具名构造 argv；未知工具抛 :class:`UnknownToolError`。"""
+    """按工具名构造 argv；未知工具抛 :class:`UnknownToolError`。
+
+    ``request_budget``（M16-b）：**主动按字典发请求**的工具（dirsearch）用它落请求量
+    授权语义。未传时取保守缺省值；对不消费预算的工具**刻意报错**——静默忽略会让
+    "以为授了限速、其实没生效"成为可能（fail-closed 方向）。
+    """
     builder = _BUILDERS.get(tool)
     if builder is None:
         raise UnknownToolError(f"工具 {tool} 没有命令构造器")
+    if tool == "dirsearch":
+        # M16-b：请求量预算的**单一真相源是 request_budget 参数**。调用方必须显式传
+        # ``scope.resolved_request_budget()``（未声明 scope 时它返回保守缺省值）。
+        # **不**在 params 里静默接受这四个键——静默忽略授权值会让"以为授了限速、
+        # 其实没生效"成为可能，故此处 fail-closed 报错。
+        if request_budget is None:
+            raise ValueError(
+                "dirsearch 必须显式传 request_budget"
+                "（用 scope.resolved_request_budget()；未声明 scope 时它返回保守缺省值）"
+            )
+        smuggled = [k for k in ("rate_rps", "concurrency", "max_requests",
+                                "window_seconds") if k in params]
+        if smuggled:
+            raise ValueError(
+                f"dirsearch 的请求量预算不得放进 params（发现 {smuggled}）"
+                "——请改传 request_budget 参数，避免静默覆盖授权值"
+            )
+        merged = {
+            **params,
+            "rate_rps": request_budget.rate_rps,
+            "concurrency": request_budget.concurrency,
+            "max_requests": request_budget.max_requests,
+            "window_seconds": request_budget.max_seconds(),
+        }
+        return builder(merged, egress_proxy_url=egress_proxy_url, session=session)
+    if request_budget is not None:
+        raise ValueError(f"工具 {tool} 不消费 request_budget（该参数仅 dirsearch 使用）")
     return builder(params, egress_proxy_url=egress_proxy_url, session=session)
 
 

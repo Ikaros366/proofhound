@@ -200,12 +200,105 @@ class ToolInstaller:
                 timeout=600,
             )
             return
+        if recipe.closure is not None:
+            # M16-b：闭包路径（本体 + 依赖链一并钉哈希安装）
+            self._install_pip_with_closure(recipe, manifest)
+            return
         self._install_pip_pinned(recipe, manifest)
 
     # ---- pip + sha256（M3b：白名单源 + 版本 pin + 强制哈希 + 隔离安装） ----
 
     _PIP_METADATA_HOST = "pypi.org"
     _PIP_FILE_HOSTS = ("files.pythonhosted.org",)
+
+    # ---- M16-b：pip + sha256 + **依赖闭包** ----
+
+    #: 闭包安装的 wheel 平台标签。**与沙箱镜像耦合**：`image: python:3.12-alpine`
+    #: ⇒ musllinux。宿主是 glibc，直接 `pip install --target` **找不到** musllinux
+    #: wheel（实测报 `No matching distribution found for MarkupSafe`——因为宿主
+    #: `sys_tags()` 里一个 musllinux 都没有），故必须交叉选择平台。
+    _CLOSURE_PLATFORM = "musllinux_1_2_x86_64"
+    _CLOSURE_PY_VERSION = "3.12"
+
+    def _find_pip_artifact_by_hash(self, package: str, sha256: str) -> dict:
+        """按 sha256 在 PyPI 元数据里精确定位 **wheel** 发行件（哈希即身份）。"""
+        name, _, version = package.partition("==")
+        meta_url = f"https://{self._PIP_METADATA_HOST}/pypi/{name}/{version}/json"
+        try:
+            with urllib.request.urlopen(meta_url, timeout=30) as resp:
+                meta = json.load(resp)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise InstallError(f"PyPI 元数据获取失败: {meta_url}（{exc}）") from exc
+        wanted = sha256.lower()
+        for item in meta.get("urls") or []:
+            digests = item.get("digests") or {}
+            if digests.get("sha256", "").lower() != wanted:
+                continue
+            if (item.get("filename") or "").endswith(".whl"):
+                return item
+        raise InstallError(
+            f"PyPI 上找不到 sha256={sha256} 对应的 **wheel**（{package}）"
+        )
+
+    def _install_pip_with_closure(
+        self, recipe: InstallRecipe, manifest: ToolManifest
+    ) -> None:
+        """装 本体 + 闭包：逐条校验哈希 → ``--require-hashes`` 安装到隔离目录。
+
+        两道哈希纪律：① 下载后**逐条**重算 sha256 与 manifest 比对（不符即拒装）；
+        ② 交给 pip 时仍写 ``--require-hashes``，由 pip 再校验一次。
+        """
+        entries: list[ClosureEntry] = list(recipe.closure or [])
+        # 本体也纳入 --require-hashes（哈希模式下 pip 要求所有需求都带哈希）
+        targets: list[tuple[str, str]] = [(recipe.package or "", recipe.sha256 or "")]
+        targets += [(e.package, e.sha256) for e in entries]
+
+        lib_dir = self.tools_dir / manifest.name / "lib"
+        lib_dir.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            wheelhouse = Path(tmp) / "wheels"
+            wheelhouse.mkdir()
+            lines: list[str] = []
+            for package, sha in targets:
+                artifact = self._find_pip_artifact_by_hash(package, sha)
+                host = (urlparse(artifact["url"]).hostname or "").lower()
+                if host not in self._PIP_FILE_HOSTS:
+                    raise InstallError(
+                        f"pip 下载源不在白名单内: {host or artifact['url']}"
+                    )
+                dest = wheelhouse / artifact["filename"]
+                urllib.request.urlretrieve(artifact["url"], dest)
+                digest = hashlib.sha256(dest.read_bytes()).hexdigest()
+                if digest.lower() != sha.lower():
+                    raise InstallError(
+                        f"SHA256 校验失败（{package}）: 期望 {sha}，实际 {digest}"
+                    )
+                lines.append(f"{package} --hash=sha256:{sha.lower()}")
+
+            requirements = Path(tmp) / "requirements.txt"
+            requirements.write_text(
+                "\n".join(lines) + "\n", encoding="utf-8"
+            )
+            subprocess.run(
+                [
+                    sys.executable, "-m", "pip", "install",
+                    "--no-index",
+                    f"--find-links={wheelhouse}",
+                    "--require-hashes",
+                    "--only-binary=:all:",
+                    "--platform", self._CLOSURE_PLATFORM,
+                    "--python-version", self._CLOSURE_PY_VERSION,
+                    "--implementation", "cp",
+                    "--abi", "cp" + self._CLOSURE_PY_VERSION.replace(".", ""),
+                    "--upgrade", "--target", str(lib_dir),
+                    "-r", str(requirements),
+                ],
+                check=True,
+                timeout=900,
+            )
+        self._write_pip_wrapper(manifest, lib_dir)
+
 
     def _install_pip_pinned(
         self, recipe: InstallRecipe, manifest: ToolManifest

@@ -18,6 +18,19 @@ host:port 形式），与授权 scope 比对；任一目标越界即拒绝。
 
 M3b：``Scope`` 增加可选 ``session``（预置会话，§5.3 认证旁路第①条）；
 ``--cookie``/``-H``/``--header`` 等凭据旗标的值从目标提取中剔除。
+
+M16-b：``Scope`` 增加可选 ``request_budget``（**请求量授权语义**）。既有 scope 只表达
+"允许打哪些目标"（域名/IP/端口），**不表达"本次允许发多少请求"**——而无差别字典爆破
+（dirsearch 实测：t=25 自然吞吐约 820 rps、自带词表全量 12308 请求 / 15s）在缺这一维
+授权时不应上线。故新增 :class:`RequestBudget`（速率 / 并发 / 请求总量 / 时间窗），由
+**主动按字典发请求**的构造器读取并翻成工具旗标（见 ``tools/build.py::_build_dirsearch``）。
+
+**缺省值语义（维护者裁定，刻意非 fail-closed）**：``request_budget`` 缺省为 ``None``，
+由构造器替换为**保守缺省值**（50 rps / 5 并发 / 5000 请求）——即**开箱即用但保守**。
+该缺省**显式记为 ``source="default"`` 进审计**，与 ``source="explicit"`` 可区分：
+缺省放行**不等于**无痕放行。这与 ``PROOFHOUND_SANDBOX_EGRESS``/``_HARDENING``
+"非法值抛错、缺省即最严"的纪律**有意不同**，理由与残余风险见 AGENTS.md 已知限制 54。
+但**非法值仍然一律显式抛错**（越界即 ``ValidationError``，绝不静默回落到放宽值）。
 """
 
 from __future__ import annotations
@@ -29,7 +42,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from proofhound.compliance.session import SessionConfig
 
@@ -54,6 +67,45 @@ DEFAULT_PROXY_FLAGS: tuple[str, ...] = (
 # 也不参与目标提取——防止 cookie 中域名形态子串被裸域名正则误判为目标
 # （fail-closed 方向再收紧）。凭据值的脱敏由 sandbox runner 在审计前执行。
 DEFAULT_SECRET_FLAGS: tuple[str, ...] = ("--cookie", "-H", "--header")
+
+
+# M16-b：请求量授权语义的**缺省值**（维护者裁定为"保守缺省、开箱即用"）。
+# 刻意不用 fail-closed 的 None-即拒绝，理由与残余风险见模块 docstring 与
+# AGENTS.md 已知限制 54；非法值仍一律显式抛错。
+DEFAULT_RATE_RPS = 50
+DEFAULT_CONCURRENCY = 5
+DEFAULT_MAX_REQUESTS = 5000
+
+
+class RequestBudget(BaseModel):
+    """本次授权允许发出的请求量（速率 / 并发 / 总量 / 时间窗）。
+
+    由**主动按字典发请求**的工具构造器读取并翻成工具旗标。四个维度各自设硬上限
+    （``le``），越界即 Pydantic ``ValidationError``——**显式抛错，不静默回落**。
+
+    - ``rate_rps``：请求速率上限（每秒）。
+    - ``concurrency``：并发连接数（同时最多几个在途请求）。
+    - ``max_requests``：本次授权的**请求总量上限**。构造器据此**截词表**，是确定性
+      硬闸（不依赖工具自觉）。
+    - ``window_minutes``：可选的**授权时间窗**（分钟）。构造器翻成工具自限时旗标，
+      调用方**同时**收窄沙箱超时为 ``min(300, window*60)``——两道，非一道。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    rate_rps: int = Field(default=DEFAULT_RATE_RPS, ge=1, le=200)
+    concurrency: int = Field(default=DEFAULT_CONCURRENCY, ge=1, le=20)
+    max_requests: int = Field(default=DEFAULT_MAX_REQUESTS, ge=1, le=50000)
+    window_minutes: int | None = Field(default=None, ge=1, le=1440)
+
+    def max_seconds(self) -> int | None:
+        """时间窗秒数；未声明返回 ``None``（表示不设工具自限时）。"""
+        return None if self.window_minutes is None else self.window_minutes * 60
+
+
+def default_request_budget() -> RequestBudget:
+    """保守缺省预算（维护者裁定：不写 scope 也开箱即用，但记为 ``source="default"``）。"""
+    return RequestBudget()
 
 
 @dataclass(frozen=True)
@@ -81,6 +133,9 @@ class Scope(BaseModel):
     # 自动退化为**完全不发凭据**的匿名请求——匿名探测已足以否定"公开资源"
     # （见 verify/idor_control.py 的语义说明），故本字段是**可选增强**而非必需。
     session_third: SessionConfig | None = None
+    # M16-b：请求量授权（可选）。``None`` = 未显式授权，构造器替换为保守缺省值并
+    # 在审计里记 ``source="default"``（见模块 docstring 的"缺省值语义"与限制 54）。
+    request_budget: RequestBudget | None = None
 
     def session_identity(self) -> str | None:
         """reference 会话的身份标识（供归属比对的**期望值**）。
@@ -115,6 +170,22 @@ class Scope(BaseModel):
         """从 scope 授权文件（YAML）加载。"""
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
         return cls.model_validate(data)
+
+    def resolved_request_budget(self) -> RequestBudget:
+        """本次生效的请求预算；未显式配置时返回**保守缺省值**。
+
+        M16-b：返回缺省对象**不代表**"已获显式授权"——授权来源由
+        :meth:`request_budget_source` 单独给出并记入审计。
+        """
+        return self.request_budget or default_request_budget()
+
+    def request_budget_source(self) -> str:
+        """请求预算的来源：``"explicit"``（scope 显式声明）/ ``"default"``（保守缺省）。
+
+        单独成一个方法而不是塞进预算对象：预算的**值**与授权的**来源**是两件事，
+        审计要能分辨"维护者显式授权 50 rps"与"没人写、按缺省放了 50 rps"。
+        """
+        return "explicit" if self.request_budget is not None else "default"
 
     def check_target(self, target: Target) -> str | None:
         """校验单个目标，返回 None 表示放行，否则返回拒绝原因。"""

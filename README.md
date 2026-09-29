@@ -169,21 +169,32 @@ EOF
 | httpx | 1.10.0 | HTTP 探活与指纹识别 | web-scan | L1（主动扫描） | GitHub release zip + 强制 sha256 |
 | katana | 1.7.0 | Web 爬行、带参端点发现、**JS 文件内端点解析**（`-jc` 恒在，M16-a） | recon-crawl | L1 | GitHub release zip + 强制 sha256 |
 | sqlmap | 1.10.8 | SQL 注入行为验证 | verify-sqli | L2（利用验证） | PyPI 版本 pin + 强制 sha256，隔离装进 `tools.d/sqlmap/lib` |
+| dirsearch | 0.5.0 | 字典爆路径 / 目录与文件发现（**请求量受 scope 授权约束**，M16-b） | web-dirsearch | L1（主动发现） | `tools.d/` 离线预置 **或** PyPI pin + sha256 + **26 条依赖闭包**（`image: python:3.12-alpine`） |
 
 ### tools.d/ 预置教程（离线场景）
 
 每个工具的安装配方按三级回退执行：**① `tools.d/` 本地预置 → ② 白名单源自动下载（强制 sha256）→ ③ 包管理器兜底**。涉敏/离线环境走第①级：
 
 - 单二进制工具：把可执行文件放成 `tools.d/<name>/<name>`（如 `tools.d/httpx/httpx`），安装器自动检测收录。
-- 自带字典/依赖文件的工具：整个发行目录放进 `tools.d/<name>/`，保证 `tools.d/<name>/<name>` 是可执行入口（可以是 wrapper 脚本，内部用相对路径引用自带文件）。以 dirsearch 为例：
+- 自带字典/依赖文件的工具：整个发行目录放进 `tools.d/<name>/`，保证 `tools.d/<name>/<name>` 是可执行入口（可以是 wrapper 脚本，内部用相对路径引用自带文件）。以 **dirsearch（M16-b 实测的真实发行件布局）** 为例：
 
 ```
 tools.d/dirsearch/
-├── dirsearch        # 可执行入口（wrapper，如 exec python3 lib/dirsearch.py "$@"）
-└── lib/             # 发行件本体
-    ├── dirsearch.py
-    └── db/dicc.txt  # 自带字典随目录一起走
+├── dirsearch                     # 可执行入口（wrapper，见下）
+└── lib/                          # 发行件本体 + 依赖闭包（26 个发行件）
+    ├── bin/dirsearch             # console script（shebang 指向构建机 ⇒ 不可 exec）
+    └── dirsearch/
+        ├── db/dicc.txt           # 自带字典（143573 B / 9681 词）
+        └── lib/…                 # 源码包
 ```
+
+- **依赖闭包非空的 Python 工具**（dirsearch 是首个先例）：wrapper 必须
+  ① 置 `PYTHONPATH=$HERE/lib`（否则容器里 `import requests/cryptography` 直接失败）；
+  ② 用 `python3 "$HERE/lib/bin/<name>"` **直跑**而不是 `exec`（console script 的 shebang
+  指向**构建机**的 `.venv/bin/python`，容器里没有那个解释器）；③ 报告写进容器内 `/tmp` 后
+  `cat` 回 stdout——沙箱 rootfs 只读、`/tmp` 是随容器销毁的 tmpfs，不 `cat` 则证据拿不到。
+  离线预置用 `scripts/make_dirsearch_preset.py` 一次性生成（走 manifest 同一套钉版哈希，
+  `--wheels DIR` 可完全离线重建）。
 
 仓内先例：sqlmap 即 `tools.d/sqlmap/sqlmap`（wrapper）+ `tools.d/sqlmap/lib/`（pip 隔离安装本体）。`tools.d/installed.json` 记录各工具版本与来源快照。
 
@@ -463,7 +474,7 @@ canary 确认、verify-idor 双会话属性验证）。
 
 按依赖排序，前三项各自独立可交付：
 
-> **2026-09-29 进度更新**：下面第 1、3 项已完成；**第 2 项（SSRF）两步均已完成（M15 第一步 + M16 第二步）**——SSRF 现为第 4 类可确认漏洞。期间插队完成了三条工程化加固（M12 沙箱隔离硬化、M13 可复现安装 + CI、M14 API 认证，见上表），它们来自第三方评审的 P0 清单而非本清单；又按维护者对「未授权访问 / 接口暴露」的裁定切出 **M16-a（katana JS 翻接口，只做发现侧，已完成）**、M16-b（dirsearch 接入，未开工）、M16-c（`unauth-exposure` 判定通道，未开工）。**现在有三个待裁决项**：① 是否把 `PROOFHOUND_TRIAGE_MODEL` 改为默认开启（数据支持，见第 1 项与「重复测量与方差」节）；② ~~是否投入建 `verify-ssrf`~~（**已落地**，见第 2 项）；③ **`KatanaParams.jsluice`（katana `-jsl`）的缺省值**（M16-a 实现侧的保守选择，见下面第 5 项）。
+> **2026-09-29 进度更新**：下面第 1、3 项已完成；**第 2 项（SSRF）两步均已完成（M15 第一步 + M16 第二步）**——SSRF 现为第 4 类可确认漏洞。期间插队完成了三条工程化加固（M12 沙箱隔离硬化、M13 可复现安装 + CI、M14 API 认证，见上表），它们来自第三方评审的 P0 清单而非本清单；又按维护者对「未授权访问 / 接口暴露」的裁定切出 **M16-a（katana JS 翻接口，只做发现侧，已完成）**、**M16-b（dirsearch 接入 + 速率/并发/时间窗授权语义，已完成 2026-09-29）**、M16-c（`unauth-exposure` 判定通道，未开工）。**现在有三个待裁决项**：① 是否把 `PROOFHOUND_TRIAGE_MODEL` 改为默认开启（数据支持，见第 1 项与「重复测量与方差」节）；② ~~是否投入建 `verify-ssrf`~~（**已落地**，见第 2 项）；③ **`KatanaParams.jsluice`（katana `-jsl`）的缺省值**（M16-a 实现侧的保守选择，见下面第 4 项）。
 
 1. ~~**基线数字补完**~~ **已完成（M10a + M11b + M11c）**——真可确认 fixture + `--live` 4 臂
    真实确认链路（M10a）；IDOR 判据收紧（M11b）；**方差已量化**（M11c，3 遍 × 4 臂，见上节）。
@@ -519,17 +530,6 @@ canary 确认、verify-idor 双会话属性验证）。
    裁决后请同步 `proofhound/tools/build.py` 的 docstring、AGENTS 里程碑行、CHANGELOG 与
    design.md §7.13。
 
-5. **`KatanaParams.jsluice`（katana `-jsl`）的缺省值**——M16-a 落地时定为**缺省关**，
-   现提请裁决（该缺省值是实现侧的保守选择，尚未经维护者正式裁定；与上面两个开关并列）。
-   **数据（实测：12MB 真实 bundle + 沙箱同档 512m 容器）**：`-jc` 峰值内存 **248MiB**、
-   `-jc -jsl` **447MiB**（后者已用掉 `mem_limit=512m` 的约 87%）；耗时两者均 ~13~16s
-   （**无可测差异**——katana 有约 13s 固定开销地板）。
-   **提取量**：6 组 JS 形态 × 3~5 次重复，`-jsl` 与 `-jc` 的**并集相同**；唯一实测增量是
-   拼接串的占位符形态（`-jc` 出 `?id=`、`-jsl` 出 `?id=EXPR`），两者都过不了下游键名启发式。
-   **建议：保持缺省关**——零提取增量换 +200MiB 内存与 OOM 风险，而硬化档余量已很薄；
-   需要更激进的 JS 解析时显式 `jsluice=True`。
-   裁决后请同步 `proofhound/tools/build.py` 的 docstring、AGENTS 里程碑行、CHANGELOG 与
-   design.md §7.13。
 
 > **测试基线随机器而异**：本机 `.gitignore` 排除的 `templates/custom_enterprise_template.docx`
 > **存在**，故 2 个企业模板测试在本机**真跑**（不 skip）——本机实测基线为

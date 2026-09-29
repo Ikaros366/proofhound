@@ -1238,6 +1238,103 @@ dirsearch 接入（M16-b）、任何判定通道（M16-c）、新增 triage 提�
 `GATE_MATRIX` / 状态机铁律 / Verifier 输入边界 / 红线 3 / 红线 4 的**任何**改动、
 「AI 判定」的任何预埋。
 
+## 7.14 M16-b 落地注记（2026-09-29：dirsearch 接入 + 速率/并发/时间窗授权语义）
+
+**方向来源**：维护者就「未授权访问 / 接口暴露」裁定的三条方向之②（字典爆路径用 dirsearch
+接入），`tools.d/` 本地预置 + manifest + 自带 `db/dicc.txt`。①（JS 翻接口）已在 §7.13 交付；
+③（`unauth-exposure` 判定通道）属 M16-c，本轮**不碰**。
+
+### 7.14.1 施工点
+
+| 位置 | 动作 |
+|---|---|
+| `proofhound/compliance/scope.py` | 新增 `RequestBudget`（`rate_rps`/`concurrency`/`max_requests`/`window_minutes`）+ `Scope.request_budget` + `resolved_request_budget()` / `request_budget_source()` |
+| `proofhound/tools/build.py` | 新增 `DirsearchParams` / `_build_dirsearch` / `dirsearch_wordlist_head` / `dirsearch_timeout_for`；`build_command` 增 `request_budget` 参数 |
+| `proofhound/tools/parsers/dirsearch_json.py` | 新增解析器（`parser: dirsearch_json`），产既有 `web-probe` |
+| `proofhound/tools/manifests/dirsearch.yaml` | 新增（`local` → `pip` + **`closure` 26 条**，`image: python:3.12-alpine`） |
+| `proofhound/tools/installer.py` | 新增闭包安装路径（`--require-hashes` + 交叉选 musllinux wheel）；`closure=None` 时旧路径不变 |
+| `scripts/make_dirsearch_preset.py` | 新增：生成离线预置 `tools.d/dirsearch/`（不入库） |
+| `scripts/demo_dirsearch.py` | 新增：真靶 + 真沙箱验收 |
+
+### 7.14.2 授权语义是"新维度"，不是"还旧账"
+
+实现前核对过：AGENTS.md **限制 5 是"预算并发精度"（LLM token 预算的 check-then-call）**，
+与请求速率无关；全仓 `速率` 出现 0 次、`时间窗` 仅 2 次且都指**报告时间窗**（限制 18/19）；
+`爆破` 唯一一处出现在**红线 1**（"确定性动作（端口扫描、**目录爆破**、模板渲染）由调度器
+直接执行"）。故本维度是**本轮新增**，据此登记为新限制（54~56），而非修订限制 5。
+
+### 7.14.3 缺省值：维护者裁定"保守缺省"，刻意非 fail-closed
+
+`RequestBudget` 缺省 `None` → 构造器替换为 **50 rps / 5 并发 / 5000 请求**，并记
+`source="default"`。**这与本仓库既有纪律有意不同**（`PROOFHOUND_SANDBOX_EGRESS` /
+`_HARDENING` / `with_session` / `verify-xss` 懒导入都是"缺省即最严、非法值抛错"）：
+后者防的是"把危险方向打开"，这里维护者要的是"开箱即用"。四道阻尼仍然成立且都不放宽：
+① `max_requests` 的**词表硬闸**（构造器按 `1 + len(extensions)` 反推允许词条数，
+**确定性截词表**，不靠工具自觉）；② 逐条 `check_scope`（triage 前拦越界并记
+`triage_out_of_scope`）；③ 出口白名单代理**逐连接**判定；④ 非法值显式抛错。
+**"缺省放行"在审计里不等于"无痕放行"**——`request_budget_source()` 可分辨 `default`/`explicit`。
+
+### 7.14.4 时间窗的"两道"，以及 70% 的来历
+
+`window_minutes` 同时翻成 ① 工具自限时 `--max-time = floor(窗口×0.7)`；
+② 沙箱超时 `min(300, 窗口秒数)`。**两道都只收窄、绝不放宽**。
+
+**为何是 70%**（实现期实测的边界失效）：`window_minutes=1` ⇒ `--max-time 60` **未触发**
+自截，扫描一直跑到沙箱超时（wall **61.4s**）才被杀——即"第一道没赶上、且报告也没写出来"
+的双输形态；而 `--max-time 8` 是能触发的。取 70% 后同一 1 分钟窗口 wall **43.4s** 且工具
+自报 `Runtime exceeded the maximum`。**残余**：70% 是单点实测的经验值，未系统扫描触发边界；
+且窗口 > 5 分钟时沙箱 300s 上限先生效（`window_minutes=8` ⇒ 工具自限时 336s 但沙箱 300s）。
+
+### 7.14.5 依赖闭包：installer 从"单发行件"扩到"闭包"
+
+dirsearch 是本项目**第一个依赖闭包非空**的 pip 工具。旧 pip 配方跑 `pip install --no-deps`
+——**装了也跑不起来**。manifest 因此新增 `closure`（26 条依赖，逐条 `==` + sha256），
+installer 新增 `_install_pip_with_closure`：逐条按 sha256 从 PyPI 元数据定位 wheel →
+下载并**重算哈希比对**（不符即拒装）→ 写 `--require-hashes` 的 requirements →
+`--no-index --find-links` 安装 → 生成 wrapper。
+
+**两条纪律**：① **哈希不符即拒装**，不回落"先装上再说"；② 显式声明 `closure` 才走闭包路径
+（`closure=None` ⇒ 旧行为，`sqlmap` 不受影响）。
+
+**闭包按 musllinux 解析**：沙箱镜像是 `python:3.12-alpine`，宿主是 glibc——直接
+`pip install --target` **找不到** musllinux wheel（实测 `No matching distribution found
+for MarkupSafe`，根因是宿主 `sys_tags()` 里一个 musllinux 都没有），故必须
+`--platform musllinux_1_2_x86_64 --only-binary=:all:` 交叉选择。**该常量与沙箱镜像耦合**，
+换基础镜像必须同步改（见限制 55）。
+
+**闭包内容的一个实测教训**：`cryptography` 最初被判为"声明但未使用"（`pyopenssl` 拉它，
+而 dirsearch 源码里 `OpenSSL`/`cryptography` 零导入）——但**实际跑起来直接崩**：
+`requests-ntlm → spnego → spnego._ntlm_raw.crypto → cryptography.hazmat.backends`。
+**即"静态扫描源码导入"不足以下结论，必须真跑**。这是本轮最有价值的一条方法论记录。
+
+### 7.14.6 判定面零改动
+
+新解析器产既有 `kind="web-probe"`，走 M3a 起就在的 `_triage_candidates` 映射
+（`web-probe` + 状态码 ∈ `_EXPOSED_STATUSES` ⇒ `web-exposure` 候选）。**零新增 Signal kind、
+零 triage 改动、零 `GATE_MATRIX` 改动**。`web-exposure` 仍不在 `GATE_MATRIX` ⇒ 这类候选
+**仍不可 Confirmed**（属 M16-c）——本轮的收益**只在发现面**。
+
+### 7.14.7 实测（真靶 + 真沙箱，产物 `evidence/demo_dirsearch/<ts>/`）
+
+| 项 | 实测 | 含义 |
+|---|---|---|
+| 限速是否落到行为 | 缺省(50)=**836.7 rps** vs 显式(2)=**2.1 rps**，**402×** | 授权不只是写进 argv |
+| 时间窗（1 分钟） | wall **43.4s**，自报 `Runtime exceeded the maximum` | 第一道真赶上 |
+| 峰值内存 | **35~56 MiB**（512m 的 **7~11%**） | 对照 katana `-jc` 248 / `-jc -jsl` 447 MiB ⇒ 轻量档 |
+| 解析管道 | 30 词 → 5 条 `web-probe` → **5 条 `web-exposure` 候选**（坏条目 0） | 零新增 kind 成立 |
+| scope 兜底 | 靶侧 42 条请求 Host 全授权（外域 0）；注入 2 条外域全拒 + `triage_out_of_scope`×2，外域候选 **0** | 主动发请求的越界面被两层挡住 |
+| 自然吞吐（对照） | `-t 25` 全量 dicc.txt 12308 请求 **15s ≈ 820 rps** | **这就是"无差别爆破"的实物** |
+
+**实现期抓到并修掉的真缺陷 2 个**：① `params` 里显式给的 2 rps 曾被构造器自己的缺省
+**静默覆盖成 50**（"以为授了限速、其实没生效"）⇒ 改为预算**单一真相源** + params 夹带即报错；
+② `window_minutes=1` 的 `--max-time 60` 未触发自截 ⇒ 改为窗口 ×0.7。
+
+### 7.14.8 本里程碑明确不做
+
+判定通道（M16-c）· `GATE_MATRIX` / 状态机铁律 / Verifier 输入边界 / 红线 3 / 红线 4 的
+任何改动 · httpx/katana 回填同一套授权语义 · `sqlmap` 的 pip 路径改造 ·
+**`request_budget` 写入 `command_executed` 审计（本轮未做）** · 在 DVWA 真实前端上验 dirsearch。
+
 ## 8. 开发路线图
 
 
