@@ -701,17 +701,35 @@ def test_listeners_are_released_after_phase(env, listener):
 
 
 def test_verify_handlers_cover_ssrf_and_stay_disjoint():
-    """四类漏洞的 method 白名单与 verify skill 覆盖面**互不染指**。"""
+    """五类漏洞的 method 白名单与 verify skill 覆盖面**互不染指**。
+
+    M16-c 披露：本用例的期望集合新增 `verify-unauth`（第 5 个 handler）。
+    **断言意图不变**——仍是"每个 verify skill 只覆盖自己的 vuln_type、两两不相交"。
+    同时把原先的**按下标取值**改为**按名字取值**：下标断言在条目增删时会静默
+    指到错误对象（加一条就得重排全部下标），按名取值对增删稳健。
+    """
     from proofhound.core.orchestrator import Orchestrator as _O
 
-    handlers = _O._verify_handlers(SimpleNamespace(_verify_sqli=1, _verify_xss=1, _verify_idor=1, _verify_ssrf=1))
-    assert set(handlers) == {"verify-sqli", "verify-xss", "verify-idor", "verify-ssrf"}
-    covered = [handlers[name][0] for name in handlers]
-    assert covered[0] == frozenset({"sqli"})
-    assert covered[1] == frozenset({"xss"})
-    assert covered[2] == frozenset({"idor"})
-    assert covered[3] == frozenset({"ssrf"})
+    handlers = _O._verify_handlers(
+        SimpleNamespace(
+            _verify_sqli=1, _verify_xss=1, _verify_idor=1, _verify_ssrf=1,
+            _verify_unauth=1,
+        )
+    )
+    assert set(handlers) == {
+        "verify-sqli", "verify-xss", "verify-idor", "verify-ssrf", "verify-unauth",
+    }
+    expected = {
+        "verify-sqli": frozenset({"sqli"}),
+        "verify-xss": frozenset({"xss"}),
+        "verify-idor": frozenset({"idor"}),
+        "verify-ssrf": frozenset({"ssrf"}),
+        "verify-unauth": frozenset({"unauth-exposure"}),
+    }
+    for name, vuln_types in expected.items():
+        assert handlers[name][0] == vuln_types, name
     # 两两不相交
+    covered = [handlers[name][0] for name in handlers]
     for i, left in enumerate(covered):
         for right in covered[i + 1:]:
             assert not (left & right)

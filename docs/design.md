@@ -1335,6 +1335,95 @@ for MarkupSafe`，根因是宿主 `sys_tags()` 里一个 musllinux 都没有）�
 任何改动 · httpx/katana 回填同一套授权语义 · `sqlmap` 的 pip 路径改造 ·
 **`request_budget` 写入 `command_executed` 审计（本轮未做）** · 在 DVWA 真实前端上验 dirsearch。
 
+## 7.15 M16-c 落地注记（2026-09-29：`unauth-exposure` 判定通道 —— 形态 B + 确定性前置门）
+
+### 7.15.1 流程：裁定先行
+
+判定通道属「判定通道的形态变更（尤其红线 3/4）」，按 AGENTS 项目纪律第 9 条**必须先拿
+维护者裁定**。故先出裁定文档（含「能否行为确认」正反论证 + 三方案 B1/B2/B3 对比），
+维护者裁定选 **B1**，然后才动代码。
+
+### 7.15.2 核心区分：把「能否行为确认」拆成两半
+
+| 半 | 内容 | 判据性质 | 能否作证据 |
+|---|---|---|---|
+| **可复现** | 同一 URL，**匿名**客户端与**已认证**客户端得到**等价响应** | 响应**字节**（二值事实） | ✅ 是（唯一证据） |
+| 不可复现 | 这份内容**本来就该**要求登录 | 内容语义（无二值观测量） | ❌ 否（只作报告分类） |
+
+后半不可作证据有双重依据：① **实测**——M15 已证语义判断不稳（形对照误报 3/4 次、
+`model` 臂 60/60/0/20% 区间重叠 ⇒ 不可判）；② **铁律 2**——`findings/finding.py`
+硬性要求 `evidence_kinds` 含非 `status-code` 标签，而「AI 说敏感」是**结论**不是证据；
+把它当证据等于打开「疑似即确认」的降级路径，撞 README「定位与边界」。
+
+⇒ `GATE_MATRIX` 的 `behavioral_kinds` **只认前置门产物**，故**判定器判错不可能造成
+误确认**（`tests/test_unauth_judge.py::test_confirmed_even_when_judge_says_not_sensitive`
+把这条主张做成可执行断言）。
+
+### 7.15.3 确定性前置门（`verify/unauth_control.py`）
+
+三态，零 LLM：
+
+- `exposed`：匿名 **2xx** 且（与已认证基准**逐字节相同** ‖ 相似度 ≥ 0.9）→ 暴露成立；
+- `requires_auth`：匿名**非 2xx** → 资源本就要求认证 → 编排层 **Rejected**；
+- `blocked`：匿名请求失败，或匿名 2xx 但内容既不同也不像 → 停 Hypothesis（不驳回不确认）。
+
+**为什么 `blocked` 不驳回**（继承 `judge_control` 的推理）：内容「不同但不像」同样符合
+「两视图不同」这一**合法且常见**形态（匿名看精简版、已认证看完整版）——把它当暴露证据是
+**误报方向**。故本模块**只做「字节级肯定」与「状态码否定」**，不做任何语义肯定。
+
+**与 `judge_control` 的方向相反（最容易踩的一处）**：两者判据形态同构（都是"已认证基准
+vs 匿名对照"），但语义方向相反——`public` 在 idor 下**否定**越权（驳回）、`exposed` 在
+exposure 下**肯定**暴露（确认）。**同一份响应、两个漏洞类型、结论相反**。故两者独立成模块，
+且 `test_unauth_control.py::test_direction_is_opposite_to_judge_control` 用同一份输入
+**显式钉住方向相反**——若后人图省事合并两处逻辑，那条测试会立刻失败。
+
+### 7.15.4 独立敏感度判定器（`verify/unauth_judge.py`，T1）
+
+- **输入**：**仅**过了门的响应正文，经**脱敏**（复用 `SessionConfig.secret_values()`）+
+  **截断**（`MAX_JUDGE_BODY_CHARS = 8000` 字符）；送审文本落
+  `unauth_judge_<id>_sent.txt`，**「判定器看到了什么」可离线复核**；
+- **输出**：`{sensitive, category(枚举白名单), anchors(L<行号>), reason, confidence}`
+  Pydantic 强校验；**非法即 fail-closed**（抛 `UnauthJudgeError`，调用方判 blocked；
+  **注意：判定器失败是「覆盖不全」，不是「没暴露」**）；
+- **红线 3 的边界（如实标注）**：判定器**读**响应正文（这是形态 B 的定义——"只看过了
+  第 1 关的响应（脱敏+截断）"），但它的**输出只有结论与锚点**；
+  **Verifier 的输入边界一字未改**（`extra_summary` 里只有枚举/数值/锚点，
+  `test_verifier_summary_has_no_response_body` 断言响应体原文不进 prompt）。
+
+### 7.15.5 `GATE_MATRIX` 与铁律 2 的衔接
+
+```python
+"unauth-exposure": GateRequirement(
+    methods=frozenset({"unauth-equivalence-confirmed"}),
+    behavioral_kinds=frozenset({"unauth-response-equivalence"}),
+),
+```
+
+**为何行为类标签要具名**（而非复用笼统的 `behavioral`）：铁律 2 只要求"存在任一非
+`status-code` 标签「，两者都满足；但具名让」这条 Confirmed 靠的是响应字节等价"在**证据层
+可分辨**（报告与审计能据此区分来源）。既有四类的标签**不受影响**。
+
+**`web-exposure` 仍不可 Confirmed**：它的证据是 `status-code`（`web-probe` + 状态码产出），
+`GATE_MATRIX` **刻意不含**它——`test_web_exposure_still_not_confirmable` 钉住这条。
+
+### 7.15.6 实测与未做
+
+**已实测（替身 fetch + 替身判定器的全链路测试）**：等价 ⇒ Confirmed（四段式 + CVSS 代码
+算分）；判定器判 `sensitive=false` ⇒ **仍 Confirmed**；判定器非法 ⇒ blocked；匿名被拒 ⇒
+确定性 Rejected 且**零判定器调用**；匿名 2xx 不等价 ⇒ blocked；**判据陷阱**——正文含
+`password` 但两视图不等价 ⇒ blocked（证明判据不落在关键词上）；两视图等价但正文无任何
+敏感词 ⇒ 仍 exposed（证明不做关键词判断）。
+
+**未做（如实标注）**：**真靶 / 真沙箱端到端 demo**——本轮的端到端证据是**替身件全链路
+测试**，**未见真实 HTTP**；「匿名看到部分敏感内容」这类真实暴露仍不可 Confirmed（维护者
+裁定的覆盖取舍，见限制 57）；POST/JSON body 型接口不在本轮范围。
+
+### 7.15.7 本里程碑明确不做
+
+`web-exposure` 进 `GATE_MATRIX` · 把 AI 判定器结论当证据（撞铁律 2）· 关键词/正则敏感表
+（既漏又误，且与「发现侧不靠关键词表」的既有立场冲突）· POST/表单 SSRF 式的扩展 ·
+红线 3/4 的任何放松 · 既有四类的 method/证据标签改动。
+
 ## 8. 开发路线图
 
 

@@ -130,6 +130,19 @@ from proofhound.verify.ssrf import resolve_callback_port as ssrf_resolve_callbac
 from proofhound.verify.ssrf import summary_for_verifier as ssrf_summary_for_verifier
 from proofhound.verify.ssrf import token_delivered as ssrf_token_delivered
 from proofhound.verify.ssrf import url_host_port as ssrf_url_host_port
+from proofhound.verify.unauth_control import (
+    UNAUTH_CONFIRMED_METHOD,
+    UNAUTH_EQUIVALENCE_EVIDENCE_KIND,
+    VERDICT_BLOCKED as UNAUTH_BLOCKED,
+    VERDICT_EXPOSED as UNAUTH_EXPOSED,
+    VERDICT_REQUIRES_AUTH as UNAUTH_REQUIRES_AUTH,
+    judge_unauth,
+    summary_to_json as unauth_summary_to_json,
+)
+from proofhound.verify.unauth_judge import (
+    UnauthJudge,
+    UnauthJudgeError,
+)
 from proofhound.verify.verifier import Verifier, VerifierError
 
 _OUTPUT_SAMPLE_LIMIT = 4096  # 失败分类的输出采样上限（字节）
@@ -400,6 +413,7 @@ class Orchestrator:
         idor_fetch=None,
         ssrf_listener_factory=None,
         ssrf_fetch=None,
+        unauth_judge_factory=None,
         triage_rules: bool = True,
         triage_model: bool = False,
         verify_prefilter: bool = False,
@@ -434,9 +448,14 @@ class Orchestrator:
         # 宿主侧探测取数（测试给罐头 fetch）；None 时用 verify/ssrf.py 的真实实现。
         self._ssrf_listener_factory = ssrf_listener_factory
         self._ssrf_fetch = ssrf_fetch if ssrf_fetch is not None else ssrf_fetch_default
+        # M16-c：verify-unauth 的敏感度判定器注入口子（测试给替身判定器；
+        # None 时懒建真实 UnauthJudge，走 T1 档）
+        self._unauth_judge_factory = unauth_judge_factory
         # 回调 listener 按 finding 分桶（每条候选一个独立 listener + 独立 token 空间），
         # phase 收尾统一释放（与 _close_browser 同范式）
         self._ssrf_listeners: dict[str, CallbackListener] = {}
+        # M16-c：敏感度判定器懒建槽位（None = 尚未建；见 _get_unauth_judge）
+        self._unauth_judge = None
         # M9c①：triage 候选来源开关。model 侧**缺省关闭**——默认行为因此
         # 与 M3a 起逐字节等价（tests/test_triage.py 断言「triage 不调 LLM」
         # 由 triage_model=False 保证）；规则侧保留为快速路径与兜底。
@@ -822,6 +841,9 @@ class Orchestrator:
             # M16：带外回调确认（SSRF 唯一确认门径）——宿主 listener 收到
             # 含本次 token 的请求才算；目标响应内容永不作为证据
             "verify-ssrf": (frozenset({"ssrf"}), self._verify_ssrf),
+            # M16-c：未授权暴露（唯一确认门径）——匿名/已认证**响应字节等价**
+            # 才算；AI 判定器只产敏感度结论与锚点、不产证据
+            "verify-unauth": (frozenset({"unauth-exposure"}), self._verify_unauth),
         }
 
     def verify_skill_coverage(self, skill_name: str = "verify-sqli") -> frozenset[str]:
@@ -2037,6 +2059,210 @@ class Orchestrator:
         text += f"\n{resp.body}"
         path.write_bytes(redact_bytes(text.encode("utf-8"), secrets))
         return path
+
+    def _verify_unauth(self, finding: Finding, skill, store: FindingStore) -> str:
+        """verify-unauth SOP（skills/verify-unauth/SKILL.md）的确定性执行（M16-c）。
+
+        确认铁律：**仅"匿名视图 ≡ 已认证视图"可确认**——已认证（预置会话）与
+        **完全不发凭据**的匿名客户端请求**同一 URL**，前者的响应与后者**逐字节
+        相同或相似度 ≥ 阈值**才算暴露成立。判定由
+        ``verify/unauth_control.py::judge_unauth`` 做（纯确定性，零 LLM）。
+
+        LLM 只出现在两处：① **独立敏感度判定器**（T1）——只产结论与行号锚点，
+        **不产证据**（``GATE_MATRIX`` 的 behavioral_kinds 不认它，故它判错
+        不可能造成误确认）；② Verifier 终审（T2）。
+
+        失败语义：匿名被拒 → Rejected（资源本就要求认证）；匿名请求失败 /
+        内容两者都不是 → blocked（覆盖不全，不驳回）；判定器失败 → blocked。
+        """
+        session = self._session()
+        if session is None or not session.cookie_header():
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="scope 未配置预置会话，无法构造已认证视图（fail-closed）",
+            )
+            return "blocked"
+        scope = getattr(self.runner, "scope", None)
+        if scope is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="runner 未挂 scope，verify-unauth 缺 scope 防线（fail-closed）",
+            )
+            return "blocked"
+        url = finding.asset
+        decision = check_scope(scope, [url])  # 红线 5：请求任何 URL 前过 scope
+        if not decision.allowed:
+            self.audit.record(
+                "verify_scope_rejected",
+                finding_id=finding.id,
+                violations=decision.violations,
+            )
+            return "blocked"
+
+        secrets = session.secret_values()
+
+        # 1. 已认证基准请求（预置会话）
+        resp_auth = self._idor_fetch(url, session)
+        self.audit.record(
+            "unauth_probe_attempt",
+            finding_id=finding.id,
+            role="authenticated",
+            status=resp_auth.status,
+            error=resp_auth.error is not None,
+        )
+        auth_path = self._idor_write_response(finding.id, "auth", resp_auth, secrets)
+        if resp_auth.error is not None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=f"已认证基准请求失败（覆盖不全，不驳回）: {resp_auth.error}",
+            )
+            return "blocked"
+
+        # 2. 匿名对照请求（**完全不发凭据**：空 SessionConfig）
+        resp_anon = self._idor_fetch(url, SessionConfig())
+        self.audit.record(
+            "unauth_probe_attempt",
+            finding_id=finding.id,
+            role="anonymous",
+            status=resp_anon.status,
+            error=resp_anon.error is not None,
+        )
+        anon_path = self._idor_write_response(finding.id, "anon", resp_anon, secrets)
+
+        # 3. 确定性判定（唯一产证据的地方）
+        judgment = judge_unauth(resp_auth, resp_anon)
+        control_json = judgment.as_summary()
+        c_path = self.evidence_dir / f"unauth_{finding.id}_control.json"
+        c_path.write_bytes(
+            redact_bytes(
+                (unauth_summary_to_json(control_json) + "\n").encode("utf-8"),
+                secrets,
+            )
+        )
+        self.audit.record(
+            "unauth_control_judged",
+            finding_id=finding.id,
+            verdict=judgment.verdict,
+            anon_status=judgment.anon_status,
+            byte_identical=judgment.byte_identical,
+            similarity=round(judgment.similarity, 3),
+        )
+
+        # 3a. 匿名被拒 → 资源本就要求认证 → 确定性驳回（零 LLM 成本）
+        if judgment.verdict == UNAUTH_REQUIRES_AUTH:
+            finding.transition(
+                FindingState.REJECTED,
+                actor=skill.name,
+                reason=(
+                    "匿名对照被拒 → 该资源本就要求认证，未授权暴露不成立："
+                    + "；".join(judgment.reasons)
+                    + f"（判定依据见 {c_path.name}）"
+                ),
+            )
+            store.append(finding)
+            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+            return "rejected"
+
+        # 3b. 覆盖不全 → 停 Hypothesis（既不驳回也不确认，fail-closed）
+        if judgment.verdict != UNAUTH_EXPOSED:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="；".join(judgment.reasons)
+                + f"（判定依据见 {c_path.name}）",
+            )
+            return "blocked"
+
+        summary = {"unauth_control": control_json}
+
+        # 4. 独立敏感度判定器（T1）：只产结论 + 锚点，**不产证据**
+        judge = self._get_unauth_judge()
+        if judge is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="未配置模型路由，无法做敏感度判定（fail-closed）",
+            )
+            return "blocked"
+        sent_path = self.evidence_dir / f"unauth_judge_{finding.id}_sent.txt"
+        sent_path.write_bytes(redact_bytes(resp_anon.body.encode("utf-8"), secrets))
+        try:
+            jr = judge.judge(
+                resp_anon.body,
+                finding_id=finding.id,
+                url=url,
+                secrets=secrets,
+            )
+        except (UnauthJudgeError, LLMError, BudgetExceededError, ContextOverflowError) as exc:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=f"敏感度判定器未完成（覆盖不全，不驳回）: {exc}",
+            )
+            return "blocked"
+        summary["unauth_judge"] = jr.as_summary()
+
+        # 5. 证据入包（method/标签只来自确定性判定；判定器结论仅入摘要）
+        equiv = (
+            "匿名响应与已认证视图**逐字节相同**（sha256 一致）"
+            if judgment.byte_identical
+            else f"匿名响应与已认证视图相似度 {judgment.similarity:.3f}"
+        )
+        finding.verification = Verification(
+            method=UNAUTH_CONFIRMED_METHOD,
+            evidence_refs=[auth_path.name, anon_path.name, c_path.name, sent_path.name],
+            baseline_diff=(
+                f"已认证基准 {judgment.baseline_status}、匿名对照 "
+                f"{judgment.anon_status}；{equiv}；"
+                f"匿名请求**未携带任何凭据**"
+            ),
+            claim=f"{url} 无需认证即可获得与已认证用户等价的内容",
+            expected="匿名请求应被拒（3xx/4xx）或得到与会话相关的内容",
+            actual=(
+                f"匿名请求返回 {judgment.anon_status}，且响应与已认证视图"
+                f"{'逐字节相同' if judgment.byte_identical else f'相似度 {judgment.similarity:.3f}'}"
+                f"；敏感度判定 category={jr.category}（judge_input_truncated="
+                f"{jr.truncated}）"
+            ),
+            reproduction_steps=[
+                f"带预置会话 GET {url} → {judgment.baseline_status}（已认证视图）",
+                f"**不带任何凭据** GET {url} → {judgment.anon_status}（匿名视图）",
+                f"确定性比对：byte_identical={judgment.byte_identical}、"
+                f"similarity={judgment.similarity:.3f}（判据见 {c_path.name}）",
+                f"敏感度判定（T1，结论非证据）：category={jr.category}、"
+                f"anchors={jr.anchors}",
+            ],
+            verified_by=f"{skill.name}@{skill.manifest.version}",
+            verified_at=_utc_now(),
+        )
+        if UNAUTH_EQUIVALENCE_EVIDENCE_KIND not in finding.evidence_kinds:
+            finding.evidence_kinds.append(UNAUTH_EQUIVALENCE_EVIDENCE_KIND)
+        finding.transition(
+            FindingState.REPRODUCED,
+            actor=skill.name,
+            reason=f"匿名/已认证响应等价（byte_identical={judgment.byte_identical}）",
+        )
+        store.append(finding)
+
+        # 6. 证据门 → Verifier 终审 → 终态迁移（公共收尾）
+        return self._gate_and_review(finding, skill, store, summary=summary)
+
+    def _get_unauth_judge(self):
+        """懒建敏感度判定器（测试经 ``unauth_judge_factory`` 注入替身）。
+
+        无模型路由（``self.router`` 为 None）时返回 None——调用方 fail-closed。
+        """
+        if self._unauth_judge is None:
+            if self._unauth_judge_factory is not None:
+                self._unauth_judge = self._unauth_judge_factory()
+            elif self.router is None:
+                return None
+            else:
+                self._unauth_judge = UnauthJudge(self.router, self.audit)
+        return self._unauth_judge
 
     def _get_browser(self, session: SessionConfig):
         """懒建/复用浏览器验证器（M8b）；不可用抛 BrowserUnavailableError。

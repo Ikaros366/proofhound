@@ -18,6 +18,10 @@ from dataclasses import dataclass, field
 
 from proofhound.findings.finding import Finding
 from proofhound.verify.ssrf import SSRF_CONFIRMED_METHOD
+from proofhound.verify.unauth_control import (
+    UNAUTH_CONFIRMED_METHOD,
+    UNAUTH_EQUIVALENCE_EVIDENCE_KIND,
+)
 
 #: 行为类证据标签（verify-* skill 在行为验证成功后追加到 evidence_kinds）
 BEHAVIORAL_EVIDENCE_KIND = "behavioral"
@@ -32,10 +36,16 @@ class GateRequirement:
 
 
 # 证据门矩阵（§5.4.2 表的代码化；sqli 落自 M3b，xss 落自 M8b，
-# idor 落自 M8c，ssrf 落自 M16，其余类型随 verify-* skill 扩展）。
+# idor 落自 M8c，ssrf 落自 M16，unauth-exposure 落自 M16-c，
+# 其余类型随 verify-* skill 扩展）。
 #
-# **四类的 method 白名单互不染指**：每个集合只含本类型自己的确认手段，
-# 任何一个 method 名不得出现在两处（tests/test_ssrf.py::test_gate_methods_are_mutually_exclusive_and_ssrf_only_accepts_callback 逐条断言互斥）。
+# **五类的 method 白名单互不染指**：每个集合只含本类型自己的确认手段，
+# 任何一个 method 名不得出现在两处（tests/test_ssrf.py::test_gate_methods_are_mutually_exclusive_and_ssrf_only_accepts_callback
+# 与 tests/test_unauth_gate.py 逐条断言互斥）。
+#
+# **`unauth-exposure` 与 `web-exposure` 是两回事**：`web-exposure` 仍是纯 status-code
+# 证据（铁律 2 禁止其 Confirmed，本矩阵**刻意不含**它）；`unauth-exposure` 的证据是
+# **匿名/已认证响应等价**（可复现的行为事实），故有自己的项。
 # 新增类型时必须同时提供对应的 verify-* skill 与 profiles.py 登记，
 # 否则该类型的候选只能停在 Hypothesis（GATE_MATRIX 是 Confirmed 的门）。
 GATE_MATRIX: dict[str, GateRequirement] = {
@@ -59,6 +69,18 @@ GATE_MATRIX: dict[str, GateRequirement] = {
     "ssrf": GateRequirement(
         methods=frozenset({SSRF_CONFIRMED_METHOD}),
         behavioral_kinds=frozenset({BEHAVIORAL_EVIDENCE_KIND}),
+    ),
+    # M16-c：未授权暴露唯一认可确认手段 = **匿名/已认证响应等价**（可复现的二值事实）。
+    #
+    # 证据标签刻意用具名的 `unauth-response-equivalence` 而非笼统的 `behavioral`：
+    # 让"这条 Confirmed 靠的是响应字节等价"在证据层可分辨（报告/审计据此区分来源）。
+    # 铁律 2 只要求"存在任一非 status-code 标签"，具名标签同样满足它。
+    #
+    # **刻意不接受** AI 判定器的语义结论作证据（M16-c 裁定：形态 B 若把 AI 结论当证据
+    # 就等于打开"AI 说敏感即确认"的降级路径，撞铁律 2 与 README 边界）。
+    "unauth-exposure": GateRequirement(
+        methods=frozenset({UNAUTH_CONFIRMED_METHOD}),
+        behavioral_kinds=frozenset({UNAUTH_EQUIVALENCE_EVIDENCE_KIND}),
     ),
 }
 

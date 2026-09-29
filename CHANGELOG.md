@@ -6,7 +6,70 @@
 
 ## [未发布]
 
-M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c / M15 / M16 / M16-a / M16-b（内部消化，按维护者要求**不 bump 版本号**：`0.2.0` 保持不变）。
+M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c / M15 / M16 / M16-a / M16-b / M16-c（内部消化，按维护者要求**不 bump 版本号**：`0.2.0` 保持不变）。
+
+### 变更（M16-c `unauth-exposure` 判定通道 —— 形态 B + 确定性前置门）
+
+**做了什么**：把「不需要登录就能拿到信息」做成**第 5 类可确认漏洞**——但**只确认可复现的那一半**。
+
+**流程纪律**：判定通道属「形态变更」（AGENTS 项目纪律第 9 条）⇒ 先出**裁定文档**
+（含「能否行为确认」论证 + 三方案对比）→ 维护者裁定选 **B1** → 才动代码。
+
+**核心设计：把「能否行为确认」拆成两半**
+
+| 半 | 内容 | 能否作证据 |
+|---|---|---|
+| **可复现** | 「同一 URL，匿名客户端与已认证客户端得到**等价响应**」——判据落在响应字节，二值事实 | ✅ **是**（Confident 的唯一证据） |
+| 不可复现 | 「这份内容**本来就该**要求登录」——敏感度语义判断，无二值观测量 | ❌ 否（只作报告分类） |
+
+后者不可作证据有实测依据：M15 已证语义判断不稳（形对照误报 3/4 次、区间重叠 ⇒ 不可判），
+且**铁律 2**（`findings/finding.py`）硬性要求 `evidence_kinds` 含非 `status-code` 标签——
+把「AI 说敏感」当证据就等于打开「疑似即确认」的降级路径。
+
+**四个落点**
+
+1. **确定性前置门** `verify/unauth_control.py::judge_unauth`：三态
+   `exposed` / `requires_auth` / `blocked`，零 LLM。
+   **与 `idor_control.judge_control` 判据同构但方向相反**——后者的 `public` 在 idor 语义下是
+   **否定**越权（驳回），前者的 `exposed` 在 exposure 语义下是**肯定**暴露（确认）；
+   同一份响应两个漏洞类型结论相反，故独立成模块，并用测试**显式钉住方向相反**。
+2. **独立敏感度判定器** `verify/unauth_judge.py`（T1）：只看**脱敏 + 截断**后的响应
+   （实际上限 `MAX_JUDGE_BODY_CHARS=8000` 字符），输出
+   `{sensitive, category, anchors, reason, confidence}` Pydantic 强校验，非法即 fail-closed；
+   实际送审正文落盘（`unauth_judge_<id>_sent.txt`），「判定器看到了什么」可离线复核。
+   **它的结论不构成证据**。
+3. **`GATE_MATRIX`**：新增 `unauth-exposure` 项，method = `unauth-equivalence-confirmed`、
+   行为类标签 = `unauth-response-equivalence`（**具名**而非笼统 `behavioral`，使证据来源可分辨）；
+   method 与既有四类**互不染指**（逐条断言）。
+4. **skill + 画像**：`skills/verify-unauth/SKILL.md`（L2、只读）+ `profiles.py` 登记
+   （两者必须同时加——`test_skill_profiles` 断言一一对应）。
+
+**实测（替身 fetch + 替身判定器的全链路测试）**
+
+| 断言 | 结果 |
+|---|---|
+| 匿名≡已认证 → Confirmed（四段式 + 具名标签 + CVSS 代码算分） | ✅ |
+| **判定器判 `sensitive=false` ⇒ 仍 Confirmed** | ✅ **证明证据来自门、不来自判定器** |
+| 判定器输出非法 ⇒ **blocked**（不确认） | ✅ |
+| 匿名被拒（302/401/403/404）⇒ **确定性 Rejected 且零判定器调用** | ✅ |
+| 匿名 2xx 但不等价 ⇒ blocked（不驳回不确认） | ✅ |
+| 匿名网络错误 / 缺预置会话 / 资产越界 ⇒ blocked | ✅ |
+| **判据陷阱**：正文含 `password` 但两视图不等价 ⇒ blocked（**判据不落在关键词上**） | ✅ |
+| 两视图等价但正文**无**任何敏感词 ⇒ 仍 exposed（**证明不做关键词判断**） | ✅ |
+| 送 Verifier 的 `extra_summary` 与落盘摘要**均不含响应体原文** | ✅ |
+| `web-exposure` **仍**不在 `GATE_MATRIX`（判定面零放松） | ✅ |
+
+**测试**：新增 `tests/test_unauth_control.py` **22** + `tests/test_unauth_judge.py` **19**
+= **41**；全量 **1262 passed / 0 skipped**。**披露的旧测试改动 1 处**：
+`tests/test_ssrf.py::test_verify_handlers_cover_ssrf_and_stay_disjoint` 的期望集合新增
+`verify-unauth`，并把**按下标取值**改为**按名取值**（下标断言在条目增删时会静默指错对象）
+——断言**意图不变**（仍是「每个 verify skill 只覆盖自己的 vuln_type、两两不相交」）。
+其余旧测试**零改动**。
+
+**明确不做**：`web-exposure` 进入 `GATE_MATRIX`、把 AI 判定器结论当证据（撞铁律 2 与
+README 边界）、关键词/正则敏感表（既漏又误，且与「发现侧不靠关键词表」的立场冲突）、
+POST/JSON body 型接口、真靶真沙箱端到端 demo（本轮的端到端证据是替身件全链路测试，
+**未见真实 HTTP**——如实标注）。
 
 ### 变更（M16-b dirsearch 接入 + 速率/并发/时间窗授权语义）
 

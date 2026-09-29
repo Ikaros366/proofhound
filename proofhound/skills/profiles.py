@@ -66,6 +66,15 @@ SKILL_PROFILES: dict[str, SkillProfile] = {
             "不改目标状态；确认靠宿主 listener 收到回调（带外二值事实）"
         ),
     ),
+    "verify-unauth": SkillProfile(
+        risk_level="L2",
+        mutating=False,
+        note=(
+            "只读验证：匿名与已认证各发一次只读 GET（不跟随重定向），比对响应字节；"
+            "确认靠「匿名响应与已认证视图等价」（可复现的二值事实），"
+            "AI 判定器只产敏感度结论与锚点、不产证据"
+        ),
+    ),
 }
 
 
