@@ -41,6 +41,29 @@ D 族换成**真安全**（含 `/d/safe4` 的真授权校验、`/d/safe2` 去掉
 **不变式**：端点表/参数名、首页链接、表单字段、爬行状态码一律不动；D 族
 "两个探测取值响应长度相同"的性质保持（粗筛只比长度）→ 离线三臂数字应逐格不变。
 
+## M15 Step 1：SSRF 候选族（E 族）+ SSRF 形对照
+
+维护者口径：发现层已不是瓶颈（模型在基准上发现率 100%），瓶颈是**可确认的漏洞
+类别数**。SSRF 的确认手段是二值事实（回调服务器收到请求），故先走第一步——
+**只放开候选**（`llm/triage.py::ALLOWED_VULN_TYPES` 加 `ssrf`）、用本基准量化
+"模型在**没有规则表提示**时能否产出高质量 ssrf 候选"，再由数据决定要不要建
+`verify-ssrf`。**本轮刻意不做的事**：不给规则表加 SSRF 提示表、不给
+`GATE_MATRIX` 加 ssrf 项——没有验证器就不该有 Confirmed 通道。
+
+端点族形态：
+
+- **E 族（真 SSRF）**：服务端**真的**按参数取值发起 HTTP 请求，响应回显"取到了
+  什么"（状态码 + 正文长度）。`url` / `redirect` 两族**参数名在提示表内**（规则表
+  锚点，用于对照）；`target` / `feed` / `avatar` 三族**参数名在提示表外**
+  （关键词盲区，第一步要测的正是这里）。
+- **`/d/ssrf-like`（对照）**：参数名与形态都"看着像"，但服务端**只是把它登记
+  下来**、不发起任何请求——这就是交接文档点名的 D 族对照（"看起来像但不是
+  SSRF，例如参数只被记录、服务端不发起请求"）。
+
+`/e/list*` 是 E 族请求的目标内容（本地同源），刻意用**目标由 fixture 自身
+提供**的形态：既有真实出网语义（服务端代取），又保证基准零外部依赖、可离线
+复现。抓取超时 1.5s——离线基准每族只抓一次，测试套件里也不至于把门拖慢。
+
 用法：
     .venv/bin/python scripts/bench_triage.py            # 离线确定性：三臂消融
     .venv/bin/python scripts/bench_triage.py --model    # rules+model 臂接真实 T1 档
@@ -154,7 +177,26 @@ ENDPOINTS: tuple[Endpoint, ...] = (
     Endpoint("/d/safe2", "article_id", None, note="对照：表外参数且无漏洞"),
     Endpoint("/d/safe3", "name", None, note="对照：xss 表内但已转义"),
     Endpoint("/d/safe4", "no", None, note="对照：表外 idor 类参数但有授权判断"),
+    # ---- E 族：真 SSRF（M15 Step 1）+ SSRF 形对照 ----
+    #: 服务端**真的**按参数取值发起请求。前两条参数名在提示表内（规则表锚点），
+    #: 后三条在表外（关键词盲区）——"发现率差异只可能来自参数名在不在表里"
+    #: 这条基准纪律，在 SSRF 族上同样成立。
+    Endpoint("/e/fetch", "url", "ssrf", note="表内（xss 表）SSRF 锚点"),
+    Endpoint("/e/fetch2", "redirect", "ssrf", note="表内（xss 表）SSRF 锚点"),
+    Endpoint("/e/fetch3", "target", "ssrf", note="表外（SSRF 盲区）"),
+    Endpoint("/e/fetch4", "feed", "ssrf", note="表外（订阅源盲区）"),
+    Endpoint("/e/fetch5", "avatar", "ssrf", note="表外（头像抓取盲区）"),
+    Endpoint(
+        "/d/ssrf-like", "callback", None,
+        note="对照：参数名像 SSRF 但服务端不发起请求（只登记）",
+    ),
 )
+
+#: E 族服务端请求的取样上限（字符）——够表达"取到了什么"，又不让正文长度抖动。
+_SSRF_SAMPLE_CHARS = 160
+
+#: E 族服务端请求超时（秒）。刻意短：离线基准与测试套件都不该为它等网络。
+_SSRF_TIMEOUT_S = 1.5
 
 
 # =====================================================================
@@ -247,6 +289,46 @@ def _object_page(value: str, label: str, param: str) -> str:
     )
 
 
+def _fetch_remote(url: str) -> tuple[int | None, bytes, str]:
+    """服务端按参数取值**真的发起一次请求**——SSRF 的行为本体。
+
+    只认 http/https（其余 scheme 一律拒绝，"取值非法"由端点渲染成 200 + 错误
+    文案，**不是** 404——端点存在这件事不受取值影响）。任何网络/协议失败都被
+    收敛成 ``(None, b"", 原因)``，fixture 自己绝不 500（否则粗筛与爬行的状态码
+    不变式都会漂）。
+
+    返回 ``(状态码 | None, 正文前若干个字节, 错误原因或空串)``。
+    """
+    import urllib.request
+
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return None, b"", "仅接受 http/https 的绝对 URL"
+    try:
+        with urllib.request.urlopen(  # noqa: S310 - fixture 的本职就是发请求
+            url, timeout=_SSRF_TIMEOUT_S
+        ) as resp:
+            return resp.status, resp.read(_SSRF_SAMPLE_CHARS), ""
+    except urllib.error.HTTPError as exc:  # 目标可达但非 2xx：仍是"取到了"
+        return exc.code, exc.read(_SSRF_SAMPLE_CHARS), ""
+    except OSError as exc:  # URLError 是 OSError 子类；超时亦然
+        return None, b"", f"{type(exc).__name__}"
+
+
+def _visit_target(value: str, label: str, param: str) -> tuple[int, str]:
+    """E 族端点：抓取 ``value`` 并渲染结果页（per-endpoint label 保证正文唯一）。"""
+    status, body, error = _fetch_remote(value)
+    sample = body.decode("utf-8", "replace")
+    if error:
+        result = f"{param}={value} 抓取失败：{error}"
+    else:
+        result = (
+            f"{param}={value} 抓取成功：状态码 {status}，"
+            f"正文 {len(body)} 字节（节选：{sample}）"
+        )
+    return 200, _page(label, result)
+
+
 def _page(title: str, body: str, links: tuple[str, ...] = ()) -> str:
     """页面渲染。footer 带 **per-endpoint 标记**（``ep=<路径去斜杠>``）。
 
@@ -320,8 +402,25 @@ class _FixtureHandler(BaseHTTPRequestHandler):
             return (query.get(key) or [""])[0]
 
         if path == "/":
+            # M15：E 族的取值是**真实可抓的 URL**（指向本 fixture 的 /e/list*）。
+            # 用相对 URL 而非绝对 URL：基准不绑定端口，且本地同源 → 零外部依赖。
+            # 它仍是"服务端按取值发请求"的完整体现（目标由 fixture 自身提供）。
+            _e_targets = {
+                "/e/fetch": "/e/list",
+                "/e/fetch2": "/e/list2",
+                "/e/fetch3": "/e/list3",
+                "/e/fetch4": "/e/list",
+                "/e/fetch5": "/e/list2",
+            }
             links = tuple(
-                f"{ep.path}?{ep.param}=1" for ep in ENDPOINTS if ep.param
+                f"{ep.path}?{ep.param}="
+                + (
+                    urllib.parse.quote(_e_targets[ep.path], safe="")
+                    if ep.path in _e_targets
+                    else "1"
+                )
+                for ep in ENDPOINTS
+                if ep.param
             ) + tuple(ep.path for ep in ENDPOINTS if not ep.param)
             self._respond(200, _page("bench fixture", "端点索引", links))
             return
@@ -388,7 +487,53 @@ class _FixtureHandler(BaseHTTPRequestHandler):
             self._respond(200, _object_page(first(key), label, key))
             return
 
+        # ---- E 族（M15）：服务端**真的**按参数发起请求（真 SSRF 语义） ----
+        # 与 A/B 族同一纪律：行为由 path 决定、参数名完全不参与行为分支。
+        if path in (
+            "/e/fetch", "/e/fetch2", "/e/fetch3", "/e/fetch4", "/e/fetch5"
+        ):
+            key, label = {
+                "/e/fetch": ("url", "链接预览"),
+                "/e/fetch2": ("redirect", "跳转跟随"),
+                "/e/fetch3": ("target", "正文抓取"),
+                "/e/fetch4": ("feed", "订阅抓取"),
+                "/e/fetch5": ("avatar", "头像拉取"),
+            }[path]
+            self._respond(*_visit_target(first(key), label, key))
+            return
+
+        # ---- E 族的抓取目标内容（本地同源，故基准零外部依赖） ----
+        if path in ("/e/list", "/e/list2", "/e/list3"):
+            self._respond(
+                200,
+                _page(
+                    "订阅源",
+                    f"源 {path.rsplit('/', 1)[-1]}：三条条目"
+                    "（第一条：基准 fixture 自述；第二条：SSRF 端点族；"
+                    "第三条：指标口径说明）。",
+                ),
+            )
+            return
+
         # ---- D 族：安全对照（**真安全**，但仍保留"诱出候选"的形态） ----
+        if path == "/d/ssrf-like":
+            # M15 对照：参数名（callback）看着像 SSRF，但服务端**只把它登记下来**，
+            # 不发起任何请求。
+            #
+            # 刻意**不回显取值**（也不转义后回显）：回显会让响应长度随取值变化，
+            # 而 D 族不变式要求"两个探测取值响应长度相同"（粗筛只比长度，见
+            # verify/prefilter.py::decide）。定长页把这条性质保住，同时参数名本身
+            # 仍留在 URL 里——"看着像 SSRF"的诱出形态不受影响。
+            # 本端点对外是只读的：**不读** query、不读凭据、无分支。
+            self._respond(
+                200,
+                _page(
+                    "回调登记",
+                    "回调地址已登记（仅登记，服务端不发起任何外发请求）。",
+                ),
+            )
+            return
+
         if path == "/d/safe":
             # 公开资源：取值被忽略、无回显、定长 → 无注入、无反射。
             # 注意它对**两个身份返回同一份内容**，IDOR 判定器分不出"公开资源"

@@ -24,9 +24,16 @@ triage 从未用过 LLM。本模块补上这一环。
   在该信号真实参数集内。任一不满足即整批拒绝（不产候选），**不是**"当作
   合法候选"。走 ``llm/repair.py`` 的 ``complete_structured``——沿用 M6a
   先例，最多一次修复重试。
-- **不发明漏洞类型**：``vuln_type`` 白名单 = :data:`ALLOWED_VULN_TYPES`
-  = 现有 ``verify-*`` 覆盖的类型。``verify/gate.py::GATE_MATRIX`` 对未知
-  类型 fail-closed（永远不可能 Confirmed），放行只会污染 findings.jsonl。
+- **不发明漏洞类型**：``vuln_type`` 白名单 = :data:`ALLOWED_VULN_TYPES`。
+  ``verify/gate.py::GATE_MATRIX`` 对未知类型 fail-closed（永远不可能
+  Confirmed），放行只会污染 findings.jsonl。
+
+  白名单与 ``GATE_MATRIX`` 的**唯一区别是 ``ssrf``**，这是刻意的两段式：
+  SSRF 已有模型候选通道但**尚无验证器**，故它的候选只能停在 Hypothesis
+  （``GATE_MATRIX`` 里没有 ssrf 项 → 证据门恒不通过）。要进 Confirmed 必须
+  先按既有确认链路补 ``verify-ssrf``（回调服务器判定），**不得在本模块或
+  证据门里开旁路**。``ssrf`` 的落地形态见 ``verify/ssrf.py`` 与
+  ``docs/design.md`` §7.12。
 """
 
 from __future__ import annotations
@@ -41,9 +48,15 @@ from proofhound.compliance.audit import AuditLog
 from proofhound.llm.repair import complete_structured
 from proofhound.llm.router import Tier
 
-#: 允许的漏洞类型白名单（= 现有 verify-* 覆盖的类型，见 GATE_MATRIX）。
+#: 允许的漏洞类型白名单。
 #: 模型不得发明新类型——无验证器的类型只会在 findings.jsonl 里堆积噪声。
-ALLOWED_VULN_TYPES: frozenset[str] = frozenset({"sqli", "xss", "idor"})
+#:
+#: ``ssrf`` 自 M15（SSRF 两步走第一步）起**只放开候选**：它没有 verifier，
+#: 故 ``GATE_MATRIX`` 里**刻意没有**对应项，证据门对 ssrf 恒 fail-closed
+#: （永远不可能 Confirmed）。这是"先测候选质量、再决定建不建验证器"的
+#: 落地形态，不是遗漏——``ssrf`` 的验证器已于 M16 落地（见
+#: ``verify/ssrf.py``），矩阵项随 ``verify-*`` skill 扩展。
+ALLOWED_VULN_TYPES: frozenset[str] = frozenset({"sqli", "xss", "idor", "ssrf"})
 
 #: 置信度档位（仅作审计与排序参考，**不参与任何解密判定**）。
 ALLOWED_CONFIDENCES: frozenset[str] = frozenset({"low", "medium", "high"})
@@ -63,8 +76,9 @@ SYSTEM_PROMPT = """你是渗透测试的**假设生成**助手，为一个「验
 1. 你的输出只是**假设**，不是结论。系统会对每条候选做行为验证，误报由你负责。
 2. 只依据给出的**结构化摘要**判断（URL 路径、参数名、状态码、表单字段名、响应长度）。
    你看不到响应体，**不要臆测**页面内容。
-3. ``vuln_type`` 只能取这三个之一：``sqli``（SQL 注入）、``xss``（跨站脚本）、
-   ``idor``（越权/水平越权，需要对象标识类参数）。**不得发明其他类型。**
+3. ``vuln_type`` 只能取这四个之一：``sqli``（SQL 注入）、``xss``（跨站脚本）、
+   ``idor``（越权/水平越权，需要对象标识类参数）、``ssrf``（服务端请求伪造，
+   需要服务端会**代你发起请求**的参数）。**不得发明其他类型。**
 4. ``param`` 必须是该条摘要里**真实出现过**的参数名/字段名（原样小写）。认不出就**不要输出该条**。
 5. 宁可少报：没有把握的参数不要硬凑。``confidence`` 取 low/medium/high。
 
@@ -73,6 +87,12 @@ SYSTEM_PROMPT = """你是渗透测试的**假设生成**助手，为一个「验
   同一参数可能同时是两者（既可能注入也可能越权），可以各出一条。
 - 参数名语义指向可回显的自由文本（搜索词、昵称、备注、消息、URL/跳转目标）→ 可能是 ``xss``。
 - 参数名语义指向查询条件/排序/分页/路径（可能拼进 SQL 或文件路径）→ 可能是 ``sqli``。
+- 参数名语义指向**服务端要去取的外部资源**（URL/主机/端口/源地址/订阅源/头像/
+  回调地址/图片或网页预览等）→ 可能是 ``ssrf``。判断要点是"取一个**别人机器上**的
+  东西"：只有服务端真的按该参数去发起请求才成立，若参数只是被原样回显、写日志或
+  存库，则不是；这类"看着像但不成立"的参数**不要**报 ssrf。
+  同一参数可能同时是 ``xss``（回显）/``sqli``（拼进查询）/``idor``（指向本系统对象），
+  可以各出一条——系统会分别做行为验证，你不必替它挑选。
 - **英文之外的语言与缩写同样重要**：``bh``（编号）、``bianhao``、``no``、``ref`` 这类
   短名/拼音/缩写，只要能看出是标识或查询条件，就该产出候选。
 - 表单字段名（``source`` 为 ``form_page``）与 URL 查询参数同等对待。

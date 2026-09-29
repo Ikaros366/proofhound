@@ -22,6 +22,18 @@
 crawler（sqli 5→1、xss 2→1、idor 3→1），live 臂的检出率被爬虫伪造成 25%。
 故 `test_no_two_endpoints_share_a_body` 是**硬性回归网**：同构指的是**同一后端、
 同一 vuln 语义、唯一变量是参数名**，而不是同字节。
+
+## M15：E 族（真 SSRF）+ SSRF 形对照
+
+SSRF 两步走的第一步只在基准上加**候选族**（`vuln_type` 白名单开 `ssrf`），
+不建验证器、不动 `GATE_MATRIX`。本文件补两类断言：
+
+1. **可确认性的前提——服务端真的代为发请求**：E 族端点必须真的按参数取值发起
+   HTTP 请求，且非 http/https 取值被收敛成 200 + 错误文案（端点存在性不受取值
+   影响）。第二步若建 `verify-ssrf`（回调服务器收到请求 = 二值事实），靠的就是
+   这个行为；若这里只是“看起来像”，第二步的确认数字会是假的。
+2. **不变式**：`/d/ssrf-like`（看着像 SSRF 但服务端不发起请求）必须与 D 族同款
+   ——两个探测取值响应长度相同（粗筛只比长度），且**不回显取值**。
 """
 
 from __future__ import annotations
@@ -76,6 +88,17 @@ def _post(url: str, data: dict[str, str]) -> tuple[int, str]:
             return resp.status, resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8", "replace")
+
+
+#: M15 之前（M10a/M11b/M11c）A/B/C/D 四族的 16 条端点路径。
+#: 这四族是**历史数字的可比性基线**——它们的路径/参数名/行为一动，
+#: 历史发现率与误报率就不再可比。故这里逐条列名，供下面的断言与冒烟测试用。
+LEGACY_ENDPOINTS: tuple[str, ...] = (
+    "/a/sqli", "/a/sqli2", "/a/xss", "/a/idor",
+    "/b/sqli", "/b/sqli2", "/b/sqli3", "/b/xss", "/b/idor", "/b/idor2",
+    "/c/form-sqli", "/c/form-sqli2",
+    "/d/safe", "/d/safe2", "/d/safe3", "/d/safe4",
+)
 
 
 def _endpoint_urls() -> list[str]:
@@ -197,11 +220,109 @@ def test_identity_mapping(base):
     assert "无权查看" in unknown
 
 
+# ------------------------------------------------- 冒烟：端点全部可达
+
+
+@pytest.mark.parametrize("url", _endpoint_urls())
+def test_every_endpoint_is_reachable(base, url):
+    """22 条端点全部可爬（200）——加族之后最容易踩的是新端点漏进 404。
+
+    加这一条的理由：`test_no_two_endpoints_share_a_body` 是**带会话**取数，新端点若漏了路由会一起 404，而那条测试的失败信息会指向"正文重复"（404 页正文对多条端点相同），把根因误导成正文问题。这里用与爬行一致的视角（带会话）单独钉住可达性。
+    """
+    status, _body = _get(base + url, bench.TOKEN)
+    assert status == 200, (url, status)
+
+
+# ------------------------------------------------- M15：E 族（真 SSRF）
+
+
+@pytest.mark.parametrize(
+    ("path", "key"),
+    [
+        ("/e/fetch", "url"),
+        ("/e/fetch2", "redirect"),
+        ("/e/fetch3", "target"),
+        ("/e/fetch4", "feed"),
+        ("/e/fetch5", "avatar"),
+    ],
+)
+def test_ssrf_endpoints_really_issue_server_side_requests(base, path, key):
+    """E 族**真的**按参数取值发起服务端请求——SSRF 的行为本体。
+
+    这条是第二步（建 `verify-ssrf`，确认手段 = 回调服务器收到请求）的地基：
+    若端点只是“把取值回显出来”，回调判定永远收不到请求，第二步的数字就是假的。
+    这里用 **fixture 自己的** `/e/list` 作目标（本地同源）：既真发了 HTTP 请求，
+    又让基准零外部依赖、可离线复现。
+    """
+    status, body = _get(
+        f"{base}{path}?" + urllib.parse.urlencode({key: f"{base}/e/list"})
+    )
+    assert status == 200
+    assert "抓取成功" in body, "E 族端点没有真的代发请求"
+    assert "状态码 200" in body
+
+
+@pytest.mark.parametrize(
+    ("path", "key"),
+    [
+        ("/e/fetch", "url"),
+        ("/e/fetch2", "redirect"),
+        ("/e/fetch3", "target"),
+        ("/e/fetch4", "feed"),
+        ("/e/fetch5", "avatar"),
+    ],
+)
+def test_ssrf_endpoints_reject_non_url_values_without_lying(base, path, key):
+    """非 http/https 取值：**端点仍存在**（200 + 失败文案），不是 404。
+
+    两个理由：① 基准纪律——取值不该改变“端点存在”这件事，否则爬行状态码不变式
+    会随探针漂；② 真实应用同款形态（“参数非法”与“端点不存在”是两回事）。
+    """
+    for bad in ("1", "file:///etc/passwd", "not a url"):
+        status, body = _get(
+            f"{base}{path}?" + urllib.parse.urlencode({key: bad})
+        )
+        assert status == 200, (path, bad, status)
+        assert "抓取失败" in body, (path, bad)
+
+
+def test_ssrf_endpoints_never_read_local_files(base):
+    """`file://` 不被当作可取目标——fixture 的取样器只认 http(s)。
+
+    这是**取样器的边界**，不是被测系统的边界（真实系统该不该允许 file:// 是
+    verify-ssrf 的设计问题）；这里钉住的是“基准不隐藏这个事实”：取值非法时
+    正文只是失败文案，绝不出现本地文件内容。
+    """
+    _, body = _get(
+        f"{base}/e/fetch3?"
+        + urllib.parse.urlencode({"target": "file:///etc/passwd"})
+    )
+    assert "抓取失败" in body
+    assert "root:" not in body, "fixture 读取了本地文件"
+
+
+def test_ssrf_like_control_never_issues_a_request(base):
+    """`/d/ssrf-like` 真安全：参数只被登记，服务端**不发起任何请求**。
+
+    交接文档点名的 D 族对照形态（“看起来像但不是 SSRF，例如参数只被记录、
+    服务端不发起请求”）。判据用**行为**而非措辞：若它真去取了 fixture 自己的
+    `/e/list`，正文会带“抓取成功”与目标路径——两条断言把它们排除掉。
+    """
+    _, probe = _get(
+        f"{base}/d/ssrf-like?"
+        + urllib.parse.urlencode({"callback": f"{base}/e/list"})
+    )
+    assert "抓取成功" not in probe
+    assert "/e/list" not in probe, "对照端点回显了取值（那就成了反射，不再是纯对照）"
+    _, other = _get(f"{base}/d/ssrf-like?callback=1")
+    assert probe == other, "对照端点响应随取值变化——D 族定长性质被破坏"
+
+
 # --------------------------------------------------------------- 不变式
 
 
 def test_no_two_endpoints_share_a_body(base):
-    """**硬性回归网**：16 个端点的响应正文两两不同。
+    """**硬性回归网**：全部 22 个端点的响应正文两两不同。
 
     理由：katana 会把正文重复的 URL 当**重复响应丢弃**，端点因此根本进不了
     crawler。第一版升级把 A/B/C 三族统一到同一份正文，实测 16 个端点只剩 9 个
@@ -244,6 +365,8 @@ def test_no_two_endpoints_share_a_body(base):
         ("/d/safe?id=1", "id", False),
         ("/d/safe2?article_id=1", "article_id", False),
         ("/d/safe4?no=1", "no", False),
+        # M15：SSRF 形对照——参数名像 SSRF，但服务端不发起请求、不回显取值
+        ("/d/ssrf-like?callback=1", "callback", False),
     ],
 )
 def test_prefilter_length_invariants_preserved(base, url, key, length_should_change):
@@ -262,28 +385,44 @@ def test_prefilter_length_invariants_preserved(base, url, key, length_should_cha
 
 
 def test_crawl_signals_unchanged(base):
-    """确定性爬行的 Signal 语料不变：16 条、状态码全 200。
+    """确定性爬行的 Signal 语料：22 条、状态码全 200。
 
     端点表/首页链接/表单字段若被改动，这里会红——因为 triage 的输入变了，
     三臂消融就不再可比。
+
+    M15 披露：计数 16 → 22、param-endpoint 14 → 20，是**加了 E 族（5 条真 SSRF）
+    与 SSRF 形对照（1 条）**的必然结果，不是既有端点被动过——A/B/C/D 四族的
+    16 条仍逐条在列（由 test_endpoint_table_shape_unchanged 的族分量断言钉死）。
     """
     signals, _ = bench.crawl(base)
-    assert len(signals) == 16
+    assert len(signals) == 22
     assert {s.status_code for s in signals} == {200}
     kinds: dict[str, int] = {}
     for signal in signals:
         kinds[signal.kind] = kinds.get(signal.kind, 0) + 1
-    assert kinds == {"param-endpoint": 14, "form_page": 2}
+    assert kinds == {"param-endpoint": 20, "form_page": 2}
 
 
 def test_endpoint_table_shape_unchanged():
-    """ground truth 端点表形态不变：16 条、12 真漏洞 / 4 安全对照。
+    """ground truth 端点表形态：22 条、17 真漏洞 / 5 安全对照。
 
-    误报率分母（对照端点数）与发现率分母（真漏洞数）一变，历史数字即不可比。
+    误报率分母（对照端点数）与发现率分母（真漏洞数）一变，历史数字即不可比——
+    故 M15 的分母变化必须**显式**写在这里（16/12/4 → 22/17/5：新增 5 条真 SSRF
+    + 1 条 SSRF 形对照），并由下面的族分量断言钉死“旧族一条没动”。
     """
-    assert len(bench.ENDPOINTS) == 16
-    assert sum(1 for e in bench.ENDPOINTS if e.vuln is not None) == 12
-    assert sum(1 for e in bench.ENDPOINTS if e.vuln is None) == 4
+    assert len(bench.ENDPOINTS) == 22
+    assert sum(1 for e in bench.ENDPOINTS if e.vuln is not None) == 17
+    assert sum(1 for e in bench.ENDPOINTS if e.vuln is None) == 5
+    # M15：族分量——A/B/C/D 四族逐条不变，新增的只有 E 族与 SSRF 形对照
+    families: dict[str, int] = {}
+    for ep in bench.ENDPOINTS:
+        families[ep.path.split("/")[1]] = families.get(ep.path.split("/")[1], 0) + 1
+    assert families == {"a": 4, "b": 6, "c": 2, "d": 5, "e": 5}
+    assert sum(1 for e in bench.ENDPOINTS if e.vuln == "ssrf") == 5
+    # 族计数还不够——同族换一条也能骗过计数，故**逐条列名**断言旧 16 条仍在
+    present = {ep.path for ep in bench.ENDPOINTS}
+    missing = [path for path in LEGACY_ENDPOINTS if path not in present]
+    assert not missing, f"既有端点被删改：{missing}"
     assert tuple(bench.OUT_OF_TABLE) == (
         "article_id", "sku", "ref", "bh", "no", "token", "product", "code",
     )

@@ -6,7 +6,36 @@
 
 ## [未发布]
 
-M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c（内部消化，按维护者要求**不 bump 版本号**：`0.2.0` 保持不变）。
+M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c / M15（内部消化，按维护者要求**不 bump 版本号**：`0.2.0` 保持不变）。
+
+### 变更（M15 SSRF 两步走·第一步：只放开候选 + 基准加 SSRF 端点族）
+
+**做了什么**：给系统加上**第 4 类漏洞候选（SSRF）**，但**只到候选层**——先测模型候选质量，再由数据决定要不要投入建验证器。
+
+- **白名单**：`proofhound/llm/triage.py::ALLOWED_VULN_TYPES` 加 `ssrf`，并**同步改 prompt 正文**（原文写死"只能取这三个之一"——漏改这处模型永远不会产 ssrf，且**不会报错**，属静默失效）。同时补 ssrf 判断线索，并把"看着像但不成立"的负例写进提示词。
+- **确认通道刻意不开**：`verify/gate.py::GATE_MATRIX` **不加** ssrf 项，也不建 `skills/verify-ssrf`、不在 `skills/profiles.py` 登记 ⇒ 证据门对 ssrf 恒 fail-closed，`ssrf` **永远不可能 Confirmed**。新增测试三条断言把该形态钉死。
+- **规则表刻意不加** SSRF 提示表：要测的正是"规则表盲区上模型能否发现"。
+- **中性基准加 E 族**（`scripts/bench_triage.py`）：5 条**真 SSRF**端点——服务端**真的**按参数取值发起 HTTP 请求（`_fetch_remote`：只认 http/https、1.5s 超时、任何失败收敛成 200 + 文案，fixture 自己绝不 500）；参数名 `url`/`redirect` 在提示表内（规则表锚点），`target`/`feed`/`avatar` 在表外（关键词盲区）。另加 **D 族形对照 `/d/ssrf-like`**：参数名 `callback` 像 SSRF，但服务端**只登记、不发起请求、不回显取值**（定长）。
+
+**为什么这样做**：发现层已不是瓶颈（模型在本基准上发现率 100%），瓶颈是**可确认的漏洞类别数**。选 SSRF 而非 LFI：SSRF 的确认手段是**二值事实**（回调服务器收到请求），LFI 靠回显 canary 文件、受目标环境与路径知识影响更易含糊。而**分两步走**的理由是避免"先建验证器再给它找活干"——先拿到候选质量数据，再决定投资。
+
+**实测（真实 T1 `deepseek-flash`，4 次独立运行，22 端点 = 17 真漏洞 + 5 对照）**：
+
+| 指标 | 结果 |
+|---|---|
+| SSRF 发现率（E 族 5 条，正确类型 = ssrf） | **5/5 = 100%，4/4 次一致（σ=0）** |
+| 其中表外盲区 3 条（`target`/`feed`/`avatar`） | **3/3，4/4 次一致** |
+| 规则表对同 5 条 SSRF 端点 | **0 候选**（表内两条只产出 xss） |
+| 无规则表提示时模型能否产出 ssrf 候选 | **能，且稳定**——这正是第二步的前提 |
+| 形对照 `/d/ssrf-like` 被误报 ssrf | **3/4 次**（prompt 已明写该类不要报） |
+| `model` 臂对照误报率（4 次） | 60% / 60% / 0% / 20% —— 区间重叠，**不可判** |
+| 单题成本 | 5.3k~8.9k token / 2 次 T1 调用 |
+
+**结论与第二步建议**：**发现侧够格，筛除侧不够格**。模型对 SSRF 的语义识别稳定且零方差（含全部表外盲区参数名），但会把"参数名像 SSRF 而服务端并不取数"的端点误报为 ssrf——这类误报**恰恰是行为验证能确定性回答、纯语义判断回答不了**的（回调服务器收没收到请求，是二值事实）。故建议**进入第二步**（建 `verify-ssrf`，回调判定），判据与形态见 `docs/design.md` §7.12；且第一步的候选**必须**经该验证器才能离开 Hypothesis。
+
+**明确不做（诚实边界）**：`GATE_MATRIX` 的 ssrf 项、`skills/verify-ssrf/`、`skills/profiles.py` 登记、规则表 SSRF 提示表、`--live` 的 SSRF 臂（无验证器 ⇒ 跑出来只会全是"未能判定"）。
+
+**测试影响**：新测试 **36** 个；旧 1040 全绿（共 **1076 passed / 2 skipped**，2 skip = 企业模板缺失，公开仓库固有形态）。**披露的旧测试改动 4 处**（逐条理由写在文件内）：① `test_allowed_types_are_exactly_the_verified_ones` → `..._declared_ones`，白名单断言加 ssrf——原意图"无验证器的类型不得有确认通道"由新增的 `test_ssrf_is_hypothesis_only_no_confirmed_channel` 承接并加强；② `test_crawl_signals_unchanged` 16→22 条（加族必然结果）；③ `test_endpoint_table_shape_unchanged` 16/12/4→22/17/5（分母变化必然结果，并新增族分量断言钉死 A/B/C/D 四族逐条未动）；④ 粗筛长度不变式参数化表加 `/d/ssrf-like` 一行（断言本体零改动）。
 
 ### 变更（M14 API 认证：HTTP Basic 单账户，deny-by-default）
 

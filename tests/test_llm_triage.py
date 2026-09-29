@@ -18,6 +18,7 @@ import json
 import pytest
 
 from proofhound.compliance.audit import AuditLog
+from proofhound.findings.finding import Finding, FindingState
 from proofhound.findings.signal import Signal
 from proofhound.llm.router import Tier
 from proofhound.llm.triage import (
@@ -161,9 +162,45 @@ def test_parse_accepts_empty_and_key_variants():
     )
 
 
-def test_allowed_types_are_exactly_the_verified_ones():
-    """白名单 = 现有 verify-* 覆盖的类型；不得发明无验证器的类型。"""
-    assert ALLOWED_VULN_TYPES == frozenset({"sqli", "xss", "idor"})
+def test_allowed_types_are_exactly_the_declared_ones():
+    """白名单**逐字**锁定：{sqli, xss, idor, ssrf}——多一个或少一个都红。
+
+    M15 披露（断言意图已随任务变更）：原断言是“白名单 = 现有 verify-* 覆盖的
+    类型”，而 M15 第一步**刻意**让 ssrf 例外——它有候选通道但没有验证器
+    （`GATE_MATRIX` 无 ssrf 项 → 证据门恒 fail-closed，永远不可能 Confirmed）。
+    “无验证器的类型不得有确认通道”这一原意图由下面的
+    test_ssrf_is_hypothesis_only_no_confirmed_channel 承接并加强。
+    """
+    assert ALLOWED_VULN_TYPES == frozenset({"sqli", "xss", "idor", "ssrf"})
+
+
+def test_ssrf_is_hypothesis_only_no_confirmed_channel():
+    """M15 两步走的安全形态：ssrf 可产候选，但**没有任何 Confirmed 通道**。
+
+    “先测候选质量、再决定建不建验证器”的落地不变量，三条同时成立才算：
+    ① ssrf 在模型白名单内（候选能产）；② `GATE_MATRIX` 里**没有** ssrf 项
+    （证据门 fail-closed）；③ 任意 ssrf Finding 过证据门恒不通过。
+    ②③ 一并断言，防止将来有人“顺手”在矩阵里加一项而绕过验证器建设
+    ——那会让 ssrf 直接出现 Confirmed 通道，而确认手段（回调服务器）尚未实现。
+    """
+    from proofhound.verify.gate import GATE_MATRIX, check
+
+    assert "ssrf" in ALLOWED_VULN_TYPES
+    assert "ssrf" not in GATE_MATRIX
+    finding = Finding(
+        id="F-2026-9001",
+        vuln_type="ssrf",
+        state=FindingState.REPRODUCED,
+        asset="http://127.0.0.1:8000/e/fetch3?target=1",
+        param="target",
+        dedup_key="ssrf-target",
+        evidence_kinds=["behavioral"],
+        created_at="2026-09-29T00:00:00Z",
+        updated_at="2026-09-29T00:00:00Z",
+    )
+    result = check(finding)
+    assert result.passed is False
+    assert any("无证据门定义" in item for item in result.missing)
 
 
 def test_parse_tolerates_code_fence():
