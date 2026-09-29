@@ -1,10 +1,9 @@
 # AGENTS.md
 
-> **✅ 交接任务「SSRF 两步走」第一步已交付（M15，2026-09-29）**——施工单见
-> 施工单（**不进仓库**，见文末说明）：白名单已放开 `ssrf`、中性基准已加 E 族（5 条真
-> SSRF）与 SSRF 形对照，**候选质量数据见里程碑表 M15 行**。
-> **第二步（建 `verify-ssrf`）尚未开工**——判据与形态记在交接单（**不进仓库**），
-> 由维护者按第一步数据裁决。
+> **✅ 交接任务「SSRF 两步走」两步均已交付（M15 第一步 2026-09-29 / M16 第二步 同日）**
+> M15 放开 `ssrf` 候选 + 中性基准加 E 族；
+> **M16 建成 `verify-ssrf` 垂直切片**（确认手段 = 回调 listener 收到请求，带外二值事实），
+> `GATE_MATRIX` 自此有 ssrf 项，**ssrf 成为第 4 类可确认漏洞**。
 > 判据与实测数字见本文件里程碑表 M15/M16/M16-a 行、`docs/design.md` §7.11/§7.12/§7.13
 > 与 `CHANGELOG.md`「未发布」节。**交接单不进仓库**（曾含本机环境细节：代理地址、
 > 宿主路径、用户名、同机其他容器清单），由维护者在本机另行保管。
@@ -76,7 +75,19 @@
 
 | M15 SSRF 两步走·第一步：白名单放开候选 + 基准加 SSRF 端点族——已完成（2026-09-29） | ① **只放开候选，不开确认通道**：`proofhound/llm/triage.py::ALLOWED_VULN_TYPES` 加 `ssrf`，**prompt 正文同步改四类**（漏改这处模型永远不会产 ssrf 且不报错）并补 ssrf 判断线索（"服务端要去取**别人机器上**的东西；只是回显/写日志/存库则不是"）。**`verify/gate.py::GATE_MATRIX` 刻意不加 ssrf 项**——没有验证器就不该有 Confirmed 通道，未知类型 fail-closed 正是想要的行为；该形态由 `test_ssrf_is_hypothesis_only_no_confirmed_channel` 三条断言钉死（白名单有 ssrf / 矩阵无 ssrf / ssrf Finding 过证据门恒不通过）。② **规则表刻意不加 SSRF 提示表**——要测的正是"规则表盲区上模型能否发现"（交接文档施工点）。③ **基准加 E 族**（`scripts/bench_triage.py`）：5 条**真 SSRF**端点，服务端**真的**按参数取值发起 HTTP 请求（`_fetch_remote` 只认 http/https、1.5s 超时、失败收敛成 200 + 文案，fixture 自己绝不 500）；`url`/`redirect` 两条参数名在提示表内（规则表锚点），`target`/`feed`/`avatar` 三条在表外（关键词盲区）；另加 **D 族形对照 `/d/ssrf-like`**（参数名 `callback` 像 SSRF，但服务端只登记、不发请求、不回显取值 → 定长）。抓取目标由 fixture 自身 `/e/list*` 提供 ⇒ **真出网语义 + 零外部依赖、可离线复现**。④ **不变的**：`GATE_MATRIX`、状态机铁律、规则表（`_SQLI/_XSS/_IDOR_PARAM_HINTS`）、证据门、两个开关缺省值、任何硬闸；A/B/C/D 四族 16 条端点逐条未动。 | **候选质量（真实 T1 `deepseek-flash`，4 次独立运行，22 端点 = 17 真漏洞 + 5 对照）**：**表外 3 条 SSRF 端点 `target`/`feed`/`avatar` 4/4 次全部命中，表内 2 条锚点同样 4/4 → SSRF 发现率 5/5 = 100%、σ=0**（对照：规则表对 5 条 SSRF **零候选**，其中表内两条只产出 xss）。**误报**：`/d/ssrf-like` 被误报 ssrf **3/4 次**（正是 prompt 已明写不要报的那一类），故 `model` 臂对照误报率 60%/60%/0%/20%、`rules+model` 80%/80%/60%/80%，**方差大不可判**——与发现侧的零方差形成对照。新测试 **36** 个（`tests/test_bench_fixture.py` 34：真代发请求 ×5 / 非 URL 取值不撒谎 ×5 / 不读本地文件 / 形对照不发请求 / **端点全部可达 ×22 参数化** / 旧族端点逐条列名 / 粗筛定长扩行；`tests/test_llm_triage.py` 2：白名单逐字锁定 + ssrf 无确认通道）；旧 1040 全绿（共 **1076 passed / 2 skipped**）。**披露的旧测试改动 4 处**：白名单断言（本轮任务本体，意图已转移并加强）、基准两处标定常量（16→22 条 / 16/12/4→22/17/5，分母变化的必然结果）——各在文件内写明理由；**未做**：`verify-ssrf` 验证器、`GATE_MATRIX` ssrf 项、`skills/profiles.py` 登记、规则表 SSRF 提示表、`--live` 的 SSRF 臂（无验证器 ⇒ 无法确认，跑了也只会全是"未能判定"） |
 
+| M16 SSRF 两步走·第二步：verify-ssrf 垂直切片（回调确认）——已完成（2026-09-29） | ① **新模块** `proofhound/verify/ssrf.py`（first-party 纯 stdlib，定位同 `verify/idor.py`）：`CallbackListener`（宿主进程内 `ThreadingHTTPServer`，缺省只绑回环）+ 判定纯函数 `judge` + 交付证明 `token_delivered` + token/nonce 生成与回调 URL 构造。② **唯一确认手段 = 回调收到请求**（带外二值事实，method=`ssrf-callback-confirmed`）：目标响应里的 callback URL 反射、状态码、耗时**一律不是证据**——SSRF 的答案不在目标给我们的响应里。③ **三道防伪**：每探针唯一 token（`secrets.token_hex(16)` + `hmac.compare_digest`；路径不含 token 的请求记 `ssrf_callback_ignored`，不计命中）· **交付证明**（回取探测 URL，正文须含 token/nonce）· **随机地址对照探针**（`<hex>.invalid` 主机；命中只证明「服务端会代发请求」，**不确认**）。④ **判定分界（宁漏勿滥）**：命中 → confirmed；干净未命中 + 交付证明成立 → **rejected**（真阴性，零 LLM 成本）；探针出错 / 交付证明不成立 / 前置不全 / listener 不可用 → **blocked**（绝不驳回）。⑤ **走既有链路、无旁路**：`GATE_MATRIX` 加 ssrf 项（method 与既有三类**互不染指**，逐条断言互斥）→ `skills/verify-ssrf/SKILL.md`（L2）→ `skills/profiles.py` 登记（L2 + **mutating=False**，只读探测）→ 编排层 `_verify_ssrf` → 证据门 → Verifier 终审（只收确定性结论 + 锚点，**回调原文一行不进 prompt**）→ CVSS 代码算分 → 四段式证据。⑥ **红线零放松**：scope 五层、证据门、状态机铁律、脱敏、预算硬闸、审计 append-only 全不动；回调 listener **不常驻**（phase 收尾释放，与 `_close_browser` 同范式）。**远程靶**：`PROOFHOUND_SSRF_CALLBACK_HOST`（告知目标的地址）与 `PROOFHOUND_SSRF_CALLBACK_BIND`（本机绑定地址，可解析则绑该名、否则 0.0.0.0 并打醒目告警）**解耦**。 | **测试**：新增 `tests/test_ssrf.py` **47** 个（纯函数 20 / 真 listener 11 / 编排层 16）——其中 confirmed 路径由**真 listener 收到真请求**驱动（非替身判定）；旧 1076 全绿（共 **1125 passed / 2 skipped**）。**披露的旧测试改动 1 处**：`test_llm_triage.py` 的`test_ssrf_is_hypothesis_only_no_confirmed_channel` 随第二步落地**意图反转**并更名`test_ssrf_confirmed_requires_callback_method_only`（原文断言"ssrf 不在矩阵内、过门恒不过"，现断言"矩阵内有且仅有回调确认这一条 method，且缺行为证据/缺 verification 一律不过门"，原意图由后者加强承接）。**实弹验收** `scripts/demo_verify_ssrf.py`：目标 = 基准 fixture 的 E 族（**跑在容器里**、端口发布到宿主，真发起服务端请求）；两条真 SSRF 端点 → **CONFIRMED**（method/cvss 5.3/refs 3/steps 4 全齐，回调源 IP 为容器网段 `172.17.0.6`）；形对照 `/d/ssrf-like` → **不被确认**（按交付证明不成立判 blocked，宁漏勿滥）。**实现期发现并修掉的 4 个真实缺陷**：① 注册的 token 与注入 URL 里的 token **不是同一个**（循环外生成 value、循环内另生成 token）⇒ confirmed 分支**在生产里永不触发**；② `_ssrf_listener` **没用注入的 listener 工厂**（token 注册与回调落在两个对象上）；③ 对照探针的失败被计入 errored ⇒ 每次干净未命中都判 blocked、rejected 分支不可达；④ **注入的回调 URL 被 `check_scope` 当作目标**（端口不在授权范围）⇒ 每个探针都被 scope 拒掉——改为"asset 过 scope + 探针同源自检"。四处**都只在"用真 listener 驱动 confirmed"的测试下才暴露**，已全部记入 docs/design.md §7.12 |
+
+49. **SSRF 回调需要目标能回连宿主，且回连地址必须显式配置**（M16）：确认手段是「回调 listener 收到请求」，故**目标必须网络可达 listener**。缺省只绑回环 ⇒ 只适用于本机/同主机目标；目标是容器或远程主机时必须显式设 `PROOFHOUND_SSRF_CALLBACK_HOST`（**告知目标**的地址，如宿主 LAN IP）与 `PROOFHOUND_SSRF_CALLBACK_BIND`（**本机绑定**地址；名字可解析则绑该名、不可解析才退 `0.0.0.0` 并打印醒目告警）。**实弹实测的两个坑**：① 本机 dockerd 上 `host.docker.internal` **不解析**（`wget: bad address`），只能用宿主真实 IP（容器经 NAT 可达，实测回调源 IP `172.17.0.6`）；② 混用两者会让 listener 直接 `gaierror` 绑不上（这正是把绑定面与告知面解耦的原因）。**残余**：非回环绑定意味着同网段任何主机都能访问 listener（有告警、不常驻、用完即关），属本机开发取舍；未做鉴权。
+
+50. **SSRF 交付证明（delivery proof）会在"参数被忽略且不回显"的目标上失败，从而判 blocked 而非 rejected**（M16，**刻意的宁漏勿滥**）：判定"干净未命中 = 真阴性"必须先证明 payload 被目标**原样接收**（回取探测 URL、正文里找 token/nonce）。若目标既不取数、又不把取值渲染进响应（很多真实系统如此），交付证明不成立 ⇒ 判 **blocked**（Finding 停 Hypothesis），**不是** rejected。**实弹实测**：基准 fixture 的形对照 `/d/ssrf-like` 正是这种形态 → 判 blocked（而不是 rejected），实弹脚本据此把期望写成"**绝不许 confirmed**"而不是"必须 rejected"。**这是保守方向的代价**（漏驳回、不误确认）；若将来要减少 blocked，应拓宽交付证明的**肯定性信号**（如「目标对合法/非法取值返回不同响应」），而不是放宽"无回调即驳回"。
+
+51. **verify-ssrf 只覆盖 GET query 参数型 SSRF，且刻意不做协议/编码绕过**（M16）：payload 只替换query 里该参数的值（`with_query_param`，URL 结构原样保留），变体集 ≤2 条（纯回调 URL；回调 URL + 同名参数二次拼接）。**不做** `gopher`/`dict`/`@`/十进制 IP/短域名等绕过变体——那是绕过技巧、不是确认所需，且会扩大攻击面。**未覆盖**：POST/表单 SSRF（`form_page` 候选直接判 blocked）、header/JSON body 注入、无回调的盲 SSRF、以及"目标会取数但只允许特定域名"的白名单过滤形态（回调域名被过滤 ⇒ 判不出，走 rejected/blocked 的安全侧）。
+
+52. **基准 fixture 作为 SSRF 目标时跑在容器里，baseline 存在一处部署面接缝**（M16 实弹）：`scripts/demo_verify_ssrf.py` 把 fixture 放进容器（目标必须在网络上真实可达，而非同进程替身），但 `_run_baseline` 走沙箱 httpx，而沙箱在 `proofhound-egress`（internal 网络）里**够不到**宿主发布的端口 ⇒ 实弹脚本用**预制 httpx 输出**提供 baseline，其余步骤（探测/回调/判定/证据门/Verifier）全部真实。**该接缝已如实写在脚本 docstring 里**，不得读作"全链路无接缝"。要让 baseline 也走真沙箱，需给沙箱配一条到宿主的出口（属 M12/M13 的部署面）。
+
 ## 技术选型（设计已定，实现时遵循）
+
+
 
 
 | 层 | 选型 |
@@ -423,7 +434,7 @@ docx 模板用 docxtpl（Jinja2 语法），渲染环境 **StrictUndefined**（�
 
 45. **工具输出体积无上限**（M12）：M12 把"写满宿主磁盘"在容器内结构性消除（rootfs 只读 + 可写面仅 64m tmpfs），但工具 stdout/stderr 经 Docker 日志驱动落在**宿主** `/var/lib/docker`，容器退场后由 `container.logs()` 整体读入内存再落证据盘——大输出（sqlmap 高 verbosity、katana 大站点）既占宿主磁盘也占一次内存峰值，且 `container.logs()` 的读取本身无上限。**未加日志驱动上限是刻意取舍**：红线 3 要求原始输出 100% 落盘，静默截断会破坏证据完整性，故治理必须先引入"显式截断 + 审计标记"（与限制 9 的大文件裁剪策略同属后续切片），不能只拧一个 `max-size`。
 
-46. **`ssrf` 只到候选层，没有确认通道**（M15，两步走第一步的**刻意形态**）：`ssrf` 已在模型白名单内（能产候选），但 `verify/gate.py::GATE_MATRIX` **刻意没有** ssrf 项、也没有 `skills/verify-ssrf` 与 `skills/profiles.py` 登记 ⇒ **证据门对 ssrf 恒 fail-closed，ssrf 永远不可能 Confirmed**（状态机铁律之外的第二层兜底）。因此 ssrf 候选目前只会停在 Hypothesis 并**堆积在 findings.jsonl 里**——这是"先测候选质量、再决定建不建验证器"的代价，不是缺陷；第二步（回调服务器收到请求 = 二值事实）的判据与形态记在交接单（**不进仓库**）。**另**：规则表**刻意不加** SSRF 提示表，故在纯规则表路径（`PROOFHOUND_TRIAGE_MODEL` 缺省关闭 + 模型失败 fail-closed）下，SSRF 端点**一个候选都不会产出**——基准实测规则表对 5 条 SSRF 端点零候选。
+46. ~~**`ssrf` 只到候选层，没有确认通道**~~ **已于 M16 还清（反转）**：`ssrf` 已在模型白名单内（能产候选），但 `verify/gate.py::GATE_MATRIX` **刻意没有** ssrf 项、也没有 `skills/verify-ssrf` 与 `skills/profiles.py` 登记 ⇒ **证据门对 ssrf 恒 fail-closed，ssrf 永远不可能 Confirmed**（状态机铁律之外的第二层兜底）。因此 ssrf 候选目前只会停在 Hypothesis 并**堆积在 findings.jsonl 里**——这是"先测候选质量、再决定建不建验证器"的代价，不是缺陷；第二步（回调服务器收到请求 = 二值事实）的判据与形态见 `docs/design.md` §7.12。**M16 反转**：第二步建成 `verify-ssrf`（确认手段 = 回调 listener 收到请求，带外二值事实），`GATE_MATRIX` 自此**有** ssrf 项且 method 白名单只含 `ssrf-callback-confirmed` ⇒ ssrf 成为**第 4 类可确认漏洞**。M15 的"先测候选质量再决定建不建验证器"由此闭环（第一步数据支持、第二步落地）。**仍不变的部分**：规则表**刻意不加** SSRF 提示表，故在纯规则表路径（`PROOFHOUND_TRIAGE_MODEL` 缺省关闭 + 模型失败 fail-closed）下，SSRF 端点**一个候选都不会产出**——基准实测规则表对 5 条 SSRF 端点零候选（这是刻意的：发现侧靠模型，规则表只做快速路径与兜底）。
 
 47. **SSRF 候选的误报面集中在"参数名像 SSRF 但服务端不取数"这类端点上，且方差大**（M15 实测）：真实 T1 在基准上对 5 条真 SSRF 端点 **4/4 次全部命中、零方差**，但对 D 族形对照 `/d/ssrf-like`（参数名 `callback` 像 SSRF，服务端只登记、不发请求）**3/4 次误报为 ssrf**——尽管 prompt 已明写"参数只是被回显/写日志/存库则不是，这类不要报"。故对照误报率在 4 次运行间为 `model` 60%/60%/0%/20%、`rules+model` 80%/80%/60%/80%，**区间重叠 ⇒ 该差异不可判**（与 M11c 的区间重叠法同口径）。**读这条限制的要点**：SSRF 的"发现"已不构成瓶颈（模型语义识别稳定），瓶颈转移到**筛掉形似端点**——而这恰是行为验证（回调服务器收没收到请求）能确定性回答、纯语义判断回答不了的问题。**残余**：样本仅 4 次；`/d/ssrf-like` 是**单一**对照形态（只覆盖"只登记不回显"一种），"参数被回显/被写日志/被存库"等其他形似形态**未上基准**。
 

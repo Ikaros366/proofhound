@@ -58,6 +58,14 @@ SKILL_PROFILES: dict[str, SkillProfile] = {
         mutating=False,
         note="只读验证：双会话各发一次 GET 做属性对比，无写操作",
     ),
+    "verify-ssrf": SkillProfile(
+        risk_level="L2",
+        mutating=False,
+        note=(
+            "只读验证：只发只读 GET 探测（替换一个 query 参数取值），不提交表单、"
+            "不改目标状态；确认靠宿主 listener 收到回调（带外二值事实）"
+        ),
+    ),
 }
 
 

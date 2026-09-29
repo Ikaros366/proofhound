@@ -18,7 +18,7 @@ import json
 import pytest
 
 from proofhound.compliance.audit import AuditLog
-from proofhound.findings.finding import Finding, FindingState
+from proofhound.findings.finding import Finding, FindingState, Verification
 from proofhound.findings.signal import Signal
 from proofhound.llm.router import Tier
 from proofhound.llm.triage import (
@@ -174,33 +174,66 @@ def test_allowed_types_are_exactly_the_declared_ones():
     assert ALLOWED_VULN_TYPES == frozenset({"sqli", "xss", "idor", "ssrf"})
 
 
-def test_ssrf_is_hypothesis_only_no_confirmed_channel():
-    """M15 两步走的安全形态：ssrf 可产候选，但**没有任何 Confirmed 通道**。
-
-    “先测候选质量、再决定建不建验证器”的落地不变量，三条同时成立才算：
-    ① ssrf 在模型白名单内（候选能产）；② `GATE_MATRIX` 里**没有** ssrf 项
-    （证据门 fail-closed）；③ 任意 ssrf Finding 过证据门恒不通过。
-    ②③ 一并断言，防止将来有人“顺手”在矩阵里加一项而绕过验证器建设
-    ——那会让 ssrf 直接出现 Confirmed 通道，而确认手段（回调服务器）尚未实现。
+def test_ssrf_confirmed_requires_callback_method_only():
+    """**M16 披露（断言意图已随第二步落地而反转）**：M15 时 ssrf 刻意没有
+    Confirmed 通道，本测试当时断言 `"ssrf" not in GATE_MATRIX` + 过门恒不过。
+    M16 建了 `verify-ssrf`（确认手段 = 回调 listener 收到请求，带外二值事实），
+    故 ssrf **现在有且仅有**一条确认通道；原意图「无验证器的类型不得有确认
+    通道」由下面三条承接——矩阵项**必须存在**、method 白名单**只含回调确认**、
+    且**缺行为证据/缺 verification 一律不过门**（防止有人把矩阵项放宽成摆设）。
     """
     from proofhound.verify.gate import GATE_MATRIX, check
+    from proofhound.verify.ssrf import SSRF_CONFIRMED_METHOD
 
     assert "ssrf" in ALLOWED_VULN_TYPES
-    assert "ssrf" not in GATE_MATRIX
-    finding = Finding(
-        id="F-2026-9001",
-        vuln_type="ssrf",
-        state=FindingState.REPRODUCED,
-        asset="http://127.0.0.1:8000/e/fetch3?target=1",
-        param="target",
-        dedup_key="ssrf-target",
-        evidence_kinds=["behavioral"],
-        created_at="2026-09-29T00:00:00Z",
-        updated_at="2026-09-29T00:00:00Z",
-    )
+    assert "ssrf" in GATE_MATRIX
+    assert GATE_MATRIX["ssrf"].methods == frozenset({SSRF_CONFIRMED_METHOD})
+
+    def _finding(**overrides) -> Finding:
+        base = dict(
+            id="F-2026-9001",
+            vuln_type="ssrf",
+            state=FindingState.REPRODUCED,
+            asset="http://127.0.0.1:8000/e/fetch3?target=1",
+            param="target",
+            dedup_key="ssrf-target",
+            evidence_kinds=["behavioral"],
+            created_at="2026-09-29T00:00:00Z",
+            updated_at="2026-09-29T00:00:00Z",
+        )
+        base.update(overrides)
+        return Finding(**base)
+
+    # 只有「行为类证据 + 白名单 method + 证据引用」齐全才过门
+    finding = _finding()
     result = check(finding)
-    assert result.passed is False
-    assert any("无证据门定义" in item for item in result.missing)
+    assert result.passed is False  # 还没有 verification
+    assert any("缺 verification" in item for item in result.missing)
+
+    # 非白名单 method（例如拿 sqlmap 的结论来确认 ssrf）必须被拒
+    other_method = _finding(
+        verification=Verification(
+            method="sqlmap-confirmed", evidence_refs=["x.jsonl"]
+        )
+    )
+    assert check(other_method).passed is False
+
+    # 缺行为类证据标签同样不过（纯 status-code 永不 Confirmed 的另一层）
+    no_behavior = _finding(
+        evidence_kinds=["crawl-endpoint"],
+        verification=Verification(
+            method=SSRF_CONFIRMED_METHOD, evidence_refs=["x.jsonl"]
+        ),
+    )
+    assert check(no_behavior).passed is False
+
+    # 齐全 → 过门（真正的判定由编排层 + Verifier 负责，本门只查最低验收标准）
+    ok = _finding(
+        verification=Verification(
+            method=SSRF_CONFIRMED_METHOD, evidence_refs=["x.jsonl"]
+        )
+    )
+    assert check(ok).passed is True
 
 
 def test_parse_tolerates_code_fence():

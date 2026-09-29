@@ -17,6 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from proofhound.findings.finding import Finding
+from proofhound.verify.ssrf import SSRF_CONFIRMED_METHOD
 
 #: 行为类证据标签（verify-* skill 在行为验证成功后追加到 evidence_kinds）
 BEHAVIORAL_EVIDENCE_KIND = "behavioral"
@@ -31,7 +32,12 @@ class GateRequirement:
 
 
 # 证据门矩阵（§5.4.2 表的代码化；sqli 落自 M3b，xss 落自 M8b，
-# idor 落自 M8c，其余类型随 verify-* skill 扩展）
+# idor 落自 M8c，ssrf 落自 M16，其余类型随 verify-* skill 扩展）。
+#
+# **四类的 method 白名单互不染指**：每个集合只含本类型自己的确认手段，
+# 任何一个 method 名不得出现在两处（tests/test_gate.py 逐条断言互斥）。
+# 新增类型时必须同时提供对应的 verify-* skill 与 profiles.py 登记，
+# 否则该类型的候选只能停在 Hypothesis（GATE_MATRIX 是 Confirmed 的门）。
 GATE_MATRIX: dict[str, GateRequirement] = {
     "sqli": GateRequirement(
         methods=frozenset({"sqlmap-confirmed", "boolean-diff", "time-blind-diff"}),
@@ -45,6 +51,13 @@ GATE_MATRIX: dict[str, GateRequirement] = {
     # M8c：IDOR 唯一认可确认手段 = 双会话属性违反（单会话异常响应不确认）
     "idor": GateRequirement(
         methods=frozenset({"dual-session-confirmed"}),
+        behavioral_kinds=frozenset({BEHAVIORAL_EVIDENCE_KIND}),
+    ),
+    # M16：SSRF 唯一认可确认手段 = **回调 listener 收到请求**（带外二值事实）。
+    # 目标响应里的 callback URL 反射、状态码、耗时一律不是证据；
+    # method 名与既有三类互不染指（见上）。
+    "ssrf": GateRequirement(
+        methods=frozenset({SSRF_CONFIRMED_METHOD}),
         behavioral_kinds=frozenset({BEHAVIORAL_EVIDENCE_KIND}),
     ),
 }

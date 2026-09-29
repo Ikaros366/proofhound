@@ -633,6 +633,7 @@ class OrchestratorPhases:
         crawl_skill: str = "recon-crawl",
         verify_xss_skill: str = "verify-xss",
         verify_idor_skill: str = "verify-idor",
+        verify_ssrf_skill: str = "verify-ssrf",
     ):
         self._orch = orchestrator
         self.scan_skill = scan_skill
@@ -705,6 +706,23 @@ class OrchestratorPhases:
                 (
                     verify_idor_skill,
                     _builtin_risk_level(verify_idor_skill, idor.manifest.risk_level),
+                )
+            )
+        # M16：第四 verify skill 槽位（SSRF 带外回调验证是增强项，缺失不阻塞主链路）。
+        # 与其余三个槽位同纪律：未注册/未启用记 verify_skill_skipped 跳过。
+        ssrf = registry.get(verify_ssrf_skill)
+        if ssrf is None or not ssrf.enabled:
+            reason = "skill 未注册" if ssrf is None else "skill 未启用"
+            orchestrator.audit.record(
+                "verify_skill_skipped",
+                skill=verify_ssrf_skill,
+                reason=f"{reason}，跳过 SSRF 带外回调验证",
+            )
+        else:
+            self.verify_skills.append(
+                (
+                    verify_ssrf_skill,
+                    _builtin_risk_level(verify_ssrf_skill, ssrf.manifest.risk_level),
                 )
             )
 

@@ -1055,7 +1055,72 @@ Docker + Chromium，semi_auto 无人过滤）。判据可判性用最保守的**
 - `--live` 的 SSRF 臂（没有验证器 ⇒ 跑出来只会全是"未能判定"，是浪费与误导）；
 - 其他形似 SSRF 的对照形态（"参数被回显""参数被写日志""参数被存库"）——当前只有"只登记"一种，已记 AGENTS.md 限制 47 的残余。
 
+## 7.12 M16 落地注记（2026-09-29：verify-ssrf —— SSRF 的带外回调确认）
+
+> **本节的定位**：记录"第 4 类可确认漏洞"如何在不削弱任何红线的前提下落地，以及
+> **实现期被测试抓出的 4 个真实缺陷**——它们都只在"用真 listener 驱动 confirmed"时暴露。
+
+### 为什么必须是带外事实
+
+SSRF 与 sqli/xss/idor 的判定形态不同：它**没有可观测的响应差异**。目标是否替我们发了请求，
+答案**不在目标给我们的响应里**——响应里出现 callback URL 只是**反射**。故确认手段只能是
+带外二值事实：我们自己起的 listener **收到了**那次请求。这与 verify-xss 用"canary 执行事件"、
+verify-idor 用"双会话属性违反"是同一种纪律。
+
+### 三道防伪（缺一不可）
+
+| 机制 | 作用 |
+|---|---|
+| 每探针唯一 token（128 位随机 + `hmac.compare_digest`） | 伪造不可能；路径不含 token 的请求记 `ssrf_callback_ignored`，**不计命中** |
+| 交付证明（回取探测 URL，正文须含 token/nonce） | 证明目标当时收到的**就是**我们报告里那个地址 |
+| 随机地址对照探针（`<hex>.invalid`） | 命中只证明"服务端会代发请求"，**不确认**——防"目标自己访问了别的地址" |
+
+### 实现期被测试抓出的 4 个真实缺陷（都记在这里，省后来者）
+
+1. **注册的 token 与注入 URL 里的 token 不是同一个**（最严重）：循环外 `probe =
+   callback_url(..., new_token())` 生成 value，循环内又 `token = new_token()` 拿去注册 ⇒
+   "注册的"与"URL 里的"永远对不上，**confirmed 分支在生产里永不触发**。修法：token 从**实际
+   注入的字符串**里解析（单一真相源），取不到即 fail-closed。
+2. **`_ssrf_listener` 没用注入的 listener 工厂**：构造时存了 `ssrf_listener_factory` 却直接
+   `CallbackListener(...)`，导致测试注入的 listener 与实际使用者不是同一对象（token 注册在 A、
+   回调打到 B）。与 `browser_factory`/`idor_fetch` 的既有契约不一致。
+3. **对照探针的失败被计入 errored**：对照打的是**必须不可解析**的随机地址，它失败是**预期**
+   行为；计入 errored 后**每次**干净未命中都判 blocked，rejected 分支形同虚设。
+4. **注入的回调 URL 被 `check_scope` 当作目标**：`check_scope` 会从参数里提取所有 URL 形态目标，
+   于是把我们的回调地址（临时端口）按"端口不在授权范围"整条拒掉——scope 只授权 8080 时
+   **每个探针**都被拒。修法：进入前对 **asset** 过一次 scope（授权前置零放松），每个探测 URL
+   再做**同源自检**（scheme/host/port 必须与 asset 一致），对照探针豁免（它刻意指向随机主机）。
+
+**共同点**：这四处都**只在"真 listener 收到真请求"的测试下才暴露**——用替身判定时四条全部
+静默通过。这是"confirmed 路径必须由真回调驱动"这条测试纪律的直接价值。
+
+### 远程靶形态：告知地址与绑定地址解耦
+
+回调 listener 缺省只绑回环（本地靶够用）。目标是容器/远程主机时，**告知目标的地址**
+（如宿主 LAN IP）与**本机绑定地址**必须分开：混用会让 listener 直接 `gaierror` 绑不上
+（实弹踩到）。故 `PROOFHOUND_SSRF_CALLBACK_HOST`（告知）+ `PROOFHOUND_SSRF_CALLBACK_BIND`
+（绑定，缺省保守推断：名字可解析就绑该名、回环仍只绑回环；不可解析才退 `0.0.0.0` 并告警）。
+**另一处实测事实**：本机 dockerd 上 `host.docker.internal` **不解析**（`wget: bad address`），
+只能用宿主真实 IP（容器经 NAT 可达，实测回调源 IP `172.17.0.6`）。
+
+### 实弹验收（`scripts/demo_verify_ssrf.py`）
+
+目标 = 基准 fixture 的 E 族，**跑在容器里**、端口发布到宿主——目标必须是网络上真实可达的服务，
+不能是同进程替身。结果：两条真 SSRF 端点 → **CONFIRMED**（method `ssrf-callback-confirmed`、
+CVSS 5.3 代码算分、refs 3、四段式 4 步、回调源 IP 为容器网段）；形对照 `/d/ssrf-like` →
+**不被确认**（交付证明不成立 ⇒ blocked）。
+
+**一处如实说明的接缝**：baseline 走沙箱 httpx，而沙箱在 `proofhound-egress`（internal）里
+**够不到**宿主发布的端口，故脚本用预制 httpx 输出提供 baseline，其余步骤全部真实。
+要让 baseline 也走真沙箱，需给沙箱配到宿主的出口（属 M12/M13 部署面，见 AGENTS.md 限制 52）。
+
+### 本里程碑明确不做
+
+POST/表单 SSRF、header/JSON body 注入、无回调的盲 SSRF、协议/编码绕过变体、listener 鉴权、
+沙箱到宿主的出口配置。
+
 ## 8. 开发路线图
+
 
 
 | 里程碑 | 内容 | 验收标准 |

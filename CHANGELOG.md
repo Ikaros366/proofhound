@@ -6,7 +6,61 @@
 
 ## [未发布]
 
-M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c / M15（内部消化，按维护者要求**不 bump 版本号**：`0.2.0` 保持不变）。
+M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c / M15 / M16（内部消化，按维护者要求**不 bump 版本号**：`0.2.0` 保持不变）。
+
+### 变更（M16 SSRF 两步走·第二步：verify-ssrf 垂直切片）
+
+**做了什么**：把 M15 放开候选的 SSRF 建成**第 4 类可确认漏洞**——确认手段只有一个：
+**回调 listener 收到请求**（带外二值事实）。
+
+- **新模块** `proofhound/verify/ssrf.py`（first-party 纯 stdlib，定位同 `verify/idor.py`）：
+  `CallbackListener`（宿主进程内，缺省只绑回环）+ 判定纯函数 `judge` + 交付证明
+  `token_delivered` + token/nonce 与回调 URL 构造。
+- **确认铁律**：目标响应里的 callback URL 反射、状态码、耗时一律**不是**证据——SSRF 的
+  答案不在目标给我们的响应里。reflected 的 callback URL 只是反射。
+- **三道防伪**：每探针唯一 token（128 位随机 + 常量时间比对；路径不含 token 的请求记
+  `ssrf_callback_ignored`，不计命中）· 交付证明（回取探测 URL，正文须含 token/nonce）·
+  随机地址对照探针（`<hex>.invalid`，命中只证明「服务端会代发请求」，**不确认**）。
+- **判定分界（宁漏勿滥）**：命中 → confirmed；干净未命中 + 交付证明成立 → rejected（确定性
+  真阴性，零 LLM 成本）；探针出错 / 交付证明不成立 / 前置不全 / listener 不可用 → blocked。
+- **走既有链路、无旁路**：`GATE_MATRIX` 加 ssrf 项（method 「与既有三类**互不染指**」，逐条断言
+  互斥）→ `skills/verify-ssrf/SKILL.md`（L2）→ `skills/profiles.py` 登记（L2 + mutating=False）→
+  编排层 `_verify_ssrf` → 证据门 → Verifier 终审（只收确定性结论 + 锚点，回调原文不进 prompt）→
+  CVSS 代码算分 → 四段式证据。红线零放松；listener **不常驻**（phase 收尾释放）。
+- **远程靶**：`PROOFHOUND_SSRF_CALLBACK_HOST`（告知目标的地址）与 `PROOFHOUND_SSRF_CALLBACK_BIND`
+  （本机绑定地址）**解耦**——两者混用会让 listener 直接绑不上（实弹踩到）。
+
+**为什么这样做**：M15 的第一步数据回答"发现侧够格、筛除侧不够格"——模型对 SSRF 语义识别
+稳定且零方差，但会把"参数名像 SSRF 而服务端并不取数"的端点误报。这类误报**恰是行为验证
+能确定性回答、纯语义判断回答不了**的（回调收没收到请求）。故第二步不是"锦上添花"，而是
+让 M15 那批候选**有可能离开 Hypothesis** 的唯一合法门径。
+
+**测试**：新增 `tests/test_ssrf.py` **47** 个（纯函数 20 / 真 listener 11 / 编排层 16），
+其中 confirmed 路径由**真 listener 收到真请求**驱动；旧 1076 全绿（共 **1125 passed / 2 skipped**）。
+**披露的旧测试改动 1 处**：`test_ssrf_is_hypothesis_only_no_confirmed_channel` 随第二步落地
+**意图反转**并更名 `test_ssrf_confirmed_requires_callback_method_only`（原断言"ssrf 不在矩阵内、
+过门恒不过"，现断言"矩阵内有且仅有回调确认这一条 method，且缺行为证据/缺 verification 一律
+不过门"；原意图由后者加强承接）。
+
+**实弹验收** `scripts/demo_verify_ssrf.py`：目标 = 基准 fixture 的 E 族，**跑在容器里**、端口
+发布到宿主（目标必须网络上真实可达，不能是同进程替身）。两条真 SSRF 端点 → **CONFIRMED**
+（method=`ssrf-callback-confirmed`、CVSS 5.3 代码算分、refs 3、四段式 4 步；回调源 IP 为容器
+网段 `172.17.0.6`）；形对照 `/d/ssrf-like` → **不被确认**（交付证明不成立 ⇒ blocked）。
+**一处如实说明的接缝**：baseline 走沙箱 httpx，而沙箱在 internal 出口网络里够不到宿主发布的
+端口，故实弹脚本用预制 httpx 输出提供 baseline，其余步骤全部真实（已写在脚本 docstring 与
+AGENTS.md 限制 52，不得读作"全链路无接缝"）。
+
+**实现期发现并修掉的 4 个真实缺陷**（都只在"用真 listener 驱动 confirmed"的测试下才暴露，
+已全部记入 `docs/design.md` §7.12）：① **注册的 token 与注入 URL 里的 token 不是同一个**
+（循环外生成 value、循环内另生成 token）⇒ confirmed 分支**在生产里永不触发**；② `_ssrf_listener`
+**没用注入的 listener 工厂** ⇒ token 注册与回调落在两个对象上；③ 对照探针的失败被计入 errored ⇒
+每次干净未命中都判 blocked、rejected 分支不可达；④ **注入的回调 URL 被 `check_scope` 当作目标**
+（端口不在授权范围）⇒ 每个探针都被 scope 拒掉，改为"asset 过 scope + 探针同源自检"。
+
+**明确不做（诚实边界）**：POST/表单 SSRF（`form_page` 候选直接判 blocked）、header/JSON body
+注入、无回调的盲 SSRF、协议/编码绕过变体（`gopher`/`dict`/`@`/十进制 IP 等）、listener 鉴权、
+给沙箱配到宿主的出口。
+
 
 ### 变更（M15 SSRF 两步走·第一步：只放开候选 + 基准加 SSRF 端点族）
 

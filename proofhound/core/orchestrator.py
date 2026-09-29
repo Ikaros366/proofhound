@@ -39,6 +39,7 @@ tools/build.py 拼装 argv（红线 1：LLM 不碰命令）→ SandboxRunner 执
 from __future__ import annotations
 
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -108,6 +109,27 @@ from proofhound.verify.idor_control import (
     judge_ownership as idor_judge_ownership,
 )
 from proofhound.verify.prefilter import screen as prefilter_screen
+from proofhound.verify.prefilter import with_query_param as prefilter_with_query_param
+from proofhound.verify.ssrf import (
+    CALLBACK_PATH_PREFIX,
+    NON_LOOPBACK_WARNING,
+    SSRF_CONFIRMED_METHOD,
+    CallbackListener,
+    SsrfListenerError,
+)
+from proofhound.verify.ssrf import callback_url as ssrf_callback_url
+from proofhound.verify.ssrf import fetch as ssrf_fetch_default
+from proofhound.verify.ssrf import is_loopback_host as ssrf_is_loopback_host
+from proofhound.verify.ssrf import judge as ssrf_judge
+from proofhound.verify.ssrf import new_nonce_host as ssrf_new_nonce_host
+from proofhound.verify.ssrf import new_token as ssrf_new_token
+from proofhound.verify.ssrf import nonce_url as ssrf_nonce_url
+from proofhound.verify.ssrf import resolve_callback_bind as ssrf_resolve_callback_bind
+from proofhound.verify.ssrf import resolve_callback_host as ssrf_resolve_callback_host
+from proofhound.verify.ssrf import resolve_callback_port as ssrf_resolve_callback_port
+from proofhound.verify.ssrf import summary_for_verifier as ssrf_summary_for_verifier
+from proofhound.verify.ssrf import token_delivered as ssrf_token_delivered
+from proofhound.verify.ssrf import url_host_port as ssrf_url_host_port
 from proofhound.verify.verifier import Verifier, VerifierError
 
 _OUTPUT_SAMPLE_LIMIT = 4096  # 失败分类的输出采样上限（字节）
@@ -183,6 +205,40 @@ class _TriageCandidate(NamedTuple):
     severity: str
     evidence_kind: str
     source: str  # M8a：web_probe / get_param / form_page（triage_completed 摘要分量）
+
+
+def _callback_token_in(value: str) -> str:
+    """从注入的参数值里取回调 token（与 URL 同一真相源的唯一取法）。
+
+    M16：token **必须**从实际注入的字符串里解析，而不是另生成一个——否则
+    "注册的 token" 与 "URL 里的 token" 会对不上，confirmed 分支永远不触发
+    （实现期埋点实测的严重缺陷）。取不到返回空串，调用方 fail-closed。
+    """
+    parsed = urlparse(value)
+    path = parsed.path
+    marker = f"{CALLBACK_PATH_PREFIX}"
+    if not path.startswith(marker):
+        return ""
+    token = path[len(marker):]
+    # 变体形如 ``<callback>&param=<callback>``：取第一段即可
+    return token.split("&", 1)[0].strip()
+
+
+def _origin_of(url: str) -> tuple[str, str, int] | None:
+    """URL 的 origin（scheme, host, port）——端口按 scheme 补缺省值。
+
+    M16：ssrf 探针的同源自检用它。返回 None 表示无法解析（调用方 fail-closed）。
+    """
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.hostname:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    return parsed.scheme.lower(), parsed.hostname.lower(), port
 
 
 def _query_param_keys(url: str) -> list[str]:
@@ -342,6 +398,8 @@ class Orchestrator:
         tool_images: dict | None = None,
         browser_factory=None,
         idor_fetch=None,
+        ssrf_listener_factory=None,
+        ssrf_fetch=None,
         triage_rules: bool = True,
         triage_model: bool = False,
         verify_prefilter: bool = False,
@@ -372,6 +430,13 @@ class Orchestrator:
         # M8c：verify-idor 的取数注入口子（测试给罐头 fetch；None 时用
         # verify/idor.py 的真实 stdlib fetch）
         self._idor_fetch = idor_fetch if idor_fetch is not None else idor_fetch_default
+        # M16：verify-ssrf 的两个注入口子——回调 listener（测试给假 listener）与
+        # 宿主侧探测取数（测试给罐头 fetch）；None 时用 verify/ssrf.py 的真实实现。
+        self._ssrf_listener_factory = ssrf_listener_factory
+        self._ssrf_fetch = ssrf_fetch if ssrf_fetch is not None else ssrf_fetch_default
+        # 回调 listener 按 finding 分桶（每条候选一个独立 listener + 独立 token 空间），
+        # phase 收尾统一释放（与 _close_browser 同范式）
+        self._ssrf_listeners: dict[str, CallbackListener] = {}
         # M9c①：triage 候选来源开关。model 侧**缺省关闭**——默认行为因此
         # 与 M3a 起逐字节等价（tests/test_triage.py 断言「triage 不调 LLM」
         # 由 triage_model=False 保证）；规则侧保留为快速路径与兜底。
@@ -754,6 +819,9 @@ class Orchestrator:
             "verify-xss": (frozenset({"xss"}), self._verify_xss),
             # M8c：双会话属性验证（IDOR 唯一确认门径）
             "verify-idor": (frozenset({"idor"}), self._verify_idor),
+            # M16：带外回调确认（SSRF 唯一确认门径）——宿主 listener 收到
+            # 含本次 token 的请求才算；目标响应内容永不作为证据
+            "verify-ssrf": (frozenset({"ssrf"}), self._verify_ssrf),
         }
 
     def verify_skill_coverage(self, skill_name: str = "verify-sqli") -> frozenset[str]:
@@ -811,6 +879,7 @@ class Orchestrator:
                 processed.append(finding)
         finally:
             self._close_browser()  # M8b：phase 收尾释放浏览器（若本 phase 建过）
+            self._close_ssrf_listeners()  # M16：回调 listener 同样不常驻
         extra = (
             {"prefilter_advisory": self._prefilter_advisory}
             if self.verify_prefilter
@@ -1255,7 +1324,424 @@ class Orchestrator:
         # 6. 证据门 → Verifier 终审 → 终态（与 verify-sqli 同一收尾）
         return self._gate_and_review(finding, skill, store)
 
+    def _ssrf_listener(self, finding_id: str) -> CallbackListener:
+        """懒建并缓存本 finding 的回调 listener（M16）。
+
+        缺省只绑回环：回调地址要对目标**回连可达**才有意义。远程靶必须显式设
+        ``PROOFHOUND_SSRF_CALLBACK_HOST``（非回环时打印醒目告警）——本函数不做
+        任何隐式放大绑定面的动作（fail-closed）。
+
+        测试经 ``ssrf_listener_factory`` 注入（与 ``browser_factory``/``idor_fetch``
+        同款契约：**注入了就用注入的**）；None 时才建真实 listener。少了这一条，
+        注入的替身与实际使用者不是同一对象，token 注册与回调会分别落在两个
+        listener 上，confirmed 分支永远走不通（实现期实测踩到）。
+        """
+        existing = self._ssrf_listeners.get(finding_id)
+        if existing is not None:
+            return existing
+        if self._ssrf_listener_factory is not None:
+            listener = self._ssrf_listener_factory()
+        else:
+            # 「告知目标的地址」与「本机绑定地址」解耦：容器/远程靶要告知它够得着的
+            # 名字（如 host.docker.internal），而本机只能绑自己的接口（不可解析时退
+            # 0.0.0.0）。两者混用会让 listener 直接 bind 失败（实弹实测）。
+            advertised = ssrf_resolve_callback_host()
+            bind_host = ssrf_resolve_callback_bind(advertised)
+            port = ssrf_resolve_callback_port()
+            listener = CallbackListener(host=bind_host, port=port)
+        listener.start()  # 不可用即抛 SsrfListenerError
+        bound_host, bound_port = listener.bound_address
+        if not ssrf_is_loopback_host(bound_host):
+            print(
+                NON_LOOPBACK_WARNING.format(host=bound_host, port=bound_port),
+                file=sys.stderr,
+                flush=True,
+            )
+        self._ssrf_listeners[finding_id] = listener
+        return listener
+
+    def _close_ssrf_listeners(self) -> None:
+        """释放 verify phase 建过的全部回调 listener；异常吞咽（不遮蔽主链路）。"""
+        for listener in list(self._ssrf_listeners.values()):
+            try:
+                listener.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._ssrf_listeners.clear()
+
+    def _verify_ssrf(self, finding: Finding, skill, store: FindingStore) -> str:
+        """verify-ssrf SOP（skills/verify-ssrf/SKILL.md）的确定性执行（M16）。
+
+        确认铁律：**仅回调 listener 收到含本次探针 token 的请求可确认**（带外二值
+        事实）。目标响应里的 callback URL 反射、状态码、耗时一律不是证据——SSRF 的
+        "答案不在目标给我们的响应里"。
+
+        判定（`verify/ssrf.py::judge`，纯函数，宁漏勿滥）：
+
+        - 命中 token → REPRODUCED → 证据门 → Verifier；
+        - **干净未命中 + 交付证明成立** → REJECTED（真阴性）；
+        - 探针出错 / 交付证明不成立 / 前置不全 / listener 不可用 → blocked
+          （覆盖不全，绝不驳回）。
+
+        防伪三道（缺一不可）：① 每探针唯一 token + 常量时间比对（不带 token 的
+        请求记 `ssrf_callback_ignored`，不计命中）；② 交付证明（回取探测 URL，正文
+        须含 token/nonce ⇒ 证明目标收到的就是我们报告里那个地址）；③ 随机地址对照
+        探针（不含本参数的地址命中，只证明「服务端会代发请求」，**不确认**）。
+
+        请求构造、payload 拼接、判定全是确定性代码（红线 1）；唯一 LLM 调用是收尾
+        的 Verifier 终审。
+        """
+        session = self._session()
+        if session is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="scope 未配置预置会话（session），无法做带会话 baseline",
+            )
+            return "blocked"
+        scope = getattr(self.runner, "scope", None)
+        if scope is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="runner 未挂 scope，ssrf 验证缺 scope 防线（fail-closed）",
+            )
+            return "blocked"
+        if not finding.param:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="ssrf 候选缺 param，无法构造回调 payload（fail-closed）",
+            )
+            return "blocked"
+        if CRAWL_FORM_EVIDENCE_KIND in finding.evidence_kinds:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="POST 表单型候选的 ssrf 验证未实现（本轮只覆盖 GET query 参数）",
+            )
+            return "blocked"
+
+        # 1. scope 授权前置（红线 5）：目标 asset 必须已授权。
+        # 注意：**不**对探测 URL 逐条 check_scope——探针的 query 里携带的是我们的
+        # 回调地址（基础设施，非目标），check_scope 会把它当目标提取并按端口拒掉
+        # （实测会让每个探针都被拒）。探测 URL 的"不越界"改由下面的同源自检保证。
+        decision = check_scope(scope, [finding.asset])
+        if not decision.allowed:
+            self.audit.record(
+                "verify_scope_rejected",
+                finding_id=finding.id,
+                violations=decision.violations,
+            )
+            return "blocked"
+
+        # 2. 回调 listener（不可用即 blocked；回调地址须与绑定地址一致）
+        try:
+            listener = self._ssrf_listener(finding.id)
+        except SsrfListenerError as exc:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=f"回调 listener 不可用（fail-closed）: {exc}",
+            )
+            return "blocked"
+        bound_host, bound_port = listener.bound_address
+        # 回调地址里的 host 用**告知地址**（目标回连时用的名字），端口用实际绑定端口
+        advertised_host = (
+            ssrf_resolve_callback_host()
+            if self._ssrf_listener_factory is None
+            else bound_host
+        )
+        callback_base = ssrf_callback_url(
+            advertised_host, bound_port, ssrf_new_token()
+        )
+        resolved = ssrf_url_host_port(callback_base)
+        if resolved != (advertised_host, bound_port):
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=(
+                    "回调地址自检失败：构造出的回调地址与告知目标的地址不一致"
+                    f"（{resolved} != {(advertised_host, bound_port)}）"
+                ),
+            )
+            return "blocked"
+
+        # 2. 带会话 baseline（与 verify-sqli/verify-xss 同一可达性对照）
+        baseline = self._run_baseline(finding, session)
+        if baseline is None:
+            return "blocked"  # 审计已在 _run_baseline 内记录
+        baseline_ref, baseline_status = baseline
+
+        # 3. 逐探针（全部只读 GET；每个 URL 都做同源自检，见 run_probe）
+        asset_origin = _origin_of(finding.asset)
+        nonce_host = ssrf_new_nonce_host()
+        probes: list[dict] = []
+        deliveries: list[tuple[str, str]] = []  # (marker, url) 供交付证明回取
+        errored = False
+        hit = None  # tuple[token, variant, records] | None
+
+        def run_probe(
+            seq: int, variant: str, url: str, token: str, *, infrastructure: bool = False
+        ):
+            """发一次只读探测并登记 token；返回 (response, records)。
+
+            ``infrastructure=True`` 用于**对照探针**（随机不可解析地址）：它的失败是
+            预期行为（目标正确地没解析它），**不计入 errored**——否则每次干净未命中都
+            会被判 blocked，rejected 分支永远不可达（实现期发现的设计缺陷）。
+            它的失败仍如实记入 probes，供取证。
+            """
+            nonlocal errored
+            # 同源自检：**载荷**探测 URL 必须与已授权的 asset 完全同源（scheme/host/port）。
+            # 不同源意味着构造出了指向别处的 URL —— fail-closed 停（红线 5）。
+            # 对照探针（infrastructure=True）刻意指向随机主机，不受本检约束。
+            if not infrastructure and _origin_of(url) != asset_origin:
+                self.audit.record(
+                    "verify_scope_rejected",
+                    finding_id=finding.id,
+                    violations=[
+                        "探测 URL 与 asset 不同源："
+                        f"{_origin_of(url)} != {asset_origin}"
+                    ],
+                )
+                return None, []
+            listener.register(token)
+            response = self._ssrf_fetch(url, session)
+            records = [r.to_dict() for r in listener.hits(token)]
+            probes.append(
+                {
+                    "seq": seq,
+                    "variant": variant,
+                    "url": url,
+                    "token": token,
+                    "status": response.status,
+                    "error": response.error,
+                    "callback_hits": len(records),
+                    "elapsed_s": round(response.elapsed_s, 3),
+                }
+            )
+            self.audit.record(
+                "ssrf_probe_attempt",
+                finding_id=finding.id,
+                seq=seq,
+                variant=variant,
+                url=url,
+                token=token,
+                status=response.status,
+                error=response.error is not None,
+                callback_hits=len(records),
+            )
+            if response.error is not None and not infrastructure:
+                errored = True
+            deliveries.append((token, url))
+            return response, records
+
+        # 3a. 随机地址对照探针（不含本参数的地址：命中≠SSRF）
+        control_nonce = ssrf_new_token()
+        control_url = ssrf_nonce_url(bound_host, bound_port, nonce_host, control_nonce)
+        _resp, control_records = run_probe(
+            0, "control-random-host", control_url, control_nonce, infrastructure=True
+        )
+        control_hit = bool(control_records)
+
+        # 3b. 回调 payload 变体（≤2 条：纯回调 URL；回调 URL + 同名参数二次拼接）。
+        # 每轮**现生成**回调地址，并从该地址里取 token —— token 与注入 URL 必须是
+        # 同一真相源。曾因"循环外生成 value、循环内另生成 token"导致注册的 token 与
+        # URL 里的 token 不一致，confirmed 分支永不触发（埋点实测的严重缺陷）。
+        for seq, variant in enumerate(
+            ("callback-url", "callback-url+decoy-param"), start=1
+        ):
+            callback = ssrf_callback_url(
+                advertised_host, bound_port, ssrf_new_token()
+            )
+            value = (
+                callback
+                if variant == "callback-url"
+                else callback + "&" + finding.param + "=" + callback
+            )
+            token = _callback_token_in(value)
+            if not token:
+                self.audit.record(
+                    "verify_blocked",
+                    finding_id=finding.id,
+                    reason=(
+                        "内部一致性失败：注入的 payload 里取不到回调 token"
+                        "（fail-closed，绝不拿不匹配的 token 继续跑）"
+                    ),
+                )
+                return "blocked"
+            url = prefilter_with_query_param(finding.asset, finding.param, value)
+            _resp, records = run_probe(seq, variant, url, token)
+            if records:
+                hit = (token, variant, records)
+                self.audit.record(
+                    "ssrf_callback_received",
+                    finding_id=finding.id,
+                    variant=variant,
+                    token=token,
+                    hits=len(records),
+                    sources=sorted({r.get("source_ip", "") for r in records}),
+                )
+                break
+
+        # 4. 交付证明：回取每个探测 URL，正文里找我们的标记（token 或 nonce）
+        delivery: list[dict] = []
+        delivered_markers = 0
+        for marker, url in deliveries:
+            resp = self._ssrf_fetch(url, session)
+            ok = resp.error is None and ssrf_token_delivered(resp, marker)
+            delivered_markers += 1 if ok else 0
+            delivery.append(
+                {
+                    "marker": marker,
+                    "url": url,
+                    "status": resp.status,
+                    "error": resp.error,
+                    "marker_found": ok,
+                }
+            )
+        delivered = delivered_markers > 0
+
+        # 5. 确定性判定（纯函数；全部依据落盘）
+        judgment = ssrf_judge(
+            callback_hit=hit is not None,
+            hit_requests=hit[2] if hit else [],
+            hit_variant=hit[1] if hit else "",
+            control_hit=control_hit,
+            delivered=delivered,
+            probes=probes,
+            probes_errored=errored,
+            ignored=[r.to_dict() for r in listener.ignored],
+        )
+        callbacks_path = self.evidence_dir / f"ssrf_{finding.id}_callbacks.jsonl"
+        callbacks_path.write_text(
+            "".join(
+                json.dumps(record, ensure_ascii=False) + "\n"
+                for record in (
+                    *judgment.hit_requests,
+                    *[
+                        {"ignored": True, **record}
+                        for record in judgment.ignored_requests
+                    ],
+                )
+            ),
+            encoding="utf-8",
+        )
+        j_path = self.evidence_dir / f"ssrf_{finding.id}_judgment.json"
+        j_path.write_bytes(
+            redact_bytes(
+                (
+                    json.dumps(
+                        {
+                            "finding_id": finding.id,
+                            "asset": finding.asset,
+                            "param": finding.param,
+                            "callback_listener": f"{bound_host}:{bound_port}",
+                            "delivery_proof": delivery,
+                            **judgment.to_dict(),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+                session.secret_values(),
+            )
+        )
+        self.audit.record(
+            "ssrf_callback_judged",
+            finding_id=finding.id,
+            verdict=judgment.verdict,
+            callback_hits=len(judgment.hit_requests),
+            control_hit=judgment.control_hit,
+            delivered=judgment.delivered,
+            probes=len(judgment.probes),
+            ignored=len(judgment.ignored_requests),
+        )
+
+        # 6. blocked：覆盖不全，**不驳回**（Finding 停在 Hypothesis）
+        if judgment.verdict == "blocked":
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="ssrf 判定未能完成（覆盖不全，不驳回）: "
+                + "；".join(judgment.reasons),
+            )
+            return "blocked"
+
+        # 7. rejected：干净未命中 + 交付证明成立（确定性真阴性，零额外 LLM 成本）
+        if judgment.verdict == "rejected":
+            finding.transition(
+                FindingState.REJECTED,
+                actor=skill.name,
+                reason="；".join(judgment.reasons) + f"（判定依据见 {j_path.name}）",
+            )
+            store.append(finding)
+            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+            return "rejected"
+
+        # 8. confirmed：回调命中 → 证据入包（behavioral + 四段式）
+        cookie_mark = secret_marker(session.cookie_header())
+        sources = sorted(
+            {r.get("source_ip", "") for r in judgment.hit_requests if r.get("source_ip")}
+        )
+        agents = sorted(
+            {r.get("user_agent", "") for r in judgment.hit_requests if r.get("user_agent")}
+        )
+        finding.verification = Verification(
+            method=SSRF_CONFIRMED_METHOD,
+            evidence_refs=[
+                baseline_ref,
+                str(callbacks_path),
+                str(j_path),
+            ],
+            baseline_diff=(
+                f"带会话 baseline {baseline_status}（认证有效，非登录跳转）；"
+                f"回调 listener 绑定 {bound_host}:{bound_port}，收到 "
+                f"{len(judgment.hit_requests)} 次含本次探针 token 的请求"
+            ),
+            claim=f"参数 {finding.param} 使服务端向外部地址发起请求",
+            expected="我们控制的回调地址应收到一次由目标服务端发起的请求（带本次探针 token）",
+            actual=(
+                f"listener 收到 {len(judgment.hit_requests)} 次回调（命中变体 "
+                f"{judgment.hit_variant}；来源 IP {sources or '未知'}；"
+                f"UA {agents or '未提供'}）；请求原文见 {callbacks_path.name}"
+            ),
+            reproduction_steps=[
+                f"以预置会话（Cookie {cookie_mark}）GET {finding.asset} "
+                f"→ baseline {baseline_status}（认证有效）",
+                f"在该 URL 的 {finding.param} 参数注入回调地址（变体 {judgment.hit_variant}）",
+                f"回调 listener（{bound_host}:{bound_port}）收到请求："
+                f"{judgment.hit_requests[0]['request_line'] if judgment.hit_requests else ''}",
+                f"交付证明：目标响应正文含本次 token（见 {j_path.name} 的 delivery_proof）",
+            ],
+            verified_by=f"{skill.name}@{skill.manifest.version}",
+            verified_at=_utc_now(),
+        )
+        if BEHAVIORAL_EVIDENCE_KIND not in finding.evidence_kinds:
+            finding.evidence_kinds.append(BEHAVIORAL_EVIDENCE_KIND)
+        finding.transition(
+            FindingState.REPRODUCED,
+            actor=skill.name,
+            reason=(
+                f"回调确认：listener 收到 {len(judgment.hit_requests)} 次请求"
+                f"（{finding.param}，变体 {judgment.hit_variant}）"
+            ),
+        )
+        store.append(finding)
+
+        # 9. 证据门 → Verifier 终审 → 终态（与其余三类同一收尾，无旁路）
+        return self._gate_and_review(
+            finding,
+            skill,
+            store,
+            summary=ssrf_summary_for_verifier(
+                judgment, callback_host_port=f"{bound_host}:{bound_port}"
+            ),
+        )
+
     def _verify_idor(self, finding: Finding, skill, store: FindingStore) -> str:
+
         """verify-idor SOP（skills/verify-idor/SKILL.md）的确定性执行（M8c）。
 
         确认铁律：**仅双会话属性违反可确认**——B（reference/victim，对象
