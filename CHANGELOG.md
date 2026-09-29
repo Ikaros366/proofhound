@@ -6,7 +6,73 @@
 
 ## [未发布]
 
-M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c / M15 / M16（内部消化，按维护者要求**不 bump 版本号**：`0.2.0` 保持不变）。
+M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c / M15 / M16 / M16-a（内部消化，按维护者要求**不 bump 版本号**：`0.2.0` 保持不变）。
+
+### 变更（M16-a katana 从 JS 里翻接口 —— 只做发现侧）
+
+**做了什么**：给 katana 构造器开 JS 端点解析，让「JS 文件里写死的接口路径」进入发现链路。
+
+- **恒在项加 `-jc`**（JS 文件内端点解析/爬行）：与 `-fs rdn` / `-cos` 同级写死，
+  **不接受参数覆盖**——JS 里写死的接口是爬行面的一大块，不开等于整块看不见。
+- **`-jsl`（jsluice AST 解析）做成可选参数且缺省关**：官方标注 memory intensive，
+  实测**提取集合与 `-jc` 等价**而峰值内存近乎翻倍（见下），恒在开它等于白付内存换零增量。
+  需要更激进的解析时显式 `jsluice=True`。
+- **刻意不暴露 `-kf`**：官方要求 depth ≥ 3 才生效，而构造器 depth 缺省 2 ⇒ 给了也是
+  「开了可能静默不生效」；且它抓的是 robots.txt / sitemap.xml（字典/已知路径面，属 M16-b）。
+- **零新增解析器 / 零新增 Signal kind**：实测 katana 把 JS 里翻出的接口当**普通爬行记录**
+  输出，字段与静态链接**逐字段同形**（`request.endpoint` / `request.method` /
+  `response.status_code`）⇒ 现有 `parsers/katana_jsonl.py` 以「GET 且 URL 含 query」为判据
+  **直接吃下**，落成 `param-endpoint` Signal（M3d 起就在的通道）。
+- **triage 接线不动**：JS 端点走既有 `param-endpoint` 通道进 sqli/xss/idor 提示表，
+  命中即产候选（零提示表改动）。
+- **判定面一律不碰**：`GATE_MATRIX`、状态机铁律、Verifier 输入边界、红线 3/4 **零改动**；
+  这类端点若落 `web-exposure` 仍不可 Confirmed（不在矩阵内，铁律：纯 status-code 证据永不 Confirmed）。
+
+**为什么这样做**：维护者裁定的三条方向里，「JS 翻接口」是发现侧成本最低、收益最直接的一条
+（katana 本体就支持、请求量小、有据可依），故先切这一段交付；字典爆路径（M16-b）与
+「未授权访问」判定通道（M16-c）本轮**刻意不碰**。
+
+**实测（真靶 + 真沙箱，产物 `evidence/demo_katana_js/<ts>/`）**：JS 里写死 17 条接口路径的
+目标上，4 轮 katana 共提取 **16 条** JS 接口（每轮 13~14 条）→ 解析出 **13 条 `param-endpoint`
+Signal**（坏行 0）→ triage 产 **19 条候选**（sqli 11 / idor 7 / xss 1）；**加 `-jc` 前同一靶
+0 条 JS 接口**（只有 3 条静态链接）。
+
+**资源**（12MB 真实 bundle：vue/three/echarts/monaco/mermaid/chart.js；容器参数与沙箱硬化档
+逐项一致：512m / 1 CPU / `nobody` / 只读 rootfs / 64m tmpfs / `pids_limit=512`）：
+
+| 配置 | wall | docker-stats 峰值内存 | OOM |
+|---|---|---|---|
+| `-jc` | ~13~16s | **248MiB** | 否 |
+| `-jc -jsl` | ~13~16s | **447MiB** | 否 |
+
+⇒ **`mem_limit=512m` 够用但余量薄**（`-jsl` 已用掉 87%），**300s 超时充裕**（katana 有 ~13s
+固定开销地板，与本轮旗标无关）；`-jsl` **无可测耗时增量**。
+
+**scope 兜底（本轮最重要安全回归）**：JS 里含 3 个外域绝对 URL 时——katana stdout **68 条
+记录里 `request.endpoint` 含外域 = 0、`request.raw` 含外域 = 0**（外域只出现在 `response.body`
+的 JS 原文回显里，那是证据、不是候选来源）；靶侧访问日志 **68 条请求 Host 全部是种子域、
+外域 0 条**；再把 2 条外域记录**直接注入**解析器 + triage，两条均被判「域名不在授权列表内」
+丢弃、**新增外域候选 0 条**，并留 `triage_out_of_scope` 审计。
+另针对 AGENTS.md 限制 30 点名的「`-fs rdn` 对 **IP 型种子**不收敛」单独复测（本轮验收
+demo 用的正是 IP 型种子）：IP 种子 + `-jc -jsl` 跑 3 轮共 **21 条 endpoint**，
+`request.endpoint` / `request.raw` 含外域**均 0**、靶侧 21 条请求 Host 全为种子地址、
+外域 0 条 ⇒ 该不收敛面**本轮未复现**（限制 30 按原样保留，不作结论性修订）。
+
+**测试**：新增 `tests/test_katana_js.py` **9** 个（构造器 3 / jsluice 输出容错 3 / scope 兜底 3）；
+旧 1125 全绿（共 **1134 passed / 2 skipped**）。**披露的旧测试改动 1 处**：
+`test_katana.py::test_katana_argv_golden` 的期望 argv 插入 `-jc`——断言**意图不变**
+（仍是逐字面量锁死默认 argv 形态），只是把新增恒在旗标纳入锁定；不加这一项，golden 测试
+就锁不住 `-jc` 是否被后续改动误删。
+
+**如实记录的既有行为缺陷 1 处**（katana 1.7.0，非本轮引入，见 AGENTS.md 限制 53）：
+JS 爬取在 `-c 5` 下**每轮只吐 1~2 条**该 JS 里的接口，`-c 1` / `-d 3` 重测**不收敛**
+（6 种参数组合 × 3~5 次重复，命中随运行漂移）⇒ 单次 crawl 的 JS 发现**必然是子集**，
+报告里不得把「本轮没翻到」读作「不存在该接口」。模板串形态（`` `/api/x?id=${id}` ``）在
+`-jc`/`-jsl` 下**均 0 提取**。
+
+**明确不做（诚实边界）**：dirsearch 接入（M16-b）、任何判定通道（M16-c）、新增 triage 提示表、
+`GATE_MATRIX` / 状态机铁律 / Verifier 输入边界 / 红线 3 / 红线 4 的**任何**改动、
+「AI 判定」的任何预埋。
 
 ### 变更（M16 SSRF 两步走·第二步：verify-ssrf 垂直切片）
 

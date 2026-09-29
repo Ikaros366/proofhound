@@ -1119,6 +1119,125 @@ CVSS 5.3 代码算分、refs 3、四段式 4 步、回调源 IP 为容器网段�
 POST/表单 SSRF、header/JSON body 注入、无回调的盲 SSRF、协议/编码绕过变体、listener 鉴权、
 沙箱到宿主的出口配置。
 
+## 7.13 M16-a 落地注记（2026-09-29：katana 从 JS 里翻接口 —— 只做发现侧）
+
+维护者就「**未授权访问 / 接口暴露**」（JS 翻接口、字典爆路径 → 不用登录就能拿到信息）
+裁定三条方向，切成三段交付，本里程碑是第①段：
+
+| # | 决定 | 状态 |
+|---|---|---|
+| ① | **JS 翻接口：开**——katana 1.7.0 本体就支持（`-jc` / `-jsl` / `-kf`） | **M16-a（本次）** |
+| ② | **字典爆路径：用 dirsearch 接入**（`tools.d/` 本地预置 + manifest + 自带 `db/dicc.txt`） | M16-b（未开工） |
+| ③ | **判定「不需要登录就能拿到信息」：交 AI**——形态 B：独立 AI 判定器产结构化结论 + 行号锚点，**Verifier 仍只收结论与锚点** | M16-c（未开工） |
+
+③ 之所以不选「让 Verifier 直接看响应体」：红线 4 的独立性论证建立在**输入边界**上，
+让 Verifier 看响应体等于它与发现端共享输入，那条论证会失效；而形态 B 有现成先例
+（M9c 模型驱动 triage、M11b 确定性归属提取、M16 verify-ssrf 都是「独立件产结构化证据，
+Verifier 只收结论 + 锚点」）。
+
+### 施工点（三处；判定面一处未动）
+
+1. **`proofhound/tools/build.py` 的 katana 构造器**：恒在项加 **`-jc`**（JS 文件内端点
+   解析/爬行），与 `-fs rdn` / `-cos` 同级**写死、不接受参数覆盖**——JS 里写死的接口是
+   爬行面的一大块，不开等于整块看不见；实测对内存/耗时无可测影响（`-jc` 峰值 248MiB，
+   与不开 JS 解析同量级）。
+2. **`KatanaParams` 加可选参数 `jsluice`（`-jsl`），缺省关**：官方标注 memory intensive，
+   实测**提取集合与 `-jc` 等价**而峰值内存 248MiB → **447MiB**（12MB 真实 bundle、
+   沙箱同档 512m 容器）⇒ 恒在开它是**白付内存换零增量**。唯一实测增量是拼接串的
+   占位符形态（`-jc` 出 `?id=`、`-jsl` 出 `?id=EXPR`），两者都过不了下游键名启发式。
+   需要更激进的 JS 解析时显式 `jsluice=True`。
+3. **刻意不暴露 `-kf`/`-known-files`**：官方要求 depth ≥ 3 才生效，而构造器 depth 缺省 2
+   ⇒ 给了也是「开了可能静默不生效」，容易误导；且它抓的是 robots.txt / sitemap.xml
+   （字典/已知路径面），属 M16-b 而非本轮 JS 发现面。
+
+**未动**：`proofhound/tools/manifests/katana.yaml`（旗标属构造器、不属 manifest）；
+`proofhound/core/orchestrator.py` 的 triage 规则表与各类型上限；`GATE_MATRIX`；状态机铁律；
+Verifier 输入边界；红线 3 / 红线 4。
+
+### 零新增解析器：JS 端点与静态链接在输出里**逐字段同形**
+
+施工前的侦察结论（`katana -h` 只是旗标存在性，不足以推出解析结论）：在真靶上跑
+`-jc -jsonl`，JS 里翻出的接口以**普通爬行记录**出现，字段与静态链接完全一致——
+`request.method` / `request.endpoint` / `response.status_code`，同样带 `response.body`。
+⇒ 现有 `parsers/katana_jsonl.py` 以「GET 且 URL 含非空 query」为判据**直接吃下**，
+落成 M3d 起就在的 `param-endpoint` Signal，**无需新增解析器、无需新增 Signal kind**；
+triage 也走既有 `param-endpoint` 通道进 sqli/xss/idor 提示表，**零提示表改动**。
+
+实测（真靶 + 真沙箱，产物 `evidence/demo_katana_js/<ts>/`）：JS 里写死 17 条接口路径的
+目标上，4 轮 katana 共提取 **16 条** JS 接口 → 解析出 **13 条 `param-endpoint` Signal**
+（坏行 0）→ triage 产 **19 条候选**（sqli 11 / idor 7 / xss 1）；**加 `-jc` 前同一靶
+0 条 JS 接口**（只有 3 条静态链接）。旗标本身不产生候选，**是"JS 里的接口进了发现链路"
+这一步**产生了候选。
+
+### 资源实测：`-jsl` 贴近 512m 上限，但耗时无可测增量
+
+容器参数与 M12 沙箱硬化档**逐项一致**（`mem_limit=512m` / 1 CPU / `nobody` /
+只读 rootfs / 仅 `/tmp` 64m tmpfs / `cap_drop=ALL` / `no-new-privileges` /
+`pids_limit=512` / `nofile=4096`），输入为 12MB 真实 bundle：
+
+| 配置 | wall | docker-stats 峰值内存 | OOMKilled |
+|---|---|---|---|
+| `-jc` | ~13~16s | **248MiB** | 否 |
+| `-jc -jsl` | ~13~16s | **447MiB** | 否 |
+
+结论：**512m 够用但余量薄**（`-jsl` 已用掉约 87%）；**300s 超时充裕**——katana 有约
+13s 的固定开销地板，与本轮旗标无关，故不存在「JS 解析撑爆超时」的问题，也就**不需要**
+去动失败预算或写死更长的超时。
+
+### scope 兜底实测（本轮最重要的一条安全回归）
+
+JS 提取最危险的是**把范围带出去**（JS 里常写外域绝对 URL）。实测形态：靶面 JS 里放
+3 个外域绝对 URL（`evil.example.com` × 2、`cdn.evil-other.example.org` × 1），跑完核对：
+
+- **层①（`-fs rdn` 恒在）**：katana stdout **68 条记录里 `request.endpoint` 含外域 = 0、
+  `request.raw` 含外域 = 0**；外域主机名**只出现在 `response.body`**（katana 把 JS 原文
+  回显在记录里，那是证据、不是候选来源）。靶侧访问日志 **68 条请求的 Host 全部是种子域，
+  外域 0 条** ⇒ 外域**根本没被请求过**。
+  ⚠️ 记录一处**判据陷阱**（本里程碑实测踩到）：用「整行文本含外域主机名」当判据会**假阳性**
+  ——命中的是 `response.body` 的回显。判据必须落在**决定候选的字段**（`request.endpoint`）
+  与**实际发出的请求行**（`request.raw`）上。
+- **层②（`check_scope`）**：把 2 条外域记录**直接注入**解析器 + triage（模拟"万一越界记录
+  还是进来了"），两条均被判「域名不在授权列表内」丢弃、**新增外域候选 0 条**，
+  并留 `triage_out_of_scope` 审计。
+
+⇒ 两层都仍然成立，**JS 提取没有把范围带出去**。
+
+**并针对限制 30 单独复测**：AGENTS 限制 30 明写「`-fs rdn` 对 **IP 型种子**不收敛
+（v1.7.0 实测外域混进输出）」，而上面这轮验收用的正是 IP 型种子（`http://127.0.0.1:<port>/`）
+⇒ 必须把这个已知不收敛面单独测清楚，否则「scope 兜底成立」会被限制 30 直接反驳。
+实测：IP 型种子 + `-jc -jsl` 跑 3 轮共 **21 条 endpoint**，`request.endpoint` 含外域 **0**、
+`request.raw` 含外域 **0**（外域只出现在 3 条记录的 `response.body` 回显里）、
+靶侧 **21 条请求 Host 全为种子地址、外域 0 条**。即**该不收敛面本轮未复现**。
+限制 30 **按原样保留、不作结论性修订**——本轮换的是靶形态（DVWA 链接结构 vs 单页 JS），
+不足以否定限制 30 记录的观测，只说明本轮这条路径上两层兜底是成立的。
+
+### 实现期发现并如实记录的行为缺陷 1 处（katana 1.7.0，非本轮引入）
+
+JS 爬取在 `-c 5` 下**每轮只吐 1~2 条**该 JS 里的接口（17 条调用里），`-c 1`（串行）与
+`-d 3`（加深）重测**不收敛**——6 种参数组合 × 3~5 次重复，每次命中的接口**随运行漂移**，
+并集才逐步覆盖；`-jsl` 亦然。**含义**：单次 crawl 的 JS 发现**必然是子集**，报告里不得把
+「本轮没翻到」读作「不存在该接口」；要提全覆盖需多轮重爬取并集（成倍增加请求量与耗时）。
+模板串形态（反引号模板串 `/api/x?id=${id}`）在 `-jc` / `-jsl` 下**均 0 提取**。
+**未定位**：属 katana 内部调度行为，本轮只如实记录、不修（不属发现侧参数能解决的面）。
+详见 `AGENTS.md` 限制 53。
+
+### 测试与披露
+
+新增 `tests/test_katana_js.py` **9** 个：构造器 3（`-jc` 恒在 / `-jsl` 缺省关且可显式开 /
+永不产 `-kf`）、jsluice 输出容错 3（`EXPR` 占位符照常收下、字段缺失不炸、JS 端点落成
+`param-endpoint`）、scope 兜底 3（解析器不把外域改写成种子域、`check_scope` 拒外域、
+端到端「外域不产生候选」）。旧 1125 全绿（共 **1134 passed / 2 skipped**）。
+
+**披露的旧测试改动 1 处**：`test_katana.py::test_katana_argv_golden` 的期望 argv 插入
+`-jc`——断言**意图不变**（仍是逐字面量锁死默认 argv 形态），只是把新增恒在旗标纳入锁定；
+不加这一项，golden 测试就锁不住 `-jc` 是否被后续改动误删。
+
+### 本里程碑明确不做
+
+dirsearch 接入（M16-b）、任何判定通道（M16-c）、新增 triage 提示表、
+`GATE_MATRIX` / 状态机铁律 / Verifier 输入边界 / 红线 3 / 红线 4 的**任何**改动、
+「AI 判定」的任何预埋。
+
 ## 8. 开发路线图
 
 

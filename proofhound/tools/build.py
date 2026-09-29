@@ -162,14 +162,29 @@ class KatanaParams(BaseModel):
     """katana 爬行参数（对应 skills/recon-crawl SOP，L1 发现类）。
 
     恒在项（构造器写死，不接受参数覆盖）：``-jsonl -silent -nc -fs rdn``
-    （field-scope 限种子根域，三层 scope 纵深第一层）与
+    （field-scope 限种子根域，三层 scope 纵深第一层）、
     ``-cos "(?i)(logout|logoff|signout|signoff|phpids)"``（爬行安全排除，
     v1.7.0 实测：katana 会把状态变更类 GET 链接当普通链接抓取——logout
     销毁服务端会话导致带认证爬行中途失效；DVWA ``security.php?phpids=on``
     会为该会话开启 PHPIDS、后续攻击载荷全被拦截。注意 -cos 值不能含
-    逗号——旗标按逗号分片，``{m,n}`` 量词会被截断）；
+    逗号——旗标按逗号分片，``{m,n}`` 量词会被截断），以及
+    **``-jc``（JS 文件内端点解析/爬行，M16-a）**——理由见下；
     **永不产 ``-o``**——输出只走 stdout → 容器日志 → 证据落盘（红线 3）。
     depth/concurrency/rate_limit 设硬上限，防爬行面失控；不暴露 headless。
+
+    可选参数 ``jsluice``（``-jsl``，缺省 **关**，M16-a 实测后决定）：
+    jsluice 用 AST 解析 JS，官方标注 memory intensive。实测（12MB 真实
+    bundle、沙箱同档 512m 容器）峰值内存 447MiB vs 不开 248MiB，
+    而**端点提取集合与 ``-jc`` 等价**（6 组 JS 形态 × 3~5 次重复，并集
+    相同）⇒ 缺省不开：白付 ~200MiB 内存与 OOM 风险，换不到额外端点。
+    已知唯一增量是拼接串的占位符形态（``-jc`` 出 ``?id=``、``-jsl`` 出
+    ``?id=EXPR``），两者都过不了下游键名启发式，故不构成理由。
+    需要更激进的 JS 解析时显式开 ``jsluice=True``。
+
+    刻意**不暴露** ``-kf``/``-known-files``：官方要求 depth ≥ 3 才生效，
+    而本构造器 depth 缺省 2、硬上限 5——给一个"开了也可能静默不生效"的
+    参数容易误导；且它抓的是 robots.txt/sitemap.xml 这类已知文件，属
+    字典/已知路径面（M16-b），不属本轮 JS 发现面。
     """
 
     target: str = Field(min_length=1)  # 单种子 URL
@@ -177,6 +192,7 @@ class KatanaParams(BaseModel):
     concurrency: int = Field(default=5, ge=1, le=10)
     rate_limit: int | None = Field(default=None, gt=0, le=150)  # -rl，缺省不限
     with_session: bool = False  # 注入预置会话（-H Cookie/自定义头）
+    jsluice: bool = False  # -jsl：jsluice AST 解析（memory intensive，缺省关）
 
     @field_validator("target")
     @classmethod
@@ -202,6 +218,14 @@ def _build_katana(
     argv += ["-d", str(p.depth), "-c", str(p.concurrency)]
     if p.rate_limit is not None:
         argv += ["-rl", str(p.rate_limit)]
+    # M16-a：JS 文件内端点解析/爬行。**恒在项**（同 -fs rdn/-cos 的地位）：
+    # JS 里写死的接口路径是爬行面的一大块，不开等于整块看不见；
+    # 实测对内存/耗时无可测影响（见 KatanaParams docstring）。
+    argv.append("-jc")
+    # M16-a：jsluice AST 解析（可选、缺省关）。实测与 -jc 提取集合等价而
+    # 峰值内存近乎翻倍，故不写成恒在项——要更激进的解析须显式开。
+    if p.jsluice:
+        argv.append("-jsl")
     # 恒在项（写死）：-fs rdn 限种子根域；-cos 排除状态变更类 GET 链接
     # （logout 自毁会话、phpids 开关为目标开启 IDS）；值不含逗号
     # （-cos 旗标按逗号分片，量词 {m,n} 会被截断失效）
