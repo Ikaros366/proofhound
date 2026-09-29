@@ -37,6 +37,14 @@ M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c / M15（内部消�
 
 **测试影响**：新测试 **36** 个；旧 1040 全绿（共 **1076 passed / 2 skipped**，2 skip = 企业模板缺失，公开仓库固有形态）。**披露的旧测试改动 4 处**（逐条理由写在文件内）：① `test_allowed_types_are_exactly_the_verified_ones` → `..._declared_ones`，白名单断言加 ssrf——原意图"无验证器的类型不得有确认通道"由新增的 `test_ssrf_is_hypothesis_only_no_confirmed_channel` 承接并加强；② `test_crawl_signals_unchanged` 16→22 条（加族必然结果）；③ `test_endpoint_table_shape_unchanged` 16/12/4→22/17/5（分母变化必然结果，并新增族分量断言钉死 A/B/C/D 四族逐条未动）；④ 粗筛长度不变式参数化表加 `/d/ssrf-like` 一行（断言本体零改动）。
 
+**附带披露（提交 `7cbf700` 的组成）**：该提交除上列 M15 改动外，还**连带提交了两处上轮第三方评审**
+**插入的 README 文档改动**（提交信息未提及，此处补记）：① 《路线图与已知限制》一节补齐 **M10~M11** 与 
+**M12~M14** 两张里程碑表；② 修正已过期的状态行（原文写"M9a~M9d 尚未提交"，实为 M9a~M14 **均已提交**、
+当时有 4 个提交未推送）。两处均为**纯文档**、不涉及任何代码或判定语义，属上一轮工作的收尾，随本轮一并入库。
+
+**另需说明的时点**：本节的 M15 里程碑行（AGENTS.md）、已知限制 46/47 与本节全部内容，是**本轮（评审后）**
+**补写**的——首次提交 M15 时 AGENTS.md 尚未包含这些记录。补写只增不改，未修改 `7cbf700` 的任何代码或历史。
+
 ### 变更（M14 API 认证：HTTP Basic 单账户，deny-by-default）
 
 **做了什么**：控制台/API 从"无认证"改为 **HTTP Basic 单账户认证**，且 `create_app` **缺省启用**：
