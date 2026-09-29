@@ -70,7 +70,9 @@ def main() -> int:
     workspace = _make_workspace(demo_dir)
     print(f"[*] 演示工作区: {workspace}（skills -> 仓库符号链接）")
 
-    client = TestClient(create_app(workspace))
+    app = create_app(workspace)
+    # M14：API 认证缺省开启——脚本作为客户端如实带凭据（不绕过校验）
+    client = TestClient(app, headers=app.state.auth.basic_header())
 
     # ---- Step 1：skill 端点已移除（M9d）----
     print("\n" + "=" * 72 + "\nStep 1：断言 skill 管理端点已移除（M9d）\n" + "=" * 72)

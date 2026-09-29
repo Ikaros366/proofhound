@@ -12,7 +12,12 @@
   响应只回显 ``with_session: true``；
 - 错误统一：403 scope_violation / 402 budget_exceeded / 409 invalid_state /
   404 not_found，响应体 ``{"detail": {"error", "message"}}``；
-- 网络暴露红线（§5.9.3）：只监听 localhost/内网，严禁无认证暴露公网。
+- **HTTP Basic 单账户认证（M14）**：``create_app`` 缺省启用（deny-by-default），
+  覆盖含控制台首页与静态资源在内的全部路径；凭据由 :func:`auth.resolve_auth`
+  解析（环境变量 > ``.env`` > 仓库默认值），默认口令是公开的，故 ``__main__``
+  对「默认口令 + 非回环绑定」直接拒绝启动；
+- 网络暴露红线（§5.9.3）：只监听 localhost/内网；Basic 口令不经 TLS 加密，
+  多人访问须前置反向代理 + 登录认证，严禁直接暴露公网。
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from proofhound.autonomy import AutonomyGate, AutonomySwitchError, gate_matrix
+from proofhound.api.auth import REALM, ApiAuth, resolve_auth
 from proofhound.api.management import ManagementService
 from proofhound.api.models import (
     AutonomySwitchRequest,
@@ -111,8 +117,13 @@ def create_app(
     phases_factory=None,
     confirm_timeout: float = 300.0,
     env_file: str | Path | None = None,
+    auth: ApiAuth | None = None,
 ) -> FastAPI:
-    """创建 FastAPI 应用。``phases_factory``/``confirm_timeout`` 供测试注入。"""
+    """创建 FastAPI 应用。``phases_factory``/``confirm_timeout`` 供测试注入。
+
+    ``auth`` 缺省由 :func:`~proofhound.api.auth.resolve_auth` 解析（环境变量 >
+    ``.env`` > 仓库默认凭据）——**认证缺省开启**，不传即 HTTP Basic 生效。
+    """
     manager = EngagementManager(
         workspace_root,
         phases_factory=phases_factory,
@@ -122,6 +133,28 @@ def create_app(
     management = ManagementService(manager)  # M6a 管理面（skill/scope）
     app = FastAPI(title="ProofHound API", version="0.2.0")
     app.state.manager = manager
+    auth_config = auth or resolve_auth(workspace_root, env_file)
+    app.state.auth = auth_config
+
+    @app.middleware("http")
+    async def _require_auth(request: Request, call_next):
+        """M14：deny-by-default——含控制台首页与静态资源在内，全路径都要凭据。
+
+        ``Authorization`` 头只在此处读取用于常量时间比对，**不落审计、不落日志**；
+        401 响应体不回显任何提交内容（避免把尝试的口令回显进日志/浏览器）。
+        """
+        if not auth_config.accepts(request.headers.get("authorization")):
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "detail": {
+                        "error": "unauthorized",
+                        "message": "需要 HTTP Basic 认证",
+                    }
+                },
+                headers={"WWW-Authenticate": f'Basic realm="{REALM}"'},
+            )
+        return await call_next(request)
 
     @app.exception_handler(ApiError)
     async def _api_error_handler(_request: Request, exc: ApiError) -> JSONResponse:
@@ -140,6 +173,12 @@ def create_app(
             "version": app.version,
             "confirm_timeout": manager.confirm_timeout,
             "autonomy_gate": gate_matrix(),
+            # M14：控制台顶栏据此显示当前账户，并在仍用公开默认口令时提醒改掉
+            "auth": {
+                "enabled": True,
+                "user": auth_config.username,
+                "default_credentials": auth_config.is_default,
+            },
         }
 
     # ---- engagement 生命周期 ----

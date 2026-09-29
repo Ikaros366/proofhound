@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import functools
 import hashlib
 import threading
@@ -210,3 +211,44 @@ def report_evidence_dir(tmp_path):
     audit.record("demo_start", note="开始")
     audit.record("demo_end", note="结束")
     return directory
+
+
+# ---- M14：API 认证默认开启后的测试客户端凭据 ----
+
+DEFAULT_API_USER = "shangyun"
+DEFAULT_API_PASSWORD = "123456"
+
+
+def basic_auth_header(
+    user: str = DEFAULT_API_USER, password: str = DEFAULT_API_PASSWORD
+) -> str:
+    token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+@pytest.fixture(autouse=True)
+def api_credentials(monkeypatch):
+    """M14：让 API 认证在测试里**照常生效**，同时不给 9 个测试文件的 19 处 client
+    构造加样板。
+
+    - 固定 ``PROOFHOUND_API_USER/PASSWORD`` 环境变量：凭据判定不受本机 ``.env``
+      影响，测试因此可判定；
+    - 给 ``TestClient`` 注入默认 ``Authorization`` 头——这是**如实带上凭据**，
+      不是绕过校验。想测无凭据/错凭据的用例显式传 ``headers=...`` 覆盖，
+      或传 ``api_auth=False`` 关掉注入（见 ``tests/test_api_auth.py``）。
+    """
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("PROOFHOUND_API_USER", DEFAULT_API_USER)
+    monkeypatch.setenv("PROOFHOUND_API_PASSWORD", DEFAULT_API_PASSWORD)
+
+    original_init = TestClient.__init__
+
+    def patched_init(self, app, *args, **kwargs):
+        if kwargs.pop("api_auth", True):
+            headers = dict(kwargs.pop("headers", None) or {})
+            headers.setdefault("Authorization", basic_auth_header())
+            kwargs["headers"] = headers
+        return original_init(self, app, *args, **kwargs)
+
+    monkeypatch.setattr(TestClient, "__init__", patched_init)

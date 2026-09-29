@@ -1068,7 +1068,7 @@ def run_live_arm(
     workspace = _live_workspace(arm_dir, port)
     app = create_app(workspace, env_file=env_file, confirm_timeout=900.0)
     started = time.monotonic()
-    with TestClient(app) as client:
+    with TestClient(app, headers=app.state.auth.basic_header()) as client:
         created = client.post(
             "/api/engagements",
             json={

@@ -1176,10 +1176,23 @@ function renderScopes(view) {
 // ---- 启动 ----
 
 window.addEventListener('hashchange', route);
+
+// 顶栏认证状态（M14）：如实显示当前账户；仍在用公开默认口令时显式提示改掉。
+// 文案一律经 textContent 落地（本控制台既有纪律：禁 HTML 字符串注入）。
+function renderAuthNote(auth) {
+  const note = document.getElementById('auth-note');
+  if (!note || !auth) return;
+  const tail = ' · 勿暴露局域网/公网';
+  note.textContent = auth.default_credentials
+    ? `认证：${auth.user} · 默认口令（公开，建议改）${tail}`
+    : `认证：${auth.user}${tail}`;
+}
+
 (async () => {
   try {
     const h = await api('/api/health');
     confirmTimeoutSec = h.confirm_timeout || 300;
+    renderAuthNote(h.auth);
   } catch (err) { /* 健康检查失败不阻塞首屏，倒计时用回退值 */ }
   route();
 })();

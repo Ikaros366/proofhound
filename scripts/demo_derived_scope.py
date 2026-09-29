@@ -104,7 +104,7 @@ def _events(workspace: Path, eng_id: str) -> list[dict]:
 def _step1_acknowledgement_is_required(workspace: Path) -> None:
     print("\n" + "=" * 72 + "\nStep 1：只给 target、不给 scope 文件、不确认授权\n" + "=" * 72)
     app = create_app(workspace, phases_factory=_factory, confirm_timeout=5.0)
-    with TestClient(app) as client:
+    with TestClient(app, headers=app.state.auth.basic_header()) as client:
         resp = client.post("/api/engagements", json={"target": TARGET})
         _check(resp.status_code == 403, f"未确认授权应 403，实际 {resp.status_code}")
         detail = resp.json()["detail"]["message"]
@@ -119,7 +119,7 @@ def _step1_acknowledgement_is_required(workspace: Path) -> None:
 def _step2_derivation(workspace: Path) -> str:
     print("\n" + "=" * 72 + "\nStep 2：补上授权确认 → 自动派生 scope\n" + "=" * 72)
     app = create_app(workspace, phases_factory=_factory, confirm_timeout=5.0)
-    with TestClient(app) as client:
+    with TestClient(app, headers=app.state.auth.basic_header()) as client:
         resp = client.post(
             "/api/engagements",
             json={"target": TARGET, "acknowledge_authorization": True},
@@ -155,7 +155,7 @@ def _step3_audit(workspace: Path, eng_id: str) -> None:
 def _step4_persistence(workspace: Path, eng_id: str) -> None:
     print("\n" + "=" * 72 + "\nStep 4：重建 manager（模拟进程重启）后派生范围仍在\n" + "=" * 72)
     app2 = create_app(workspace, phases_factory=_factory, confirm_timeout=5.0)
-    with TestClient(app2) as client:
+    with TestClient(app2, headers=app2.state.auth.basic_header()) as client:
         manager = app2.state.manager
         eng = manager.get(eng_id)
         _check(eng.derived_scope is not None, "重启后派生范围丢失")
@@ -171,7 +171,7 @@ def _step4_persistence(workspace: Path, eng_id: str) -> None:
 def _step5_boundary_not_widened(workspace: Path) -> None:
     print("\n" + "=" * 72 + "\nStep 5：边界未被放宽（M9a 的真正风险点）\n" + "=" * 72)
     app = create_app(workspace, phases_factory=_factory, confirm_timeout=5.0)
-    with TestClient(app) as client:
+    with TestClient(app, headers=app.state.auth.basic_header()) as client:
         eng_id = client.post(
             "/api/engagements",
             json={"target": TARGET_DOMAIN, "acknowledge_authorization": True},
@@ -246,7 +246,7 @@ def _live(workspace: Path) -> None:
     )
 
     app = _create_app(workspace, phases_factory=default_phases_factory, confirm_timeout=5.0)
-    with TestClient(app) as client:
+    with TestClient(app, headers=app.state.auth.basic_header()) as client:
         resp = client.post(
             "/api/engagements",
             json={

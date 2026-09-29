@@ -317,7 +317,7 @@ def main() -> int:
     print(f"[*] API 应用已创建（TestClient，真实编排栈不 mock）：workspace={workspace}")
 
     try:
-        with TestClient(app) as client:
+        with TestClient(app, headers=app.state.auth.basic_header()) as client:
             cookies = dvwa.session_cookies()
             assert cookies.get("security") == "low", cookies
             cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())

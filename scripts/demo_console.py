@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -44,6 +45,8 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))  # 复用 seed_finding / demo_ver
 
 import httpx
 
+from proofhound.api.__main__ import loopback_warning
+from proofhound.api.auth import ApiAuth, resolve_auth, startup_blocker
 from proofhound.llm.client import LLMError
 from proofhound.llm.router import ModelRouter, Tier
 
@@ -131,12 +134,17 @@ def _start_server(workspace: Path, port: int, log_path: Path) -> subprocess.Pope
         ],
         stdout=log_fh, stderr=subprocess.STDOUT, cwd=str(REPO_ROOT),
     )
+    auth = resolve_auth(workspace)  # M14：就绪探针也要带凭据
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             raise DemoError(f"API 服务启动失败，日志见 {log_path}")
         try:
-            if httpx.get(f"http://127.0.0.1:{port}/api/health", timeout=2).status_code == 200:
+            probe = httpx.get(
+                f"http://127.0.0.1:{port}/api/health", timeout=2,
+                headers=auth.basic_header(),
+            )
+            if probe.status_code == 200:
                 return proc
         except httpx.TransportError:
             time.sleep(0.5)
@@ -157,28 +165,52 @@ def step0_static(client, rec) -> None:
     print("[*] GET / 200（text/html）+ app.css/app.js/api.js 全部 200")
 
 
-def step1_non_loopback_warning(port: int) -> None:
-    print("\n" + "=" * 72)
-    print("Step 1：非回环绑定醒目警告（--host 0.0.0.0）")
-    print("=" * 72)
-    # 端口已被主服务占用 → uvicorn 绑定失败立即退出；警告先于绑定打印，
-    # 全程不做任何真实局域网暴露
+def _run_non_loopback_cli(port: int):
+    """跑一次 --host 0.0.0.0 的 CLI 并收齐输出。
+
+    **只用于"默认口令必被拒绝启动"那一条**：该路径在 ``uvicorn.run`` 之前 return，
+    因此不会产生任何非回环监听。自定义口令的告警路径**不在这里跑**——原因见下。
+    """
     proc = subprocess.Popen(
         [
             sys.executable, "-m", "proofhound.api",
             "--workspace", ".", "--host", "0.0.0.0", "--port", str(port),
         ],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=str(REPO_ROOT),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        cwd=str(REPO_ROOT),
     )
     try:
         out, _ = proc.communicate(timeout=20)
     except subprocess.TimeoutExpired:
         proc.kill()
         out, _ = proc.communicate()
-    assert "警告" in out and "非回环" in out and "0.0.0.0" in out, out[:500]
-    first_lines = "\n".join(out.splitlines()[:7])
-    print(f"[*] 非回环绑定 stderr 输出（前 7 行）:\n{first_lines}")
-    print("[*] 醒目警告断言通过（且进程因端口占用未实际暴露局域网）")
+    return proc.returncode, out
+
+
+def step1_non_loopback_guard(port: int) -> None:
+    print("\n" + "=" * 72)
+    print("Step 1：非回环绑定护栏（M14——默认口令不再只告警，直接拒绝启动）")
+    print("=" * 72)
+
+    # ① 默认口令 + 0.0.0.0 ⇒ 在 uvicorn.run 之前退出（rc=2），全程零监听
+    rc, out = _run_non_loopback_cli(port)
+    assert rc == 2, f"默认口令下非回环绑定应拒绝启动（rc=2），实得 rc={rc}\n{out[:500]}"
+    assert "拒绝启动" in out and "0.0.0.0" in out, out[:500]
+    print("[*] 默认口令 + --host 0.0.0.0 → 拒绝启动（rc=2，未起任何监听），stderr 前 7 行:")
+    print("\n".join(out.splitlines()[:7]))
+
+    # ② 自定义口令 ⇒ 护栏放行，但告警必须打。
+    #    **故意不跑真服务**：本 demo 旧版假设"端口已被主服务占用 ⇒ 绑不上 ⇒ 不会真暴露"，
+    #    该假设在 Linux 上是错的——SO_REUSEADDR 允许 0.0.0.0:X 与 127.0.0.1:X 共存
+    #    （M14 实测：两个 bind 都成功），所以那样跑等于真把控制台挂到所有网卡上，
+    #    且断言只看输出文本、不会失败。这里改为只调纯函数断言逻辑与文案。
+    custom = ApiAuth("demo-operator", "demo-operator-pw", "env")
+    assert startup_blocker("0.0.0.0", custom) is None, "换了口令后不应被护栏拒绝"
+    warning = loopback_warning("0.0.0.0")
+    assert warning and "非回环" in warning and "0.0.0.0" in warning and "Basic" in warning
+    print("[*] 自定义口令 + --host 0.0.0.0 → 护栏放行；告警文案（仅断言，未起服务）:")
+    print("\n".join(warning.splitlines()[:7]))
+    print("[*] Step 1 断言通过（默认口令那次在 uvicorn.run 之前退出，非回环零监听）")
 
 
 def part_a(client, rec, cookie_header: str) -> str:
@@ -424,13 +456,16 @@ def main() -> int:
     cookie_header = "; ".join(f"{k}={v}" for k, v in dvwa.session_cookies().items())
     eng_a = eng_b = None
     try:
-        with httpx.Client(base_url=base_url, timeout=60) as client:
+        with httpx.Client(
+            base_url=base_url, timeout=60,
+            headers=resolve_auth(workspace).basic_header(),
+        ) as client:
             health = client.get("/api/health")
             rec.record("GET health", health)
             print(f"[*] 健康检查: {health.json()['status']} version={health.json().get('version')}"
                   f" confirm_timeout={health.json().get('confirm_timeout')}")
             step0_static(client, rec)
-            step1_non_loopback_warning(args.port)
+            step1_non_loopback_guard(args.port)
             eng_a = part_a(client, rec, cookie_header)
             if not args.skip_l2:
                 eng_b = part_b(client, rec, cookie_header)
