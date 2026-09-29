@@ -1414,9 +1414,17 @@ exposure 下**肯定**暴露（确认）。**同一份响应、两个漏洞类�
 `password` 但两视图不等价 ⇒ blocked（证明判据不落在关键词上）；两视图等价但正文无任何
 敏感词 ⇒ 仍 exposed（证明不做关键词判断）。
 
-**未做（如实标注）**：**真靶 / 真沙箱端到端 demo**——本轮的端到端证据是**替身件全链路
-测试**，**未见真实 HTTP**；「匿名看到部分敏感内容」这类真实暴露仍不可 Confirmed（维护者
-裁定的覆盖取舍，见限制 57）；POST/JSON body 型接口不在本轮范围。
+**真靶实测（`scripts/demo_verify_unauth.py`）**：真实 `ThreadingHTTPServer` + **真实
+stdlib HTTP**（靶侧日志核对 6 次请求，每端点 1 带会话 + 1 匿名）：① 有无会话同内容 ⇒
+Confirmed（CVSS 7.5、4 件证据）；② 匿名 302 ⇒ Rejected（零判定器调用）；③ 匿名公开页
+vs 已认证敏感 JSON（相似度 0.085）⇒ 停 Hypothesis + `verify_blocked` 审计。**中心主张
+复验**：判定器判 `sensitive=false` 时真暴露照样 Confirmed。**红线 3 核查**：
+`*_control.json` 均不含响应体原文，`*_sent.txt` 按设计含原文（判定器输入的可复核留痕，
+非 prompt）。
+
+**仍存的边界**：「匿名看到部分敏感内容」这类真实暴露仍不可 Confirmed（维护者裁定的
+覆盖取舍，见限制 57）；POST/JSON body 型接口不在本轮范围；判定器的**真实模型行为**
+未验（只验了契约：schema/fail-closed/脱敏/截断）——但它不构成证据，故不影响确认正确性。
 
 ### 7.15.7 本里程碑明确不做
 

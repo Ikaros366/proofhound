@@ -66,10 +66,27 @@ M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c / M15 / M16 / M16-a
 ——断言**意图不变**（仍是「每个 verify skill 只覆盖自己的 vuln_type、两两不相交」）。
 其余旧测试**零改动**。
 
+**真靶实测（`scripts/demo_verify_unauth.py`，产物 `evidence/demo_verify_unauth/<ts>/`）**
+
+真实 `ThreadingHTTPServer` + **真实 stdlib HTTP**（靶侧访问日志核对：**6 次请求**，
+每个端点各 1 次带会话 + 1 次匿名——匿名侧确实匿名）：
+
+| 形态 | 靶行为 | 实测终态 | 依据 |
+|---|---|---|---|
+| ① 真暴露 | 有无会话都返回**同一份**敏感 JSON | **Confirmed**（CVSS 7.5 high、4 件证据） | 逐字节相同 |
+| ② 受保护 | 匿名 302 → 登录页 | **Rejected** | 匿名被拒（零判定器调用） |
+| ③ 视图不同 | 匿名得公开首页、已认证得敏感 JSON | 停 **Hypothesis** + `verify_blocked` 审计 | 相似度 0.085 < 0.9 |
+
+**中心主张复验（真靶）**：判定器判 `sensitive=false`、`category=none`、`anchors=[]` 时，
+真暴露**照样 Confirmed** ⇒ 证据来自确定性前置门，不来自判定器。
+
+**红线 3 核查**：3 份 `*_control.json`（送 Verifier 的摘要）**均不含**响应体原文；
+`*_sent.txt` 按设计**含**原文——它是「判定器实际看到了什么」的**可复核留痕**，
+不是 prompt（红线 3 约束的是 Verifier 的输入）。
+
 **明确不做**：`web-exposure` 进入 `GATE_MATRIX`、把 AI 判定器结论当证据（撞铁律 2 与
 README 边界）、关键词/正则敏感表（既漏又误，且与「发现侧不靠关键词表」的立场冲突）、
-POST/JSON body 型接口、真靶真沙箱端到端 demo（本轮的端到端证据是替身件全链路测试，
-**未见真实 HTTP**——如实标注）。
+POST/JSON body 型接口。
 
 ### 变更（M16-b dirsearch 接入 + 速率/并发/时间窗授权语义）
 
