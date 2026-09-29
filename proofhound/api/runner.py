@@ -21,6 +21,7 @@ import json
 import os
 import threading
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -755,6 +756,22 @@ def _env_flag(name: str) -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def sandbox_hardening(environ: Mapping[str, str] | None = None) -> bool:
+    """沙箱隔离硬化档开关（M12）：``strict``（缺省）| ``relaxed``。
+
+    非法值 **fail-closed 抛错**（不静默回落到放宽档，与
+    ``PROOFHOUND_SANDBOX_EGRESS`` 同一纪律）。放宽档逐字节回到 M12 之前
+    的容器参数，仅用于硬化导致工具无法运行的受限环境。
+    """
+    env = os.environ if environ is None else environ
+    mode = (env.get("PROOFHOUND_SANDBOX_HARDENING") or "strict").strip().lower()
+    if mode not in {"strict", "relaxed"}:
+        raise ValueError(
+            f"PROOFHOUND_SANDBOX_HARDENING 非法取值 {mode!r}（可选 strict/relaxed）"
+        )
+    return mode == "strict"
+
+
 def default_phases_factory(rt: EngagementRuntime) -> OrchestratorPhases:
     """构建真实执行栈：Docker 沙箱 + skill registry + 模型路由 + 编排器。
 
@@ -788,11 +805,15 @@ def default_phases_factory(rt: EngagementRuntime) -> OrchestratorPhases:
     #
     # 逃生阀：某些环境无法创建 internal 网络或绑定网关代理（如受限的 Docker
     # 环境），可显式设 PROOFHOUND_SANDBOX_EGRESS=open 退回演示取向。默认严格。
+    #
+    # M12 隔离硬化档同样有逃生阀：PROOFHOUND_SANDBOX_HARDENING=relaxed 退回
+    # M12 之前的容器参数（默认 strict；非法值 fail-closed 抛错）。
     egress_mode = (os.environ.get("PROOFHOUND_SANDBOX_EGRESS") or "restricted").strip().lower()
     if egress_mode not in {"restricted", "open", "none"}:
         raise ValueError(
             f"PROOFHOUND_SANDBOX_EGRESS 非法取值 {egress_mode!r}（可选 restricted/open/none）"
         )
+    hardening = sandbox_hardening()
     runner = SandboxRunner(
         rt.scope,
         rt.audit,
@@ -802,6 +823,7 @@ def default_phases_factory(rt: EngagementRuntime) -> OrchestratorPhases:
             image="alpine:3.20",
             network_mode="bridge",
             egress=EgressPolicy(mode=egress_mode),
+            hardening=hardening,
         ),
         client=client,
     )

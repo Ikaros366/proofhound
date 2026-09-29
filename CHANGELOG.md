@@ -8,6 +8,30 @@
 
 M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c（内部消化，按维护者要求**不 bump 版本号**：`0.2.0` 保持不变）。
 
+### 变更（M12 沙箱隔离硬化：容器内降权 + 只读 rootfs + capability 归零）
+
+**做了什么**：沙箱工具容器的隔离从"容器化执行"提到"强隔离执行"——`SandboxConfig` 新增
+隔离硬化档并**缺省生效**：容器内降权为 `nobody(65534)`、容器 rootfs 只读（仅 `/tmp` 为
+64m tmpfs 可写，`mode=1777`、`nosuid`）、`cap_drop=["ALL"]`、`security_opt=["no-new-privileges:true"]`、
+`pids_limit=512`、`RLIMIT_NOFILE=4096`；`$HOME`/`TMPDIR`/`working_dir` 指向该 tmpfs，
+使 sqlmap 这类要往 `~/.sqlmap` 写会话与输出的有状态工具在只读 rootfs 下仍可用。
+
+**为什么**：原先只有 CPU/内存配额 + 工具目录只读挂载，容器内仍是 root 且带默认 capability
+集合，"写满宿主磁盘"只能靠 `mem_limit` 间接约束。硬化后该路径在容器内**结构性不存在**。
+
+**可审计**：`command_executed` 增 `sandbox` 字段，逐项记录本次执行的隔离档（放宽档记
+`{"mode": "relaxed"}`）——隔离强度与证据同源可查，不只写在文档里。
+
+**逃生阀**：`PROOFHOUND_SANDBOX_HARDENING=strict|relaxed`（缺省 `strict`；非法值 fail-closed
+抛错，与 `PROOFHOUND_SANDBOX_EGRESS` 同纪律）。`relaxed` 逐字节回到旧容器参数。
+
+**不改**：scope 五层校验、证据门判定语义、状态机铁律、闸门矩阵、出口白名单、脱敏与预算硬闸。
+
+**实测**：容器内探针 `uid=65534 / home=WRITABLE / rootfs=READONLY / tools=READONLY /
+docker_sock=ABSENT / pids_max=512 / cap_eff=0000000000000000`；fork 炸弹被 pids 上限截断且
+容器零残留；真实 T1/T2 + DVWA 全链路验收脚本在硬化档下通过（`sqlmap-confirmed`，
+`deepseek-v4-pro` confirm，证据 3 项）。
+
 ### 变更（M11c 重复测量：方差已量化，`PROOFHOUND_TRIAGE_MODEL` 建议默认开启）
 
 **做了什么**：4 臂 × 3 遍 = **12 次臂运行**（`scripts/bench_triage.py --live`，真实 T1/T2 +

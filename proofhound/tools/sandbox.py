@@ -3,6 +3,12 @@
 - 通过 ``/var/run/docker.sock`` 以兄弟容器方式拉起任务容器；
 - 宿主工具目录只读挂载到容器 ``/opt/tools``；
 - CPU（nano_cpus）/ 内存（mem_limit）配额；
+- **隔离硬化档（M12，缺省严格）**：容器内降权为非 root（nobody）+ rootfs
+  只读 + 仅 ``/tmp`` 为 tmpfs 可写（工具写 ``$HOME`` 也落这里）+ 丢弃全部
+  capability + ``no-new-privileges`` + ``pids_limit`` + ``RLIMIT_NOFILE``；
+  逐项进 ``command_executed`` 审计的 ``sandbox`` 字段（隔离强度与证据同源
+  可查）。逃生阀 ``PROOFHOUND_SANDBOX_HARDENING=relaxed`` 退回 M12 之前
+  的容器参数（默认 strict，非法值 fail-closed）；
 - 网络出口策略（M2a，见 ``tools/egress.py``）：默认 restricted——容器接入
   internal 出口网络，HTTP(S) 流量强制经白名单正向代理出站；``open`` 沿用
   配置的 ``network_mode``（M1 行为）；``none`` 完全断网；
@@ -22,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import docker
-from docker.types import Mount
+from docker.types import Mount, Ulimit
 
 from proofhound.compliance.audit import AuditLog
 from proofhound.compliance.scope import Scope, check_scope
@@ -30,6 +36,8 @@ from proofhound.compliance.session import redact_argv, redact_bytes
 from proofhound.tools.egress import EGRESS_NETWORK_NAME, EgressPolicy, EgressProxy
 
 CONTAINER_TOOLS_DIR = "/opt/tools"
+SCRATCH_DIR = "/tmp"  # 硬化档下容器内唯一可写位置（tmpfs，随容器销毁）
+SCRATCH_USER = "65534:65534"  # nobody:nogroup（alpine / python 基础镜像均有）
 
 
 @dataclass
@@ -39,6 +47,32 @@ class SandboxConfig:
     mem_limit: str = "512m"
     network_mode: str = "bridge"  # 仅 egress.mode="open" 时生效
     egress: EgressPolicy = field(default_factory=EgressPolicy)
+    # ---- 隔离硬化档（M12）----
+    # 缺省严格：fail-closed 方向——宁可让工具跑不起来，也不静默降级隔离。
+    # ``hardening=False`` 逐字节回到 M12 之前的容器参数，仅作逃生阀。
+    hardening: bool = True
+    cap_drop: tuple[str, ...] = ("ALL",)
+    pids_limit: int = 512
+    nofile_limit: int = 4096
+    scratch_size: str = "64m"
+    run_as: str = SCRATCH_USER
+
+    def isolation_profile(self) -> dict:
+        """审计用：本次执行的隔离档摘要（严格档逐项列出落实的边界）。"""
+        if not self.hardening:
+            return {"mode": "relaxed"}
+        return {
+            "mode": "strict",
+            "user": self.run_as,
+            "read_only_rootfs": True,
+            "tmpfs": (
+                f"{SCRATCH_DIR}:rw,nosuid,size={self.scratch_size},mode=1777"
+            ),
+            "cap_drop": list(self.cap_drop),
+            "no_new_privileges": True,
+            "pids_limit": self.pids_limit,
+            "nofile_limit": self.nofile_limit,
+        }
 
 
 @dataclass
@@ -120,6 +154,12 @@ class SandboxRunner:
                 ":/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
             )
         }
+        if self.config.hardening:
+            # rootfs 只读，故 HOME/TMPDIR 必须指向唯一的可写 tmpfs；否则
+            # 往 ~/.sqlmap 写会话/输出的工具（sqlmap）会直接失败。
+            env["HOME"] = SCRATCH_DIR
+            env["TMPDIR"] = SCRATCH_DIR
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
         if proxy_url:
             env["HTTP_PROXY"] = proxy_url
             env["HTTPS_PROXY"] = proxy_url
@@ -127,11 +167,11 @@ class SandboxRunner:
             env["http_proxy"] = proxy_url
             env["https_proxy"] = proxy_url
             env["all_proxy"] = proxy_url
-        container = self._client.containers.create(
-            image,
-            command=command,
-            environment=env,
-            mounts=[
+        create_kwargs: dict = {
+            "image": image,
+            "command": command,
+            "environment": env,
+            "mounts": [
                 Mount(
                     target=CONTAINER_TOOLS_DIR,
                     source=str(self.tools_dir.resolve()),
@@ -139,10 +179,35 @@ class SandboxRunner:
                     read_only=True,
                 )
             ],
-            nano_cpus=self.config.nano_cpus,
-            mem_limit=self.config.mem_limit,
-            network_mode=network_mode,
-        )
+            "nano_cpus": self.config.nano_cpus,
+            "mem_limit": self.config.mem_limit,
+            "network_mode": network_mode,
+        }
+        if self.config.hardening:
+            # M12：非 root + rootfs 只读 + 仅 /tmp 可写 + 去全部 capability
+            # + 禁提权 + 进程数/FD 上限。磁盘写满因此结构性不可能（rootfs
+            # 只读、可写面只有 64m tmpfs）。
+            create_kwargs.update(
+                user=self.config.run_as,
+                working_dir=SCRATCH_DIR,
+                read_only=True,
+                tmpfs={
+                    SCRATCH_DIR: (
+                        f"rw,nosuid,size={self.config.scratch_size},mode=1777"
+                    )
+                },
+                cap_drop=list(self.config.cap_drop),
+                security_opt=["no-new-privileges:true"],
+                pids_limit=self.config.pids_limit,
+                ulimits=[
+                    Ulimit(
+                        name="nofile",
+                        soft=self.config.nofile_limit,
+                        hard=self.config.nofile_limit,
+                    )
+                ],
+            )
+        container = self._client.containers.create(**create_kwargs)
         try:
             container.start()
             status = container.wait(timeout=timeout)
@@ -167,6 +232,7 @@ class SandboxRunner:
             no_targets=decision.no_targets,
             file_targets=decision.file_targets,
             egress=self._egress_audit_fields(network_mode),
+            sandbox=self.config.isolation_profile(),
             exit_code=exit_code,
             stdout_sha256=hashlib.sha256(stdout).hexdigest(),
             stderr_sha256=hashlib.sha256(stderr).hexdigest(),

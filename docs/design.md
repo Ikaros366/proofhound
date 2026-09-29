@@ -158,7 +158,7 @@ tags: [scanner, web]
 **执行策略**：
 1. 本地优先：依次检查 PATH → `./tools.d/` → 预构建 Docker 镜像（Kali 基础镜像 + 常用工具，支持完全离线）。
 2. 缺失才装：仅从白名单源下载，强制 SHA256 校验，安装后记录版本快照。
-3. 沙箱执行：每个测试任务（engagement）独立容器；工具目录只读挂载；网络出口限速+白名单；CPU/内存配额。
+3. 沙箱执行：每个测试任务（engagement）独立容器；工具目录只读挂载；网络出口限速+白名单；CPU/内存配额。**隔离硬化档**（M12，缺省严格）：容器内非 root（`nobody`）+ rootfs 只读（仅 `/tmp` 为 tmpfs 可写）+ `cap_drop=ALL` + `no-new-privileges` + `pids_limit` + `RLIMIT_NOFILE`；隔离档逐项写入 `command_executed` 审计，逃生阀 `PROOFHOUND_SANDBOX_HARDENING=relaxed`。
 4. Scope 强制：命令执行前，从命令参数中提取目标（host/IP/URL），与授权 scope 比对，越界直接拒绝并记审计日志。
 
 **工具持久化策略**（针对"PentAGI 每任务重复下载"问题的硬性设计）：
