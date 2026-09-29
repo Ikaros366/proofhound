@@ -62,6 +62,7 @@
 
 | M11c 重复测量与方差量化——已完成（2026-09-24） | 4 臂 × 3 遍 = **12 次臂运行**（`scripts/bench_triage.py --live`，真实 T1/T2 + Docker + Chromium，semi_auto 无人过滤），用**区间重叠法**判臂间差异可判性 | **结论（实测）**：① `PROOFHOUND_TRIAGE_MODEL` 是**唯一可判且增益巨大**的开关——TP `[4,4,4]` → `[8,8,8]`（区间不重叠 ⇒ 可判），两者**标准差均为 0**，**+4 个 Confirmed（33.3%→66.7%，翻倍）**，代价 **1.97× token** ⇒ **建议默认开启**（现缺省关闭）；② `PROOFHOUND_VERIFY_PREFILTER` **效应落在噪声内**——`rules` 下 `[4,4,4]→[4,4,4]`（零效应）、`rules+model` 下 `[8,8,8]→[9,8,9]`（区间重叠 ⇒ **不可判**），代价 1.23× token ⇒ **保持缺省关闭**；③ **12 次运行精确率全 100%、FP 全 0**（4 个安全对照端点从未误确认）；④ M10a 的"同一真 IDOR 4 臂 4 结果"**不再复现**——`/a/idor` 在全部 12 次里都是 confirmed；⑤ 残余方差收窄到**单端点**（`/b/sqli2 [sqli]` 在 `rules+model+prefilter` 臂为 confirmed/无候选/confirmed，是整臂 σ=0.048 的唯一来源），其余 15 个端点终态 12 次全一致。**⚠️ 断代**：本批 **T2 指向 DeepSeek（与 T1 同模型）**（Kimi 账户余额耗尽），红线 4（M9b）明确允许同模型，判定语义有效，但**与 kimi-k3 数据不可直接比较**；测量前停掉了抢占 CPU 的 pentagi 栈，故 wall 亦不可比 | 12 次臂运行全部 rc=0（产物 `evidence/bench_triage/20260923T15{4341,5457,0744}Z`）；方差分析脚本逐端点给出终态翻转表与可判性判定；旧 **980** 全绿（本里程碑只改文档，未动代码） |
 | M12 沙箱隔离硬化档：容器内降权 + 只读 rootfs + capability 归零 + 资源上限——已完成（2026-09-29） | ① **硬化档缺省生效**（`SandboxConfig.hardening=True`，fail-closed 方向）：容器内降权为 `nobody`（`65534:65534`）+ 容器 rootfs 只读 + 仅 `/tmp` 为 64m tmpfs 可写（`mode=1777`、`nosuid`）+ `cap_drop=["ALL"]` + `security_opt=["no-new-privileges:true"]` + `pids_limit=512` + `RLIMIT_NOFILE=4096`。② **可用性不陪葬**：`$HOME`/`TMPDIR` 与 `working_dir` 一并指向该 tmpfs 并设 `PYTHONDONTWRITEBYTECODE=1`，使 sqlmap 这类要往 `~/.sqlmap` 写会话/输出的有状态工具在只读 rootfs 下仍可用（这是"硬化不等于把工具跑挂"的关键一步，由真实容器实测保证）。③ **磁盘写满结构性消除**：rootfs 只读 + 可写面仅 64m tmpfs ⇒ 容器内不存在写满宿主磁盘的路径（原先只能靠 `mem_limit` 间接约束）。④ **隔离强度进审计**：`command_executed` 新增 `sandbox` 字段，严格档逐项列出 user/read_only_rootfs/tmpfs/cap_drop/no_new_privileges/pids_limit/nofile_limit，放宽档记 `{"mode": "relaxed"}`——执行时的隔离强度与证据同源可查，而非只写在文档里。⑤ **逃生阀**（与 `PROOFHOUND_SANDBOX_EGRESS` 同纪律）：`PROOFHOUND_SANDBOX_HARDENING=strict|relaxed`，缺省 `strict`，**非法值 fail-closed 抛错**（不静默回落），`relaxed` 逐字节回到 M12 之前的容器参数。⑥ **不改**：scope 五层校验、证据门判定语义、状态机铁律、闸门矩阵、出口白名单、脱敏与预算硬闸一律不动；`EgressProxy` 是宿主进程内的白名单代理（非容器），本轮不碰 | 新测试 **30** 个——`tests/test_sandbox_hardening.py` 11 个真实容器（正例：工具仍可执行、非 root、`$HOME` 可写；负例：Docker socket 不可达、rootfs 与工具目录不可写、`CapEff` 全零、`pids.max` 等于配置值、fork 炸弹被截断且容器零残留、create 参数逐项断言、审计含隔离档、relaxed 逐项退回）+ `tests/test_sandbox_profile.py` 19 个纯配置（缺省严格、审计摘要形态、逃生阀取值表、非法值 fail-closed；独立成文件是因为 `test_sandbox.py` 整文件带 docker 标记，无 Docker 时会被整文件跳过）；旧 **980** 全绿（共 **1010**，旧测试零改动）；容器内探针实测 `uid=65534 / home=WRITABLE / rootfs=READONLY / tools=READONLY / docker_sock=ABSENT / pids_max=512 / cap_eff=0000000000000000`；fork 炸弹隔离重跑 3 次：宿主零残留进程、dockerd 未重启、其他项目容器零扰动；真实 T1/T2 + DVWA 全链路验收脚本在硬化档下通过（sqlmap-confirmed + `deepseek-v4-pro` confirm + 证据 3 项），审计可见 `sandbox.mode=strict` |
+| M13 可复现安装 + CI——已完成（2026-09-29） | ① `requirements.txt` 从"只锁 API 层三项 + playwright"改为**完整依赖锁**（36 个包含传递依赖；生成方式写在文件头）。② `.github/workflows/ci.yml` 两道门：`unit`（Python 3.12、无 Docker 无浏览器，`pytest -m "not docker and not browser"`）与 `integration`（`playwright install --with-deps chromium` + 预拉 `alpine:3.20` / `python:3.12-alpine` / `vulnerables/web-dvwa`，跑全量）；两道门**都从锁安装**（`pip install -r requirements.txt` + `pip install -e . --no-deps --no-build-isolation`，避免解析器二次求解造成漂移）。③ `tests/test_release_hygiene.py` 8 个守护断言：锁覆盖 pyproject 全部直接依赖、钉住版本满足声明区间、锁内无可编辑/VCS/路径引用、CI 形态与所列命令、**CI 解释器落在 `requires-python` 内**。**只跑 3.12**：`requires-python` 虽为 `>=3.12`，但只有 3.12 经过全量验证，加 3.13 属能力扩张，须先本地跑绿再进矩阵，不靠 CI 试错。不改任何运行时代码与测试语义 | **干净环境实证**：新建 venv **只按锁安装**（不跑 `pip install -e ".[dev]"`）→ `pip freeze` 与锁**逐行一致（36 包）**；默认门 986 passed / 2 skipped / 30 deselected（13.2s）；全量 **1016 passed / 2 skipped**（116s；浏览器用例因 `~/.cache/ms-playwright` 按用户共享而真实执行、非 skip）。新测试 8 个，旧 1010 全绿（共 **1018**） |
 
 ## 技术选型（设计已定，实现时遵循）
 
@@ -142,10 +143,14 @@ proofhound/
 
 ```bash
 python3.12 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -r requirements.txt                       # 完整依赖锁（M13，可复现）
+.venv/bin/pip install -e . --no-deps --no-build-isolation
 .venv/bin/python -m pytest            # 全量（含 Docker 沙箱与 httpx 端到端）
 .venv/bin/python -m pytest -m "not docker"   # 无 Docker 环境时只跑纯单元测试
+.venv/bin/python -m pytest -m "not docker and not browser"   # CI 默认门（M13，两样都不需要）
 ```
+
+M13 起 `requirements.txt` 是**完整锁**（含传递依赖，36 个包）：先 `pip install -r`、再 `pip install -e . --no-deps --no-build-isolation`——顺序有意义，`--no-deps` 防止解析器二次求解把版本带偏。`.github/workflows/ci.yml` 是该命令的唯一执行者，两道门（`unit` / `integration`）见里程碑表 M13 行；`tests/test_release_hygiene.py` 断言锁与 `pyproject.toml` 不漂移、锁内无可编辑/VCS 引用、CI 配置形态未被改坏。
 
 沙箱/端到端测试需要可用的 Docker 守护进程（自动探测，不可用则 skip）；httpx 端到端测试需能访问 github.com（不可达时自动 skip）。设计确定的交付形态（文档 §5.9）：
 

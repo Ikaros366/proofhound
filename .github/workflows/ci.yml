@@ -1,0 +1,80 @@
+name: CI
+
+# 两道门：
+#   unit         —— 无 Docker / 无浏览器的纯单元与集成测试（默认门，秒级，任何 PR 都跑）
+#   integration  —— 真实容器沙箱 + 无头 Chromium 全量（含 docker / browser 标记）
+#
+# 只跑 Python 3.12：pyproject 的 requires-python 是 >=3.12，但**只有 3.12 经过本仓库
+# 全量验证**（1010 测试）。加 3.13 属能力扩张，须先在本地跑绿再进矩阵，不靠 CI 试错。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  unit:
+    name: 单元测试（无 Docker / 无浏览器）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装锁定依赖（可复现）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e . --no-deps --no-build-isolation
+
+      - name: 环境自检（版本与依赖锁一致）
+        run: |
+          python -V
+          python -c "import proofhound, sys; print('proofhound', proofhound.__version__, '| python', sys.version.split()[0])"
+          python -m pytest --version
+
+      - name: 单元与集成测试（排除需要 Docker / 浏览器的用例）
+        run: python -m pytest -m "not docker and not browser" -q
+
+  integration:
+    name: Docker 沙箱 + 浏览器 e2e（全量）
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: 安装锁定依赖（可复现）
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -e . --no-deps --no-build-isolation
+
+      - name: 安装无头 Chromium（verify-xss 行为确认用）
+        run: python -m playwright install --with-deps chromium
+
+      - name: 预拉沙箱与靶场镜像
+        run: |
+          docker pull alpine:3.20
+          docker pull python:3.12-alpine
+          docker pull vulnerables/web-dvwa
+
+      - name: 全量测试（含 docker 与 browser 标记）
+        run: python -m pytest -q

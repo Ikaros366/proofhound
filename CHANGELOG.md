@@ -8,6 +8,37 @@
 
 M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c（内部消化，按维护者要求**不 bump 版本号**：`0.2.0` 保持不变）。
 
+### 变更（M13 可复现安装 + CI）
+
+**做了什么**：① `requirements.txt` 从"只锁 API 层三项 + playwright"改为**完整依赖锁**
+（36 个包，含传递依赖；生成方式与沿革写在文件头）；② 新增 `.github/workflows/ci.yml`，
+两道门——`unit`（Python 3.12，无 Docker / 无浏览器，`pytest -m "not docker and not browser"`）
+与 `integration`（`playwright install --with-deps chromium` + 预拉 `alpine:3.20` /
+`python:3.12-alpine` / `vulnerables/web-dvwa`，跑全量）；两道门都**从锁安装**
+（`pip install -r requirements.txt` + `pip install -e . --no-deps --no-build-isolation`）；
+③ 新增 `tests/test_release_hygiene.py`（8 个），把"锁不漂移 / 锁可复现 / CI 形态 /
+CI 解释器落在 `requires-python` 内"钉成断言。
+
+**为什么**：原先只有 `pyproject.toml` 的 `>=` 区间，实际解析结果随时间漂移——实测
+`requirements.txt` 里写死的 `uvicorn==0.52.1`、`playwright==1.62.0` 与真正装到的
+`0.54.0`、`1.63.0` 已不一致（两者都仍满足 pyproject，故**不会报错、只会静默不一致**），
+而仓库没有任何 CI，也没有人在干净环境执行过文档里的测试命令。第三方评审把"干净环境
+`python -m pytest` 43 个模块收集失败"列为 P0——该**归因**是错的（README §Quickstart 本来
+就写了装依赖的命令，`pip install -e ".[dev]"` 后 1010 测试全绿），但**缺口是真的**：
+没有锁、没有 CI，"全绿"这件事在任何别的机器上都不可复现。M13 补的正是这一块。
+
+**实证（干净环境，非本机 venv）**：新建 venv 只按锁安装、跳过 `pip install -e ".[dev]"`
+→ `pip freeze` 与锁**逐行一致（36 包）**；默认门 `986 passed / 2 skipped / 30 deselected`
+（13.2s）；全量 `1016 passed / 2 skipped`（116s；浏览器用例因 `~/.cache/ms-playwright`
+按用户共享而真实执行，非 skip）。
+
+**只跑 Python 3.12**：`requires-python` 是 `>=3.12`，但只有 3.12 经过本仓库全量验证；
+加 3.13 属能力扩张，须先在本地跑绿再进矩阵，不靠 CI 试错。守护测试断言 CI 的 Python
+版本落在 `requires-python` 内，防止一边放宽区间、一边 CI 仍停在旧解释器。
+
+**不改**：任何运行时代码与测试语义；`requirements.txt` 原先四个版本 pin 的**语义**
+（API 层直接依赖）在文件头注释里保留沿革说明。
+
 ### 变更（M12 沙箱隔离硬化：容器内降权 + 只读 rootfs + capability 归零）
 
 **做了什么**：沙箱工具容器的隔离从"容器化执行"提到"强隔离执行"——`SandboxConfig` 新增

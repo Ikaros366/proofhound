@@ -89,7 +89,9 @@
 # 1. 获取代码与依赖
 git clone <仓库地址> proofhound && cd proofhound
 python3.12 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
+.venv/bin/pip install -r requirements.txt                     # 完整依赖锁（可复现）
+.venv/bin/pip install -e . --no-deps --no-build-isolation
+# 不锁版本亦可：.venv/bin/pip install -e ".[dev]"（按 pyproject 的 >= 解析）
 
 # 2. 配置 LLM：复制样例并填入 T1/T2 两档（T0 可选）
 cp .env.example .env
