@@ -24,9 +24,18 @@
    取值 ⇒ 交付证明不成立 ⇒ 按设计判 blocked（宁漏勿滥）；目标若回显取值则同形态走
    rejected。**两条都接受**——本轮要证明的是"它不会被误确认"，而不是"它一定被驳回"。
 3. 回调真的来自**容器进程**（源 IP 是容器网段，不是回环），token 与注入 URL 一致。
+
+产物默认落 ``evidence/demo_verify_ssrf/<时间戳>/``（audit + findings + baseline 输出 +
+回调记录，gitignored）——按仓库约定，实弹验收**事后必须可复核**。要"跑完即弃"用
+``--tmp`` 走临时目录（旧行为，验收留痕场景不要用）。
+
+用法：
+    .venv/bin/python scripts/demo_verify_ssrf.py          # 缺省落盘（推荐）
+    .venv/bin/python scripts/demo_verify_ssrf.py --tmp    # 临时目录，跑完即弃
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import socket
@@ -35,6 +44,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -222,6 +232,26 @@ def _seed(store, audit, asset, param):
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="ProofHound M16 verify-ssrf 实弹验收")
+    parser.add_argument(
+        "--tmp",
+        action="store_true",
+        help="产物落临时目录、跑完即弃（缺省落 evidence/demo_verify_ssrf/<时间戳>/）",
+    )
+    args = parser.parse_args()
+
+    # 产物落 evidence/<name>/<ts>/（仓库约定：demo 的 audit 与证据必须可事后复核）。
+    # 目录在 Docker 前置检查**之前**建：本轮跑没跑成同样是事实，留痕不丢。
+    tmp_ctx = tempfile.TemporaryDirectory() if args.tmp else None
+    if tmp_ctx is not None:
+        run_dir = Path(tmp_ctx.name)
+        print("[*] --tmp：产物落临时目录，跑完即弃（事后不可复核）")
+    else:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        run_dir = REPO / "evidence" / "demo_verify_ssrf" / stamp
+        run_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[*] 运行目录（产物落盘）: {run_dir}")
+
     import docker
 
     try:
@@ -272,61 +302,61 @@ def main() -> int:
 
     results: list[tuple[str, str]] = []
     try:
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            evidence = root / "evidence"
-            evidence.mkdir()
-            audit = AuditLog(evidence / "audit.jsonl")
-            scope = Scope(
-                networks=["127.0.0.0/8"],
-                ports=[port],
-                session=SessionConfig(cookies={"phsess": "bench0session0token"}),
-            )
-            registry = SkillRegistry(REPO / "skills").discover()
-            orch = Orchestrator(
-                registry,
-                BaselineRunner(scope, evidence),
-                MockRouter(),
-                audit,
-                evidence_dir=evidence,
-            )
-            store = FindingStore(evidence / "findings.jsonl")
+        evidence = run_dir / "evidence"
+        evidence.mkdir(parents=True, exist_ok=True)
+        audit = AuditLog(evidence / "audit.jsonl")
+        scope = Scope(
+            networks=["127.0.0.0/8"],
+            ports=[port],
+            session=SessionConfig(cookies={"phsess": "bench0session0token"}),
+        )
+        registry = SkillRegistry(REPO / "skills").discover()
+        orch = Orchestrator(
+            registry,
+            BaselineRunner(scope, evidence),
+            MockRouter(),
+            audit,
+            evidence_dir=evidence,
+        )
+        store = FindingStore(evidence / "findings.jsonl")
 
-            cases = [
-                ("/e/fetch3?target=1", "target", "E 族真 SSRF（表外盲区）"),
-                ("/e/fetch?url=1", "url", "E 族真 SSRF（表内锚点）"),
-                ("/d/ssrf-like?callback=1", "callback", "形对照：只登记不取数"),
-            ]
-            for path, param, label in cases:
-                asset = base + path
-                finding = _seed(store, audit, asset, param)
-                processed = orch.run_verify_phase(skill_name="verify-ssrf")
-                fresh = [f for f in processed if f.id == finding.id]
-                state = fresh[0].state.value if fresh else finding.state.value
-                results.append((label, state))
-                print(f"[*] {label:<24} {path:<24} → {state}")
-                if fresh and fresh[0].verification is not None:
-                    v = fresh[0].verification
-                    assert v.method == SSRF_CONFIRMED_METHOD, v.method
-                    print(f"      method={v.method} cvss={fresh[0].cvss_score} "
-                          f"refs={len(v.evidence_refs)} steps={len(v.reproduction_steps)}")
-                for event in audit.read_all():
-                    if event.get("finding_id") == finding.id and event["event"] in (
-                        "verify_blocked",
-                        "verify_scope_rejected",
-                        "verify_baseline_failed",
-                        "ssrf_callback_received",
-                        "ssrf_callback_judged",
-                    ):
-                        print("      ·", json.dumps(event, ensure_ascii=False)[:230])
-                cb = evidence / f"ssrf_{finding.id}_callbacks.jsonl"
-                if cb.is_file():
-                    for line in cb.read_text(encoding="utf-8").splitlines():
-                        rec = json.loads(line)
-                        if not rec.get("ignored"):
-                            print(f"      回调来源 {rec['source_ip']} · {rec['request_line'][:70]}")
+        cases = [
+            ("/e/fetch3?target=1", "target", "E 族真 SSRF（表外盲区）"),
+            ("/e/fetch?url=1", "url", "E 族真 SSRF（表内锚点）"),
+            ("/d/ssrf-like?callback=1", "callback", "形对照：只登记不取数"),
+        ]
+        for path, param, label in cases:
+            asset = base + path
+            finding = _seed(store, audit, asset, param)
+            processed = orch.run_verify_phase(skill_name="verify-ssrf")
+            fresh = [f for f in processed if f.id == finding.id]
+            state = fresh[0].state.value if fresh else finding.state.value
+            results.append((label, state))
+            print(f"[*] {label:<24} {path:<24} → {state}")
+            if fresh and fresh[0].verification is not None:
+                v = fresh[0].verification
+                assert v.method == SSRF_CONFIRMED_METHOD, v.method
+                print(f"      method={v.method} cvss={fresh[0].cvss_score} "
+                      f"refs={len(v.evidence_refs)} steps={len(v.reproduction_steps)}")
+            for event in audit.read_all():
+                if event.get("finding_id") == finding.id and event["event"] in (
+                    "verify_blocked",
+                    "verify_scope_rejected",
+                    "verify_baseline_failed",
+                    "ssrf_callback_received",
+                    "ssrf_callback_judged",
+                ):
+                    print("      ·", json.dumps(event, ensure_ascii=False)[:230])
+            cb = evidence / f"ssrf_{finding.id}_callbacks.jsonl"
+            if cb.is_file():
+                for line in cb.read_text(encoding="utf-8").splitlines():
+                    rec = json.loads(line)
+                    if not rec.get("ignored"):
+                        print(f"      回调来源 {rec['source_ip']} · {rec['request_line'][:70]}")
     finally:
         _safe_remove(container)
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
 
     print("\n===== 结论 =====")
     # 形对照的期望是 **blocked 或 rejected**，但**绝不是 confirmed**：
@@ -350,6 +380,10 @@ def main() -> int:
         shown = want if want else "blocked 或 rejected（绝不许 confirmed）"
         print(f"  {mark} {label:<24} → {state}（期望 {shown}）")
     print("✅ 实弹验收通过" if ok else "❌ 实弹验收失败")
+    if tmp_ctx is not None:
+        print("[*] --tmp 模式：产物已随临时目录清理（事后不可复核）")
+    else:
+        print(f"[*] 产物：{run_dir}（audit.jsonl / findings.jsonl / evidence/）")
     return 0 if ok else 1
 
 

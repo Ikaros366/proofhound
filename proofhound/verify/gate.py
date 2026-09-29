@@ -35,7 +35,7 @@ class GateRequirement:
 # idor 落自 M8c，ssrf 落自 M16，其余类型随 verify-* skill 扩展）。
 #
 # **四类的 method 白名单互不染指**：每个集合只含本类型自己的确认手段，
-# 任何一个 method 名不得出现在两处（tests/test_gate.py 逐条断言互斥）。
+# 任何一个 method 名不得出现在两处（tests/test_ssrf.py::test_gate_methods_are_mutually_exclusive_and_ssrf_only_accepts_callback 逐条断言互斥）。
 # 新增类型时必须同时提供对应的 verify-* skill 与 profiles.py 登记，
 # 否则该类型的候选只能停在 Hypothesis（GATE_MATRIX 是 Confirmed 的门）。
 GATE_MATRIX: dict[str, GateRequirement] = {
