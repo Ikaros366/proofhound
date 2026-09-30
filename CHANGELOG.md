@@ -11,7 +11,7 @@
 **做了什么**：把 M18-a 的判定通道接上生产链路——命令注入自此**真的**会从扫描结果里
 长出来并被确认。
 
-**① 候选来源 C3（裁定）**：新增 `_CMDI_PARAM_HINTS`（22 键保守表：`cmd` / `command` /
+**① 候选来源 C3（裁定）**：新增 `_CMDI_PARAM_HINTS`（21 键保守表：`cmd` / `command` /
 `exec` / `execute` / `run` / `shell` / `system` / `ping` / `host` / `ip` / `target` /
 `domain` / `url` / `file` / `path` / `daemon` / `process` / `service` / `script` /
 `query` / `input`），`param-endpoint` 分支按它展开 cmdi 候选。与 `sqli`/`xss`/`idor`

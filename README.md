@@ -494,7 +494,7 @@ skill 画像）仍靠守护测试而非结构保证。
 已落地——确认手段 = **宿主 listener 收到注入命令发起的回调**（带外二值事实），
 并新增一道 SSRF 没有的防伪：**DNS 非命中变体**（排除 WAF/反代/截图服务
 "替我们抓取"造成的假命中）。**2026-09-30 更新（M18-b，已完成）**：候选来源已接上——规则表
-`_CMDI_PARAM_HINTS`（`cmd`/`exec`/`ping` 等 22 键）+ 模型通道（由 `VULN_REGISTRY`
+`_CMDI_PARAM_HINTS`（`cmd`/`exec`/`ping` 等 21 键）+ 模型通道（由 `VULN_REGISTRY`
 自动纳入白名单），独立上限 10。零 seed 真靶验收
 `scripts/demo_cmdi_zero_seed.py` 全绿：真漏洞 CONFIRMED / 不取数 REJECTED /
 `triage_capped(dropped=8)` / 生产栈 6 个槽位。
