@@ -58,11 +58,6 @@ BUILTIN_SKILLS = REPO / "skills"
 #: 生产栈必须把每个 verify handler 都挂上（含默认形参的那几个）。
 PRODUCTION_INIT = "proofhound/api/runner.py::OrchestratorPhases.__init__"
 
-#: `cmdi` 生产者未接的 xfail 理由（限制 61）；M18-b 接好后必须删掉本标记。
-XFAIL_CMDI_PRODUCER = (
-    "已知限制 61：cmdi 的候选来源（规则表 _CMDI_PARAM_HINTS + 模型通道）"
-    "属 M18-b，尚未接上"
-)
 
 
 
@@ -427,7 +422,6 @@ def test_landing_mechanism_fields_are_derived_not_duplicated():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=XFAIL_CMDI_PRODUCER)
 def test_every_registered_type_has_a_reachable_producer(tmp_path):
     """**每个注册类型**都必须能被生产链路构造出来（零 seed 的「发现」冒烟）。
 

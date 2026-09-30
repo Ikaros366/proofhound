@@ -221,6 +221,30 @@ _IDOR_PARAM_HINTS = frozenset(
 # M8c：每 engagement 新建 idor Hypothesis 上限（独立计数、独立 triage_capped 事件）
 _TRIAGE_IDOR_CAP = 10
 
+# M18-b：param-endpoint → cmdi 假设的参数键启发式（保守小表，宁漏勿滥）。
+#
+# **裁定 C3**：命令注入既有确定性候选（本表）也有模型通道补盲区——与
+# sqli/xss/idor 一致。当初把「关键词表」列为"不做"是针对**敏感度判定**
+# （unauth-exposure 的语义判断那一半），不针对**候选生成**；候选生成侧
+# 五类里四类都在用提示表，本表沿用同一取舍。
+#
+# 表内容偏"命令执行/网络诊断/系统命令"类参数名——这类端点最可能把取值
+# 直接拼进 shell。刻意**不收** id/name 这类泛化键（那会让几乎每个端点都产
+# cmdi 候选，爆炸半径过大）。
+_CMDI_PARAM_HINTS = frozenset(
+    {
+        "cmd", "command", "exec", "execute", "run", "shell", "system",
+        "ping", "host", "ip", "target", "domain", "url", "file", "path",
+        "daemon", "process", "service", "script", "query", "input",
+    }
+)
+
+# M18-b：每 engagement 新建 cmdi Hypothesis 上限（独立计数、独立 triage_capped 事件）。
+# 独立上限是硬要求：每条 cmdi 候选在 verify 阶段会**逐条发最多 10 次真实请求**
+# （1 交付探针 + 1 DNS 探针 + ≤8 载荷变体）并各开一个回调 listener，
+# 不设限会给贵验证档与目标同时灌水。
+_TRIAGE_CMDI_CAP = 10
+
 # M17-b：每 engagement 新建 unauth-exposure Hypothesis 上限（独立计数、独立
 # triage_capped 事件）。**必须**有独立上限：`web-exposure` 是全池唯一**没有**
 # 上限的类型（sqli/xss/idor 各有），而新生产者的候选量与 web-probe 信号数同阶，
@@ -248,6 +272,7 @@ _TRIAGE_CAPS: dict[str, int] = {
     "xss": _TRIAGE_XSS_CAP,
     "idor": _TRIAGE_IDOR_CAP,
     "unauth-exposure": _TRIAGE_UNAUTH_CAP,
+    "cmdi": _TRIAGE_CMDI_CAP,  # M18-b
 }
 
 # M9c②：**贵验证档**上限。启用廉价粗筛（``verify_prefilter``）时，cap 从
@@ -418,6 +443,21 @@ def _triage_candidates(
             )
             for key in keys
             if key in _IDOR_PARAM_HINTS
+        )
+        # M18-b：同一份 query 键再按 cmdi 提示表展开命令注入候选（裁定 C3：
+        # 与 sqli/xss/idor 同待遇，独立上限与独立 triage_capped 事件）。
+        # 与 `file`/`path`/`query` 等键的交集同产是设计行为——同一个参数
+        # 既可能被拼进 SQL 也可能被拼进 shell，各自经独立 verify skill 行为验证。
+        candidates.extend(
+            _TriageCandidate(
+                vuln_type="cmdi",
+                param=key,
+                severity="critical",
+                evidence_kind=CRAWL_ENDPOINT_EVIDENCE_KIND,
+                source="get_param",
+            )
+            for key in keys
+            if key in _CMDI_PARAM_HINTS
         )
         return candidates
     if signal.kind == "form_page":
@@ -707,13 +747,11 @@ class Orchestrator:
             merged = counters["merged"]
             if hits == 0:
                 kept += 1
-        # M8b/M8c：triage_capped 按 vuln_type 分立事件（各自上限各自记）
-        for vuln_type, limit in (
-            ("sqli", _TRIAGE_SQLI_CAP),
-            ("xss", _TRIAGE_XSS_CAP),
-            ("idor", _TRIAGE_IDOR_CAP),
-            ("unauth-exposure", _TRIAGE_UNAUTH_CAP),  # M17-b
-        ):
+        # M8b/M8c：triage_capped 按 vuln_type 分立事件（各自上限各自记）。
+        # M18-b：**从 `_TRIAGE_CAPS` 派生**，不再手写列表——原先查表判上限、
+        # 手写列表上报，两处不同源；加 `cmdi` 时只登记了查表，导致候选被正确
+        # 丢弃却**没有任何审计事件**（静默丢弃）。
+        for vuln_type, limit in sorted(_TRIAGE_CAPS.items()):
             dropped = capped_by_type.get(vuln_type, 0)
             if dropped:
                 self.audit.record(

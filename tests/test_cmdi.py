@@ -31,6 +31,7 @@ from proofhound.findings import (
     Finding,
     FindingState,
     FindingStore,
+    Signal,
     Verification,
     compute_dedup_key,
 )
@@ -563,3 +564,84 @@ def test_no_session_is_required(env):
 
 def test_with_session_still_works(env):
     """带会话时同样工作（会话只让请求更贴近操作员形态，不是前置）。"""
+
+
+# =====================================================================
+# 四、上限上报的同源性（M18-b 实测踩到的静默丢弃 bug）
+# =====================================================================
+
+
+def test_every_capped_type_reports_triage_capped(tmp_path, make_skill_dir):
+    """**每个**登记了上限的类型，超限时都必须留下 ``triage_capped`` 事件。
+
+    钉住的缺陷形态：上限**查表**判、上报**手写列表** —— 两处不同源时，
+    新类型会被静默丢弃（候选没了、审计里也没有），正是最该避免的形态。
+    """
+    from proofhound.core.orchestrator import _TRIAGE_CAPS
+    from proofhound.core.orchestrator import _triage_candidates
+
+    # 构造一个能命中所有已登记类型的输入域：三张提示表的并集 + 一张能命中
+    # cmdi 的键；每个键重复到超过该类型的上限。
+    import proofhound.core.orchestrator as orch_mod
+
+    hint_union = (
+        orch_mod._SQLI_PARAM_HINTS
+        | orch_mod._XSS_PARAM_HINTS
+        | orch_mod._IDOR_PARAM_HINTS
+        | orch_mod._CMDI_PARAM_HINTS
+    )
+    evidence_dir = tmp_path / "evidence"
+    evidence_dir.mkdir()
+    raw = evidence_dir / "crawl.stdout.log"
+    raw.write_text("x\n", encoding="utf-8")
+
+    rows = []
+    seq = 0
+    for key in sorted(hint_union):
+        for i in range(30):  # 足够超过任何单类型上限
+            seq += 1
+            asset = f"http://h/p/{key}/{i}?{key}=1"
+            rows.append(
+                Signal(
+                    asset=asset,
+                    status_code=200,
+                    kind="param-endpoint",
+                    source_tool="katana",
+                    skill="recon-crawl",
+                    evidence_ref=f"{raw.name}#L1",
+                ).model_dump_json()
+            )
+    (evidence_dir / "crawl.signals.jsonl").write_text(
+        "\n".join(rows) + "\n", encoding="utf-8"
+    )
+
+    from proofhound.compliance.audit import AuditLog
+
+    audit = AuditLog(evidence_dir / "audit.jsonl")
+    orch = Orchestrator(
+        SkillRegistry(make_skill_dir(name="verify-cmdi", tools=())).discover(),
+        runner=None,
+        llm=None,
+        audit=audit,
+        evidence_dir=evidence_dir,
+    )
+    orch.run_triage_phase()
+
+    # 先确认这批输入确实能命中所有这些类型（否则本测试是空跑）
+    produced = {
+        candidate.vuln_type
+        for row in rows
+        for candidate in _triage_candidates(Signal.model_validate_json(row))
+    }
+    capped_types = {
+        e["vuln_type"] for e in audit.read_all() if e["event"] == "triage_capped"
+    }
+    # 每个「既登记了上限、又能被产出」的类型都必须有上报事件
+    expected = (set(_TRIAGE_CAPS) & produced) - {"unauth-exposure"}  # 需会话才派生
+    missing = sorted(expected - capped_types)
+    assert not missing, (
+        "以下类型登记了上限却**没有** triage_capped 上报事件（静默丢弃）："
+        + str(missing)
+        + "；实测上报=" + str(sorted(capped_types))
+        + "；可产出=" + str(sorted(produced))
+    )

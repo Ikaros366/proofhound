@@ -6,6 +6,49 @@
 
 ## [未发布]
 
+### 新增（M18-b 命令注入接生产 —— 候选来源 C3 + 独立上限，关闭限制 61）
+
+**做了什么**：把 M18-a 的判定通道接上生产链路——命令注入自此**真的**会从扫描结果里
+长出来并被确认。
+
+**① 候选来源 C3（裁定）**：新增 `_CMDI_PARAM_HINTS`（22 键保守表：`cmd` / `command` /
+`exec` / `execute` / `run` / `shell` / `system` / `ping` / `host` / `ip` / `target` /
+`domain` / `url` / `file` / `path` / `daemon` / `process` / `service` / `script` /
+`query` / `input`），`param-endpoint` 分支按它展开 cmdi 候选。与 `sqli`/`xss`/`idor`
+同一取舍：**候选生成用提示表**并不违背「不做关键词敏感表」——后者针对的是**敏感度
+判定**（`unauth-exposure` 的语义那一半），不是候选生成；候选生成侧六类里五类都在用
+提示表。模型通道由 M17-c 的 `VULN_REGISTRY` **自动**纳入白名单，零手工同步。
+
+**② 独立上限**：`_TRIAGE_CMDI_CAP = 10` + `_TRIAGE_CAPS` 登记。每条 cmdi 候选在
+verify 阶段要发 **≤10 次真实请求**（1 交付探针 + 1 DNS 探针 + ≤8 载荷变体）并各开一个
+回调 listener，不设限会给贵验证档与目标同时灌水。
+
+**③ 零 seed 真靶验收** `scripts/demo_cmdi_zero_seed.py`（真靶 · 只写 Signal ·
+Finding 由生产代码建）：
+
+| 段 | 断言 | 实测 |
+|---|---|---|
+| A 发现 | 每个 `cmd` 参数端点产出 cmdi 候选 | 3 条 |
+| B 确认 | 真漏洞 CONFIRMED / 不取数 REJECTED / 真漏洞上 `dns_misfire=False` | ✅ method=`cmdi-callback-confirmed` + CVSS 代码算分 |
+| C 上限 | 18 个端点 → 建 10 条 + `triage_capped` | `limit=10, dropped=8` |
+| D 生产栈 | 槽位含 `verify-cmdi` | 6 个槽位齐备 |
+| E 注册面 | 三处由登记表派生 | `GATE_MATRIX`/白名单/前置集一致 |
+
+**④ 修一个真 bug：`triage_capped` 的静默丢弃**。`_ingest_candidates` 按
+`_TRIAGE_CAPS` **查表**判上限，而 `run_triage_phase` 的**上报**循环是一份**手写列表**
+——加 `cmdi` 时只登记了查表 ⇒ 候选被**正确丢弃却没有任何审计事件**。已改为上报循环
+**从 `_TRIAGE_CAPS` 派生**（两处同源），并加回归测试对每个登记了上限的类型断言上报
+事件存在。**教训与 M17-c 同源**：能从单一真相源派生的，就不要手写第二遍。
+
+**测试**：全量 **1310 passed / 0 xfailed**。**M18-a 的 1 个 strict xfail 转正并删除
+标记**（`strict=True` 再次如设计般强制了这一步）。**旧测试零改动**——M18-b 只动
+`tests/test_cmdi.py` 自己（新增 1 条回归测试）。
+
+**新增限制 62（诚实披露盲区）**：DNS 防线依赖**探针能到达靶**，而 `<nonce>.invalid`
+在任何环境都解析不了（本机实测：透明代理截获返回 502 / 直连 URLError）⇒ 在无直连
+出口的部署里该探针**结构性失效**，「中间件代抓取」形态在本类型下**无法被检出**。
+属**保守方向**盲区（失效 ⇒ 不会因此产生假阳性，风险是漏检），故未阻塞交付。
+
 ### 新增（M18-a 第 6 类漏洞「命令注入 / RCE」的判定通道 —— 带外回调确认）
 
 **做了什么**：把命令注入做成**第 6 类可确认漏洞**的判定通道。裁定先行
