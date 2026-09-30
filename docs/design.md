@@ -1426,6 +1426,21 @@ vs 已认证敏感 JSON（相似度 0.085）⇒ 停 Hypothesis + `verify_blocked
 覆盖取舍，见限制 57）；POST/JSON body 型接口不在本轮范围；判定器的**真实模型行为**
 未验（只验了契约：schema/fail-closed/脱敏/截断）——但它不构成证据，故不影响确认正确性。
 
+### 7.15.6b 🔴 事后核实（2026-09-29，发布后）：本类型在生产链路不可达
+
+第三方评审提出、独立复核确认：**`unauth-exposure` 缺生产者**。详见 AGENTS.md 已知限制 58。
+要点：生产期 `vuln_type` 只由 `_triage_candidates`（`web-exposure`/`sqli`/`xss`/`idor`）
+与模型通道（`ALLOWED_VULN_TYPES`）产出，**两条路都不产该类型**；全仓唯一产出点是 demo 的
+**手写 seed**。故 §7.15.6 的「真靶实测」验的是**判定通道自身**，**未验「发现→验证」接通**。
+
+**§7.15.1~§7.15.6 的设计与实测数字仍然有效**——缺的是入口那一端，不是判定端。
+
+**修复方向**：① `web-probe` 信号确定性派生 `unauth-exposure` 候选（待决策：与
+`web-exposure` 重复候选 vs 取代；scope 无会话时是否回退）；② 收敛注册点为
+`VULN_REGISTRY` 单一真相源 + 守护测试「每个注册类型必须有生产者」与「发现→确认」冒烟
+测试。**同批**修正了 `llm/triage.py` 里「白名单与 `GATE_MATRIX` 唯一区别是 `ssrf`」
+这句过期注释（M16-c 后已是两处方向相反的差异）。
+
 ### 7.15.7 本里程碑明确不做
 
 `web-exposure` 进 `GATE_MATRIX` · 把 AI 判定器结论当证据（撞铁律 2）· 关键词/正则敏感表

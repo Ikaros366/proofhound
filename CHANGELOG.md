@@ -105,6 +105,19 @@ M9a / M9b / M9c / M9d / M10a / M11a / M11b / M11c-pre / M11c / M15 / M16 / M16-a
 README 边界）、关键词/正则敏感表（既漏又误，且与「发现侧不靠关键词表」的立场冲突）、
 POST/JSON body 型接口。
 
+#### 🔴 事后核实（2026-09-29，发布 `v0.3.0` 之后）：本类型的 Finding 在生产链路不可达
+
+第三方评审提出、独立复核确认：**`unauth-exposure` 没有生产者**。生产期 `vuln_type` 只由
+`orchestrator._triage_candidates`（产 `web-exposure`/`sqli`/`xss`/`idor`）与模型通道
+（`ALLOWED_VULN_TYPES` = `{sqli, xss, idor, ssrf}`）产出，**两条路都不产该类型**；全仓唯一
+产出点是 `scripts/demo_verify_unauth.py` 的**手写 seed**。故上文「真靶实测全绿」验的是
+**我写的那段代码**，**未验「功能真接上了」**——真实扫描不会有 Finding 进入 `_verify_unauth`。
+
+**本节其余内容（设计、实测数字、证据形态）仍然有效**，缺的是入口那一端。详细记录见
+**AGENTS.md 已知限制 58**；修复方向与守护测试见 `HANDOFF_M16C_NEXT.md`（仓库外）。
+**`v0.3.0` 已发布，该缺口在修复前对使用者的含义**：`unauth-exposure` 这一「第 5 类可确认
+漏洞」目前只在 demo/测试里可达，**真实扫描中不可用**。
+
 ### 变更（M16-b dirsearch 接入 + 速率/并发/时间窗授权语义）
 
 **做了什么**：把 dirsearch 接进发现链路，**并先补上"本次允许发多少请求"的授权语义**——

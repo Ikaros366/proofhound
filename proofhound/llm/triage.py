@@ -28,12 +28,16 @@ triage 从未用过 LLM。本模块补上这一环。
   ``verify/gate.py::GATE_MATRIX`` 对未知类型 fail-closed（永远不可能
   Confirmed），放行只会污染 findings.jsonl。
 
-  白名单与 ``GATE_MATRIX`` 的**唯一区别是 ``ssrf``**，这是刻意的两段式：
-  SSRF 已有模型候选通道但**尚无验证器**，故它的候选只能停在 Hypothesis
-  （``GATE_MATRIX`` 里没有 ssrf 项 → 证据门恒不通过）。要进 Confirmed 必须
-  先按既有确认链路补 ``verify-ssrf``（回调服务器判定），**不得在本模块或
-  证据门里开旁路**。``ssrf`` 的落地形态见 ``verify/ssrf.py`` 与
-  ``docs/design.md`` §7.12。
+  白名单与 ``GATE_MATRIX`` 的**差异是刻意且方向相反的两处**（M16-c 后修正，
+  原文误写为「唯一区别是 ssrf」——该表述在 M16-c 之后已过期）：
+  ① ``ssrf`` **只在白名单**：已有模型候选通道（M15）而验证器后补（M16）；
+  ② ``unauth-exposure`` **只在矩阵**而**不在白名单**：它的候选由**确定性规则表**
+     从 ``web-probe`` 信号派生（窄形态无需语义判断），故不需要进模型白名单；
+     ⚠️ 该派生**当前尚未实现** ⇒ 该类型的 Finding 在**生产链路不可达**，
+     详见 AGENTS.md 已知限制 58。
+  ``GATE_MATRIX`` 对未知类型 fail-closed（永远不可能 Confirmed），故放行只会
+  污染 findings.jsonl。``ssrf`` 的落地形态见 ``verify/ssrf.py`` 与
+  ``docs/design.md`` §7.12；``unauth-exposure`` 见 §7.15 与限制 58。
 """
 
 from __future__ import annotations
