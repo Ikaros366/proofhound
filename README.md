@@ -482,6 +482,13 @@ canary 确认、verify-idor 双会话属性验证）。
 （M17-b：`web-probe` 有会话且 2xx 时并存派生 `unauth-exposure`、独立上限 10、API 生产栈补第 5 槽位、
 前置不可满足的类型不再白吃贵验证配额）。M17-a 的 3 个 strict xfail **全部转正并删除标记**。
 零 seed 验收：`scripts/demo_unauth_zero_seed.py`（真靶 · 只写 Signal · 走生产代码建 Finding）。
+
+**2026-09-30 更新（M17-c）**：漏洞类型的三处手工登记表已收敛为**单一真相源**
+`verify/gate.py::VULN_REGISTRY`——`GATE_MATRIX`、模型 triage 白名单、
+验证前置集**全部由它派生**（「加一个漏洞类型」自此只需登记一次）。
+守护测试同步改为对登记表断言（含「生产者可达」的零 seed 穷举）。
+**收敛的边界已如实记入 AGENTS.md 限制 60**：机制类接线（handler、生产栈槽位、
+skill 画像）仍靠守护测试而非结构保证。
 **现在有三个待裁决项**：① 是否把 `PROOFHOUND_TRIAGE_MODEL` 改为默认开启（数据支持，见第 1 项与「重复测量与方差」节）；② ~~是否投入建 `verify-ssrf`~~（**已落地**，见第 2 项）；③ **`KatanaParams.jsluice`（katana `-jsl`）的缺省值**（M16-a 实现侧的保守选择，见下面第 4 项）。
 
 1. ~~**基线数字补完**~~ **已完成（M10a + M11b + M11c）**——真可确认 fixture + `--live` 4 臂

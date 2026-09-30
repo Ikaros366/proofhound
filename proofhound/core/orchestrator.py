@@ -130,6 +130,7 @@ from proofhound.verify.ssrf import resolve_callback_port as ssrf_resolve_callbac
 from proofhound.verify.ssrf import summary_for_verifier as ssrf_summary_for_verifier
 from proofhound.verify.ssrf import token_delivered as ssrf_token_delivered
 from proofhound.verify.ssrf import url_host_port as ssrf_url_host_port
+from proofhound.verify.gate import VULN_REGISTRY
 from proofhound.verify.unauth_control import (
     UNAUTH_CONFIRMED_METHOD,
     UNAUTH_EQUIVALENCE_EVIDENCE_KIND,
@@ -210,12 +211,18 @@ _TRIAGE_IDOR_CAP = 10
 # 每条又要花「2 次 HTTP + 1 次 T1 调用」——不设限会给贵验证档灌水。
 _TRIAGE_UNAUTH_CAP = 10
 
-#: 需要「scope 配了可用预置会话」才能验证的 vuln_type（M17-b）。
+#: 需要「scope 配了可用预置会话」才能验证的 vuln_type —— **由
+#: `verify/gate.py::VULN_REGISTRY` 的 `requires_session` 派生**（M17-c）。
 #: 两类都是**等价性/基线比对**型判定，没有已认证视图就没有可比对象：
 #: - ``unauth-exposure``：匿名视图 vs 已认证视图（缺后者 ⇒ 无从比）；
 #: - ``ssrf``：带会话 baseline（缺会话 ⇒ `_verify_ssrf` 直接 blocked）。
-#: 登记在此 ⇒ 该类型的候选在缺会话时**一次也不进贵验证档**（配额仍留给真验证）。
-_VERIFY_PRECONDITIONS: frozenset[str] = frozenset({"unauth-exposure", "ssrf"})
+#: 在登记表里声明 `requires_session=True` ⇒ 该类型的候选在缺会话时**一次也不进
+#: 贵验证档**（配额仍留给真验证）。
+_VERIFY_PRECONDITIONS: frozenset[str] = frozenset(
+    vuln_type
+    for vuln_type, spec in VULN_REGISTRY.items()
+    if spec.requires_session
+)
 
 #: vuln_type → 每 engagement 新建 Hypothesis 上限（未登记的类型不限）。
 #: M17-b：由 `_ingest_candidates` 里的三个并列 if 收成一张查表——加类型时

@@ -44,12 +44,13 @@ from proofhound.compliance.audit import AuditLog
 from proofhound.compliance.scope import Scope
 from proofhound.compliance.session import SessionConfig
 from proofhound.core import orchestrator as orch_mod
-from proofhound.core.orchestrator import Orchestrator
+from proofhound.core.orchestrator import Orchestrator, _VERIFY_PRECONDITIONS
 from proofhound.findings.finding import FindingStore
 from proofhound.findings.signal import Signal
 from proofhound.skills.profiles import profile_for
 from proofhound.skills.registry import SkillRegistry
-from proofhound.verify.gate import GATE_MATRIX
+from proofhound.verify.gate import ALLOWED_VULN_TYPES, GATE_MATRIX, VULN_REGISTRY
+from proofhound.verify.gate import VulnSpec
 
 REPO = Path(__file__).resolve().parent.parent
 BUILTIN_SKILLS = REPO / "skills"
@@ -60,64 +61,62 @@ PRODUCTION_INIT = "proofhound/api/runner.py::OrchestratorPhases.__init__"
 
 
 class VulnLanding(NamedTuple):
-    """单个 vuln_type 的落点清单（**六处**）。
+    """单个 vuln_type 的落点清单。
 
-    ``producer`` 是**人类可读的生产期产出点命名**（规则表 kind / 模型通道），
-    只用于失败信息定位；**判定仍走真实代码**（见两条守护测试），不以此字段
-    为准——否则就会退化成「声明即通过」。
+    **机制字段全部从登记表派生**（M17-c）：``verify_skill`` /
+    ``in_model_whitelist`` / ``requires_session`` 三项直接读
+    ``verify/gate.py::VULN_REGISTRY``，本文件**不再自持这几份副本**——
+    自持副本正是限制 58 那一类「多处手工同步、互不校验」缺陷的温床。
+
+    ``producer`` 是本文件**唯一自持**的字段：它是**人类可读的生产者说明**
+    （规则表 kind / 模型通道），只用于失败信息定位，判定一律走真实代码。
+    登记表**刻意不记 producer**——它是规则表的属性、会随规则表演进，
+    记进「类型事实表」就等于制造第二个真相源。
     """
 
     producer: str
-    handler: str | None  # orchestrator._verify_handlers 里的 skill 名
-    skill: str | None  # skills/<name>/ 目录名（无外部 skill 的为 None）
-    profile: str | None  # profiles.py 的登记名（与 skill 同名）
-    in_model_whitelist: bool  # 是否在 llm.triage.ALLOWED_VULN_TYPES
-    note: str = ""
+    #: 以下三项由 :func:`_landing` 从 ``VULN_REGISTRY`` 回填
+    verify_skill: str
+    in_model_whitelist: bool
+    requires_session: bool
 
 
-#: vuln_type → 落点清单。**新增类型必须在此登记**——未登记即测试失败
-#: （与 `GATE_MATRIX` 键集双向校验，任一侧多出/缺失都会被断言抓到）。
+def _landing(vuln_type: str, producer: str) -> VulnLanding:
+    """从登记表取机制字段 + 本文件给出的人类可读生产者说明。"""
+    spec = VULN_REGISTRY[vuln_type]
+    return VulnLanding(
+        producer=producer,
+        verify_skill=spec.verify_skill,
+        in_model_whitelist=spec.in_model_whitelist,
+        requires_session=spec.requires_session,
+    )
+
+
+#: vuln_type → 落点清单。**新增类型必须在此登记**（与 `VULN_REGISTRY` 键集双向校验）。
 VULN_LANDINGS: dict[str, VulnLanding] = {
-    "sqli": VulnLanding(
-        producer="param-endpoint / form_page（_SQLI_PARAM_HINTS 命中）",
-        handler="verify-sqli",
-        skill="verify-sqli",
-        profile="verify-sqli",
-        in_model_whitelist=True,
+    "sqli": _landing(
+        "sqli",
+        "param-endpoint / form_page（_SQLI_PARAM_HINTS 命中）+ 模型通道",
     ),
-    "xss": VulnLanding(
-        producer="param-endpoint（_XSS_PARAM_HINTS 命中）",
-        handler="verify-xss",
-        skill="verify-xss",
-        profile="verify-xss",
-        in_model_whitelist=True,
+    "xss": _landing(
+        "xss",
+        "param-endpoint（_XSS_PARAM_HINTS 命中）+ 模型通道",
     ),
-    "idor": VulnLanding(
-        producer="param-endpoint（_IDOR_PARAM_HINTS 命中）",
-        handler="verify-idor",
-        skill="verify-idor",
-        profile="verify-idor",
-        in_model_whitelist=True,
+    "idor": _landing(
+        "idor",
+        "param-endpoint（_IDOR_PARAM_HINTS 命中）+ 模型通道",
     ),
-    "ssrf": VulnLanding(
+    "ssrf": _landing(
+        "ssrf",
         # M15 第一步刻意只放开候选：规则表**不给** SSRF 提示表，
         # 唯一生产者是模型通道。
-        producer="模型通道（ALLOWED_VULN_TYPES；规则表刻意零候选）",
-        handler="verify-ssrf",
-        skill="verify-ssrf",
-        profile="verify-ssrf",
-        in_model_whitelist=True,
-        note="规则表刻意不加 SSRF 提示表（M15 的落地形态）",
+        "模型通道（ALLOWED_VULN_TYPES；规则表刻意零候选）",
     ),
-    "unauth-exposure": VulnLanding(
+    "unauth-exposure": _landing(
+        "unauth-exposure",
         # M16-c 裁定：窄形态无需语义判断 ⇒ 由确定性规则表从 web-probe 派生，
-        # **不**进模型白名单。该派生即限制 58 缺失的那一环。
-        producer="web-probe（有预置会话且状态码 ∈ 2xx）",
-        handler="verify-unauth",
-        skill="verify-unauth",
-        profile="verify-unauth",
-        in_model_whitelist=False,
-        note="M16-c 裁定：确定性派生，刻意不进模型白名单",
+        # **不**进模型白名单。该派生由 M17-b 实现（限制 58 关闭）。
+        "web-probe（有预置会话且状态码 ∈ 2xx）",
     ),
 }
 
@@ -203,8 +202,8 @@ NON_GATE_VULN_TYPES: dict[str, str] = {
 
 
 def _registered_types() -> set[str]:
-    """已注册类型的真相源 = ``GATE_MATRIX`` 键 ∪ ``VULN_LANDINGS`` 键。"""
-    return set(GATE_MATRIX) | set(VULN_LANDINGS)
+    """已注册类型的真相源 = ``verify/gate.py::VULN_REGISTRY``（M17-c）。"""
+    return set(VULN_REGISTRY)
 
 
 def _known_types() -> set[str]:
@@ -270,43 +269,68 @@ def _run_real_triage(tmp_path: Path, session: SessionConfig | None):
 
 
 def test_landings_and_gate_matrix_are_bijective():
-    """``VULN_LANDINGS`` 与 ``GATE_MATRIX`` 键集必须逐条一致。"""
-    assert set(VULN_LANDINGS) == set(GATE_MATRIX), (
-        "落点清单与证据门矩阵的键集必须完全一致；仅在矩阵="
-        + str(sorted(set(GATE_MATRIX) - set(VULN_LANDINGS)))
+    """三处键集/派生值必须逐条一致：``VULN_REGISTRY`` ↔ ``VULN_LANDINGS`` ↔ ``GATE_MATRIX``。
+
+    M17-c 起 ``GATE_MATRIX`` 是登记表的派生视图，故这条同时钉住
+    「派生确实生效」与「本文件的落点清单没漏登记」。
+    """
+    assert set(VULN_LANDINGS) == set(VULN_REGISTRY), (
+        "落点清单与登记表键集必须完全一致；仅在登记表="
+        + str(sorted(set(VULN_REGISTRY) - set(VULN_LANDINGS)))
         + "，仅在清单="
-        + str(sorted(set(VULN_LANDINGS) - set(GATE_MATRIX)))
+        + str(sorted(set(VULN_LANDINGS) - set(VULN_REGISTRY)))
     )
+    assert set(GATE_MATRIX) == set(VULN_REGISTRY), (
+        "GATE_MATRIX 必须是登记表的派生视图；差异="
+        + str(sorted(set(GATE_MATRIX) ^ set(VULN_REGISTRY)))
+    )
+    # 派生值逐项等价（不只是键集）
+    for vuln_type, spec in VULN_REGISTRY.items():
+        requirement = GATE_MATRIX[vuln_type]
+        assert requirement.methods == spec.methods, vuln_type + " 的 methods 派生不一致"
+        assert requirement.behavioral_kinds == spec.behavioral_kinds, (
+            vuln_type + " 的 behavioral_kinds 派生不一致"
+        )
 
 
-def test_every_landing_has_skill_dir_and_profile():
-    """每个落点声明的 skill 目录与 profiles 登记都必须在真仓库里存在。"""
-    for vuln_type, landing in sorted(VULN_LANDINGS.items()):
-        assert landing.handler, vuln_type + " 未声明 verify handler"
-        skill_md = BUILTIN_SKILLS / str(landing.handler) / "SKILL.md"
+def test_every_registered_type_has_skill_dir_and_profile():
+    """登记表里每个类型的 verify skill 都必须在**三处**真实存在且同名。
+
+    三处 = ``skills/<name>/SKILL.md`` 目录 + ``profiles.py`` 画像登记 +
+    ``_verify_handlers`` 的键（第三处在 `test_every_registered_type_has_verify_handler` 里断言）。
+    """
+    for vuln_type, spec in sorted(VULN_REGISTRY.items()):
+        assert spec.verify_skill, vuln_type + " 未声明 verify_skill"
+        skill_md = BUILTIN_SKILLS / spec.verify_skill / "SKILL.md"
         assert skill_md.is_file(), (
-            vuln_type + " 的 handler " + str(landing.handler) + " 缺 "
+            vuln_type + " 的 verify skill " + spec.verify_skill + " 缺 "
             + str(skill_md.relative_to(REPO))
         )
-        profile = profile_for(str(landing.profile))  # 未登记即 KeyError（fail-closed）
+        profile = profile_for(spec.verify_skill)  # 未登记即 KeyError（fail-closed）
         assert profile.risk_level == "L2", (
             vuln_type + " 的验证 skill 风险级为 " + profile.risk_level + "，预期 L2"
         )
 
 
 def test_model_whitelist_matches_registry():
-    """白名单声明必须与 ``llm/triage.py`` 的真实白名单一致（防声明漂移）。"""
+    """白名单必须**恰好**是登记表里 ``in_model_whitelist=True`` 的那些（M17-c）。
+
+    同时钉住 ``llm/triage.py`` 的 re-export 与登记表同源（同一对象），
+    防止有人把白名单改回手工常量。
+    """
     declared = {
-        vuln_type
-        for vuln_type, landing in VULN_LANDINGS.items()
-        if landing.in_model_whitelist
+        spec.vuln_type for spec in VULN_REGISTRY.values() if spec.in_model_whitelist
     }
-    actual = _model_channel_producers()
-    assert declared == actual, (
-        "落点清单与 ALLOWED_VULN_TYPES 不一致：仅在清单="
-        + str(sorted(declared - actual))
+    assert declared == set(ALLOWED_VULN_TYPES), (
+        "登记表与 ALLOWED_VULN_TYPES（gate 派生）不一致：仅在登记表="
+        + str(sorted(declared - set(ALLOWED_VULN_TYPES)))
         + "，仅在白名单="
-        + str(sorted(actual - declared))
+        + str(sorted(set(ALLOWED_VULN_TYPES) - declared))
+    )
+    triage_allowed = _model_channel_producers()
+    assert triage_allowed == set(ALLOWED_VULN_TYPES), (
+        "llm/triage.py 的白名单必须与 verify/gate.py 派生值同源；差异="
+        + str(sorted(triage_allowed ^ set(ALLOWED_VULN_TYPES)))
     )
 
 
@@ -330,6 +354,51 @@ def test_probe_enumeration_is_saturated():
         "param-endpoint",
         "form_page",
     }
+
+
+# --------------------------------------------------------------------------
+# 守护 0：登记表自身的自洽（M17-c）
+# --------------------------------------------------------------------------
+
+
+def test_registry_specs_are_internally_consistent():
+    """``VulnSpec`` 的字段必须与键、派生值、前置集三处一致（M17-c）。"""
+    for key, spec in sorted(VULN_REGISTRY.items()):
+        assert isinstance(spec, VulnSpec), key + " 不是 VulnSpec"
+        assert spec.vuln_type == key, (
+            key + " 的 spec.vuln_type=" + spec.vuln_type + " 与键不一致"
+        )
+        assert spec.methods, key + " 的 methods 为空"
+        assert spec.behavioral_kinds, key + " 的 behavioral_kinds 为空"
+        assert spec.verify_skill.startswith("verify-"), (
+            key + " 的 verify_skill 命名不符合 verify-* 约定：" + spec.verify_skill
+        )
+        assert spec.note, key + " 缺 note（给人看的理由也要有）"
+    # 需会话前置集必须与登记表逐条一致
+    declared = {
+        spec.vuln_type for spec in VULN_REGISTRY.values() if spec.requires_session
+    }
+    assert declared == set(_VERIFY_PRECONDITIONS), (
+        "_VERIFY_PRECONDITIONS 必须由登记表的 requires_session 派生；差异="
+        + str(sorted(declared ^ set(_VERIFY_PRECONDITIONS)))
+    )
+
+
+def test_registry_producer_descriptions_are_complete():
+    """每个注册类型都要有生产者说明（防「加了类型但没人写它怎么被产出」）。"""
+    for vuln_type, landing in sorted(VULN_LANDINGS.items()):
+        assert landing.producer.strip(), vuln_type + " 缺 producer 说明"
+    extra = sorted(set(VULN_LANDINGS) - set(VULN_REGISTRY))
+    assert not extra, "落点清单里有未注册的类型：" + str(extra)
+
+
+def test_landing_mechanism_fields_are_derived_not_duplicated():
+    """落点的机制字段必须**等于**登记表（派生，而非第二份副本）。"""
+    for vuln_type, landing in sorted(VULN_LANDINGS.items()):
+        spec = VULN_REGISTRY[vuln_type]
+        assert landing.verify_skill == spec.verify_skill
+        assert landing.in_model_whitelist == spec.in_model_whitelist
+        assert landing.requires_session == spec.requires_session
 
 
 # --------------------------------------------------------------------------
@@ -438,12 +507,19 @@ def test_every_registered_type_has_verify_handler():
     for name, (vuln_types, _fn) in handlers.items():
         assert isinstance(vuln_types, frozenset), name + " 的覆盖集不是 frozenset"
         covered |= set(vuln_types)
-    missing = sorted(set(VULN_LANDINGS) - covered)
-    extra = sorted(covered - set(VULN_LANDINGS))
+    missing = sorted(set(VULN_REGISTRY) - covered)
+    extra = sorted(covered - set(VULN_REGISTRY))
     assert not missing and not extra, (
-        "handler 覆盖集与落点清单不一致：缺 handler 的注册类型="
+        "handler 覆盖集与登记表不一致：缺 handler 的注册类型="
         + str(missing) + "；覆盖了未登记类型=" + str(extra)
     )
+    # handler 名必须与登记表声明的 verify_skill 一致（四处同名）
+    wrong = sorted(
+        spec.verify_skill
+        for vuln_type, spec in VULN_REGISTRY.items()
+        if spec.verify_skill not in handlers
+    )
+    assert not wrong, "登记表声明的 verify_skill 在 _verify_handlers 里找不到：" + str(wrong)
 
 
 def test_verify_handlers_cover_nothing_unregistered():

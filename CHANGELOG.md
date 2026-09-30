@@ -6,6 +6,50 @@
 
 ## [未发布]
 
+### 变更（M17-c `VULN_REGISTRY` 单一真相源 —— 「加一个漏洞类型」只需登记一次）
+
+**做了什么**：把散在三处、**手工维护且互不校验**的漏洞类型事实收敛成一张表。
+
+**收敛前后的对照**
+
+| 事实 | M17-c 之前（三处手工同步） | M17-c 之后 |
+|---|---|---|
+| 确认门 + method 白名单 | `verify/gate.py::GATE_MATRIX` | **由登记表派生**（推导式） |
+| 进不进模型 triage 白名单 | `llm/triage.py::ALLOWED_VULN_TYPES` | **由登记表派生**（`in_model_whitelist`） |
+| 验证要不要预置会话 | `core/orchestrator.py::_VERIFY_PRECONDITIONS` | **由登记表派生**（`requires_session`） |
+
+`VULN_REGISTRY: dict[str, VulnSpec]` 落在 `verify/gate.py`（依赖树的**叶**，只依赖
+`findings` + `verify.*`，故不引入循环导入——实测 `gate` / `llm.triage` / `verify` 包
+三处白名单是**同一对象**）。`VulnSpec` 是 frozen dataclass：
+`vuln_type` / `methods` / `behavioral_kinds` / `verify_skill` / `in_model_whitelist` /
+`requires_session` / `note`。
+
+**为什么值得做**：M16-c / 限制 58 那次「六个落点全就位、就是没接上」正是这种散落的
+代价——登记表之间**没有任何机制保证一致**，而这类不一致恰好落在安全语义上。
+
+**兼容性**：`GATE_MATRIX` 与 `ALLOWED_VULN_TYPES` 的**名字与可导入位置均不变**
+（`llm/triage.py` 以私有名导入后赋回同名，避开 `x = x` 的 NameError；
+`verify/__init__.py` 的 re-export 已补新名字），故**既有 import 点零改动**。
+
+**守护测试同步升级**（不新增测试文件，改 `tests/test_vuln_registry.py`）：
+`VulnLanding` 的机制字段改为**从登记表派生**（测试文件不再自持副本——自持副本
+正是「多处手工同步」的温床）；新增「登记表自洽」「producer 说明齐备」「落点机制
+字段是派生而非副本」三条守护；键集双向校验升级为**三处键集 + 派生值逐项等价**。
+
+**刻意不做**：**不把 `producer` 记进登记表**。它是**规则表**的属性、会随规则表演进
+（M15 的 `ssrf` 至今规则表零候选），记进「类型事实表」就是制造第二个真相源。
+生产者可达性仍由走真实 `run_triage_phase` 的穷举守护断言——边界见 AGENTS.md 限制 60。
+
+**顺带更正**：`llm/triage.py` 里「该派生**当前尚未实现**」一句在 M17-b 实现后已过期，
+一并改为「已于 M17-b 实现（限制 58 关闭）」。
+
+**测试**：全量 **1278 passed / 0 failed / 0 xfailed**；旧测试**零改动**。
+**派生值逐项等价实测**：`GATE_MATRIX` 键 = `[idor, sqli, ssrf, unauth-exposure, xss]`、
+白名单 = `[idor, sqli, ssrf, xss]`、需会话前置 = `[ssrf, unauth-exposure]`、
+七个 method 名仍互不染指、`VulnSpec` 不可变（`FrozenInstanceError`）；
+**变异探针**：注入未实现的 `phantom-rce` 后，生产者守护 + handler 守护 +
+落点双向校验**三者同时发现它**，而真实仓库零缺口。
+
 ### 修复（M17-b `unauth-exposure` 接生产 —— 关闭限制 58 + 59）
 
 **做了什么**：把 v0.3.0 那个「宣称第 5 类可确认漏洞、实际生产链路不可用」的缺口闭合。

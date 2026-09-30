@@ -28,13 +28,13 @@ triage 从未用过 LLM。本模块补上这一环。
   ``verify/gate.py::GATE_MATRIX`` 对未知类型 fail-closed（永远不可能
   Confirmed），放行只会污染 findings.jsonl。
 
-  白名单与 ``GATE_MATRIX`` 的**差异是刻意且方向相反的两处**（M16-c 后修正，
-  原文误写为「唯一区别是 ssrf」——该表述在 M16-c 之后已过期）：
+  白名单与「已注册类型」的**差异是刻意且方向相反的两处**（M16-c 后修正，原文
+  误写为「唯一区别是 ssrf」——该表述在 M16-c 之后已过期；M17-c 起两侧同源于
+  ``verify/gate.py::VULN_REGISTRY``，差异表现为 ``in_model_whitelist`` 字段）：
   ① ``ssrf`` **只在白名单**：已有模型候选通道（M15）而验证器后补（M16）；
-  ② ``unauth-exposure`` **只在矩阵**而**不在白名单**：它的候选由**确定性规则表**
-     从 ``web-probe`` 信号派生（窄形态无需语义判断），故不需要进模型白名单；
-     ⚠️ 该派生**当前尚未实现** ⇒ 该类型的 Finding 在**生产链路不可达**，
-     详见 AGENTS.md 已知限制 58。
+  ② ``unauth-exposure`` **不在白名单**：它的候选由**确定性规则表**从 ``web-probe``
+     信号派生（窄形态无需语义判断），故刻意不交给模型。
+     该派生已于 **M17-b 实现**（限制 58 关闭）。
   ``GATE_MATRIX`` 对未知类型 fail-closed（永远不可能 Confirmed），故放行只会
   污染 findings.jsonl。``ssrf`` 的落地形态见 ``verify/ssrf.py`` 与
   ``docs/design.md`` §7.12；``unauth-exposure`` 见 §7.15 与限制 58。
@@ -52,15 +52,19 @@ from proofhound.compliance.audit import AuditLog
 from proofhound.llm.repair import complete_structured
 from proofhound.llm.router import Tier
 
-#: 允许的漏洞类型白名单。
-#: 模型不得发明新类型——无验证器的类型只会在 findings.jsonl 里堆积噪声。
+# M17-c：白名单的唯一真相源在 verify/gate.py（本模块只 re-export）
+from proofhound.verify.gate import ALLOWED_VULN_TYPES as _ALLOWED_VULN_TYPES
+
+#: 允许的漏洞类型白名单——**本模块不再自持事实**（M17-c）。
 #:
-#: ``ssrf`` 自 M15（SSRF 两步走第一步）起**只放开候选**：它没有 verifier，
-#: 故 ``GATE_MATRIX`` 里**刻意没有**对应项，证据门对 ssrf 恒 fail-closed
-#: （永远不可能 Confirmed）。这是"先测候选质量、再决定建不建验证器"的
-#: 落地形态，不是遗漏——``ssrf`` 的验证器已于 M16 落地（见
-#: ``verify/ssrf.py``），矩阵项随 ``verify-*`` skill 扩展。
-ALLOWED_VULN_TYPES: frozenset[str] = frozenset({"sqli", "xss", "idor", "ssrf"})
+#: 它是 ``verify/gate.py::VULN_REGISTRY`` 的**派生视图**（``in_model_whitelist=True``
+#: 的那些）。一个类型的「有没有确认门 / 进不进模型白名单 / 要不要预置会话」自此
+#: 只有一处登记，不再三处手工同步。
+#:
+#: **名字与可导入位置保持不变**（本模块 re-export），故既有 import 点零改动。
+#: 注意白名单**不等于**已注册集：``unauth-exposure`` 在登记表里而**刻意不在**
+#: 白名单（窄形态由确定性规则表派生，无需语义判断）。
+ALLOWED_VULN_TYPES: frozenset[str] = _ALLOWED_VULN_TYPES
 
 #: 置信度档位（仅作审计与排序参考，**不参与任何解密判定**）。
 ALLOWED_CONFIDENCES: frozenset[str] = frozenset({"low", "medium", "high"})

@@ -13,18 +13,24 @@ from proofhound.verify.cvss import (
     severity_for_score,
 )
 from proofhound.verify.gate import (
+    ALLOWED_VULN_TYPES,
     BEHAVIORAL_EVIDENCE_KIND,
     GATE_MATRIX,
+    VULN_REGISTRY,
     GateRequirement,
     GateResult,
+    VulnSpec,
     check,
 )
 from proofhound.verify.verifier import Verifier, VerifierError
 
 __all__ = [
+    "ALLOWED_VULN_TYPES",
     "BEHAVIORAL_EVIDENCE_KIND",
     "CVSSVectorError",
     "GATE_MATRIX",
+    "VULN_REGISTRY",
+    "VulnSpec",
     "GateRequirement",
     "GateResult",
     "Verifier",
