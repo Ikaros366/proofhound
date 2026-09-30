@@ -66,6 +66,16 @@ SKILL_PROFILES: dict[str, SkillProfile] = {
             "不改目标状态；确认靠宿主 listener 收到回调（带外二值事实）"
         ),
     ),
+    "verify-cmdi": SkillProfile(
+        risk_level="L2",
+        mutating=False,
+        note=(
+            "只读验证：载荷只发起一次出站 HTTP 回调（注入值形如 ;curl http://<我们的 "
+            "listener>/c/<token>），不写目标状态、不读文件、不外泄命令输出、不做"
+            "反弹 shell；确认靠宿主 listener 收到请求（带外二值事实），"
+            "另用 DNS 非命中变体排除第三方代抓取"
+        ),
+    ),
     "verify-unauth": SkillProfile(
         risk_level="L2",
         mutating=False,

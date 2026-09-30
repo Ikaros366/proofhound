@@ -94,6 +94,22 @@ from proofhound.verify.browser import (
     payload_url as xss_payload_url,
 )
 from proofhound.verify.browser import PAYLOAD_TEMPLATES as XSS_PAYLOAD_TEMPLATES
+from proofhound.verify.cmdi import (
+    CMDI_CONFIRMED_METHOD,
+    DELIVERY_VARIANT,
+    DNS_VARIANT,
+    VARIANTS as CMDI_VARIANTS,
+)
+from proofhound.verify.cmdi import build_probe_url as cmdi_build_probe_url
+from proofhound.verify.cmdi import callback_value as cmdi_callback_value
+from proofhound.verify.cmdi import delivery_probe_value as cmdi_delivery_probe_value
+from proofhound.verify.cmdi import dns_probe_value as cmdi_dns_probe_value
+from proofhound.verify.cmdi import fetch as cmdi_fetch_default
+from proofhound.verify.cmdi import judge as cmdi_judge
+from proofhound.verify.cmdi import new_cmdi_token
+from proofhound.verify.cmdi import same_origin as cmdi_same_origin
+from proofhound.verify.cmdi import summary_for_verifier as cmdi_summary_for_verifier
+from proofhound.verify.cmdi import token_delivered as cmdi_token_delivered
 from proofhound.verify.cvss import base_score as cvss_base_score
 from proofhound.verify.cvss import severity_for_score
 from proofhound.verify.gate import BEHAVIORAL_EVIDENCE_KIND
@@ -482,6 +498,7 @@ class Orchestrator:
         ssrf_listener_factory=None,
         ssrf_fetch=None,
         unauth_judge_factory=None,
+        cmdi_fetch=None,
         triage_rules: bool = True,
         triage_model: bool = False,
         verify_prefilter: bool = False,
@@ -519,6 +536,10 @@ class Orchestrator:
         # M16-c：verify-unauth 的敏感度判定器注入口子（测试给替身判定器；
         # None 时懒建真实 UnauthJudge，走 T1 档）
         self._unauth_judge_factory = unauth_judge_factory
+        # M18：verify-cmdi 的宿主侧取数口子（测试给罐头 fetch；None 时用
+        # verify/cmdi.py 的真实实现）。listener 复用 SSRF 的 ssrf_listener_factory
+        # ——两者是同一件基础设施（`CallbackListener`），共用即可。
+        self._cmdi_fetch = cmdi_fetch if cmdi_fetch is not None else cmdi_fetch_default
         # 回调 listener 按 finding 分桶（每条候选一个独立 listener + 独立 token 空间），
         # phase 收尾统一释放（与 _close_browser 同范式）
         self._ssrf_listeners: dict[str, CallbackListener] = {}
@@ -922,6 +943,10 @@ class Orchestrator:
             # M16-c：未授权暴露（唯一确认门径）——匿名/已认证**响应字节等价**
             # 才算；AI 判定器只产敏感度结论与锚点、不产证据
             "verify-unauth": (frozenset({"unauth-exposure"}), self._verify_unauth),
+            # M18：命令注入（唯一确认门径）——注入的**命令发起的回调**到达
+            # listener 才算；响应回显/状态码/耗时一律不是证据，另用 DNS
+            # 非命中变体排除第三方代抓取
+            "verify-cmdi": (frozenset({"cmdi"}), self._verify_cmdi),
         }
 
     def verify_skill_coverage(self, skill_name: str = "verify-sqli") -> frozenset[str]:
@@ -2385,6 +2410,325 @@ class Orchestrator:
         store.append(finding)
 
         # 6. 证据门 → Verifier 终审 → 终态迁移（公共收尾）
+        return self._gate_and_review(finding, skill, store, summary=summary)
+
+    def _verify_cmdi(self, finding: Finding, skill, store: FindingStore) -> str:
+        """verify-cmdi SOP（skills/verify-cmdi/SKILL.md）的确定性执行（M18）。
+
+        确认铁律：**仅"我们注入的命令发起的回调"到达 listener 可确认**（带外二值
+        事实）。响应体里回显出来的 ``curl ...`` 文本、状态码、耗时一律不是证据
+        ——命令注入的"答案不在目标给我们的响应里"。
+
+        判定（`verify/cmdi.py::judge`，纯函数，宁漏勿滥）：
+
+        - 命中 token ∧ 交付证明成立 ∧ DNS 变体未命中 → REPRODUCED → 证据门 → Verifier；
+        - **DNS 非命中变体命中** → blocked（有第三方在代抓取，观测不可信）；
+        - 交付证明不成立 / 探针出错 → blocked（覆盖不全，绝不驳回）；
+        - 干净未命中 + 交付证明成立 → REJECTED（真阴性）。
+
+        防伪三道（缺一不可）：① 每探针唯一 token + 常量时间比对（不带 token 的
+        请求记 ``cmdi_callback_ignored``，不计命中）；② 交付证明（先注入**纯
+        token**，目标原样回显 ⇒ 载荷"送达"有据）；③ **DNS 非命中变体**（不可解析
+        主机名：真 shell 与"替我们抓取的中间件"都发不出我们能收到的请求 ⇒ 它命中
+        即说明命中来自第三方）。
+
+        **与 verify-ssrf 的两处结构差异**（都是本类型性质决定的，不是简化）：
+        ① **不需要预置会话**——判据是"注入的命令发起的回调"，与身份无关
+        （ssrf 的带会话 baseline 是为证明"服务端在替已认证用户发请求"）；
+        ② **多一道 DNS 探针**——命令注入可能打在 WAF/反代/截图服务前面。
+
+        请求构造、载荷拼接、判定全是确定性代码（红线 1）；唯一 LLM 调用是收尾
+        的 Verifier 终审。
+        """
+        if not finding.param:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="cmdi 候选缺 param，无法构造注入载荷（fail-closed）",
+            )
+            return "blocked"
+        if CRAWL_FORM_EVIDENCE_KIND in finding.evidence_kinds:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="POST 表单型候选的 cmdi 验证未实现（本轮只覆盖 GET query 参数）",
+            )
+            return "blocked"
+        scope = getattr(self.runner, "scope", None)
+        if scope is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="runner 未挂 scope，cmdi 验证缺 scope 防线（fail-closed）",
+            )
+            return "blocked"
+
+        # 1. scope 授权前置（红线 5）：目标 asset 必须已授权。
+        # 与 ssrf 同纪律：**不**对探测 URL 逐条 check_scope——载荷里携带的是我们的
+        # 回调地址（基础设施，非目标），check_scope 会把它当目标提取并按端口拒掉。
+        # 探测 URL 的"不越界"改由下面的**同源自检**保证。
+        decision = check_scope(scope, [finding.asset])
+        if not decision.allowed:
+            self.audit.record(
+                "verify_scope_rejected",
+                finding_id=finding.id,
+                violations=decision.violations,
+            )
+            return "blocked"
+
+        # 2. 回调 listener（复用 SSRF 的同一件基础设施；不可用即 blocked）
+        try:
+            listener = self._ssrf_listener(finding.id)
+        except SsrfListenerError as exc:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=f"回调 listener 不可用（fail-closed）: {exc}",
+            )
+            return "blocked"
+        bound_host, bound_port = listener.bound_address
+        advertised_host = (
+            ssrf_resolve_callback_host()
+            if self._ssrf_listener_factory is None
+            else bound_host
+        )
+
+        # 会话**可选**：有就带上（更贴近操作员的真实请求），没有也能验证
+        session = self._session()
+
+        asset_origin = _origin_of(finding.asset)
+        probes: list[dict] = []
+        errored = False
+        hit: tuple[str, str, list[dict]] | None = None
+
+        def run_probe(seq: int, variant: str, url: str, token: str, *,
+                      infrastructure: bool = False):
+            """发一次探测并登记 token；返回 (response, records)。
+
+            ``infrastructure=True`` 用于 **DNS 非命中探针**：它的失败是**预期行为**
+            （正确的结果就是解析不了），**不计入 errored**——否则每次干净未命中都会
+            被判 blocked，rejected 分支永远不可达（ssrf 实现期踩过的同一个坑）。
+            它的失败仍如实记入 probes 供取证。
+            """
+            nonlocal errored
+            # 同源自检：**载荷**探测 URL 必须与已授权的 asset 完全同源（红线 5）。
+            # DNS 非命中探针刻意指向不可解析主机，不受本检约束。
+            if not infrastructure and not cmdi_same_origin(url, finding.asset):
+                self.audit.record(
+                    "verify_scope_rejected",
+                    finding_id=finding.id,
+                    violations=[
+                        f"探测 URL 与 asset 不同源：{url} vs {finding.asset}"
+                    ],
+                )
+                return None, []
+            listener.register(token)
+            response = self._cmdi_fetch(url, session)
+            records = [r.to_dict() for r in listener.hits(token)]
+            probes.append(
+                {
+                    "seq": seq,
+                    "variant": variant,
+                    "url": url,
+                    "token": token,
+                    "status": response.status,
+                    "error": response.error,
+                    "callback_hits": len(records),
+                    "elapsed_s": round(response.elapsed_s, 3),
+                }
+            )
+            self.audit.record(
+                "cmdi_probe_attempt",
+                finding_id=finding.id,
+                seq=seq,
+                variant=variant,
+                url=url,
+                token=token,
+                status=response.status,
+                error=response.error is not None,
+                callback_hits=len(records),
+            )
+            if response.error is not None and not infrastructure:
+                errored = True
+            return response, records
+
+        def callback_url_for(token: str) -> str:
+            """由 token 现构造回调地址（**token 与注入 URL 必须同一真相源**）。
+
+            ssrf 实现期踩过的坑：循环外生成 value、循环内另生成 token ⇒ 注册的
+            token 与载荷里的 token 不一致，confirmed 分支永不触发。
+            """
+            return ssrf_callback_url(advertised_host, bound_port, token)
+
+        # 3. DNS 非命中变体（先做：它命中就说明本次观测不可信，无需再打目标）
+        dns_token = new_cmdi_token()
+        dns_value, dns_url = cmdi_dns_probe_value(
+            ssrf_new_nonce_host(), bound_port, dns_token
+        )
+        _dns_resp, dns_records = run_probe(
+            0, DNS_VARIANT, dns_url, dns_token, infrastructure=True
+        )
+        dns_misfire = bool(dns_records)
+
+        # 4. 交付证明探针（纯 token，不含命令分隔符）
+        delivery_token = new_cmdi_token()
+        delivery_url = cmdi_build_probe_url(
+            finding.asset, finding.param, cmdi_delivery_probe_value(delivery_token)
+        )
+        delivery_resp, _ = run_probe(1, DELIVERY_VARIANT, delivery_url, delivery_token)
+        # 交付证明的判据：**响应正文里出现我们的纯 token**（`token_delivered`
+        # 只搜前 DELIVERY_PROOF_CHARS 个字符，上限确定）。探针出错则交付证明不成立。
+        delivered = bool(
+            delivery_resp is not None
+            and delivery_resp.error is None
+            and cmdi_token_delivered(delivery_resp, delivery_token)
+        )
+
+        # 5. 载荷变体（全部只读 GET；命中即停）
+        for seq, (variant, template) in enumerate(CMDI_VARIANTS, start=2):
+            if dns_misfire or hit is not None:
+                break
+            token = new_cmdi_token()
+            url = cmdi_build_probe_url(
+                finding.asset, finding.param, cmdi_callback_value(template, callback_url_for(token))
+            )
+            _resp, records = run_probe(seq, variant, url, token)
+            if records:
+                hit = (token, variant, records)
+
+        # 6. 确定性判定（纯函数；全部依据落盘）
+        judgment = cmdi_judge(
+            callback_hit=hit is not None,
+            hit_requests=hit[2] if hit else [],
+            hit_variant=hit[1] if hit else "",
+            delivered=delivered,
+            dns_misfire=dns_misfire,
+            probes=probes,
+            probes_errored=errored,
+            ignored=[r.to_dict() for r in listener.ignored],
+        )
+        callbacks_path = self.evidence_dir / f"cmdi_{finding.id}_callbacks.jsonl"
+        callbacks_path.write_text(
+            "".join(
+                json.dumps(record, ensure_ascii=False) + "\n"
+                for record in (
+                    *judgment.hit_requests,
+                    *[
+                        {"ignored": True, **record}
+                        for record in judgment.ignored_requests
+                    ],
+                )
+            ),
+            encoding="utf-8",
+        )
+        j_path = self.evidence_dir / f"cmdi_{finding.id}_judgment.json"
+        secrets = session.secret_values() if session is not None else []
+        j_path.write_bytes(
+            redact_bytes(
+                (
+                    json.dumps(
+                        {
+                            "finding_id": finding.id,
+                            "asset": finding.asset,
+                            "param": finding.param,
+                            "callback_listener": f"{bound_host}:{bound_port}",
+                            "delivery_probe_url": delivery_url,
+                            "dns_probe_url": dns_url,
+                            **judgment.to_dict(),
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+                secrets,
+            )
+        )
+        self.audit.record(
+            "cmdi_callback_judged",
+            finding_id=finding.id,
+            verdict=judgment.verdict,
+            callback_hits=len(judgment.hit_requests),
+            delivered=judgment.delivered,
+            dns_misfire=judgment.dns_misfire,
+            probes=len(judgment.probes),
+            ignored=len(judgment.ignored_requests),
+        )
+
+        # 7. blocked：覆盖不全，**不驳回**（Finding 停在 Hypothesis）
+        if judgment.verdict == "blocked":
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="cmdi 判定未能完成（覆盖不全，不驳回）: "
+                + "；".join(judgment.reasons),
+            )
+            return "blocked"
+
+        # 8. rejected：干净未命中 + 交付证明成立（确定性真阴性，零额外 LLM 成本）
+        if judgment.verdict == "rejected":
+            finding.transition(
+                FindingState.REJECTED,
+                actor=skill.name,
+                reason="；".join(judgment.reasons) + f"（判定依据见 {j_path.name}）",
+            )
+            store.append(finding)
+            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+            return "rejected"
+
+        # 9. confirmed：回调命中 → 证据入包（behavioral + 四段式）
+        sources = sorted(
+            {r.get("source_ip", "") for r in judgment.hit_requests if r.get("source_ip")}
+        )
+        agents = sorted(
+            {r.get("user_agent", "") for r in judgment.hit_requests if r.get("user_agent")}
+        )
+        finding.verification = Verification(
+            method=CMDI_CONFIRMED_METHOD,
+            evidence_refs=[
+                str(callbacks_path),
+                str(j_path),
+            ],
+            baseline_diff=(
+                f"回调 listener 绑定 {bound_host}:{bound_port}，收到 "
+                f"{len(judgment.hit_requests)} 次含本次探针 token 的请求；"
+                f"交付证明成立（纯 token 探针被目标原样回显）；"
+                f"DNS 非命中变体未命中（排除第三方代抓取）"
+            ),
+            claim=f"参数 {finding.param} 被拼接进服务端执行的命令，可执行任意命令",
+            expected="我们注入的命令应使目标向回调地址发起一次请求（带本次探针 token）",
+            actual=(
+                f"listener 收到 {len(judgment.hit_requests)} 次回调（命中变体 "
+                f"{judgment.hit_variant}；来源 IP {sources or '未知'}；"
+                f"UA {agents or '未提供'}）；请求原文见 {callbacks_path.name}"
+            ),
+            reproduction_steps=[
+                f"注入纯 token 值确认参数回显（交付证明）→ "
+                f"marker_found={delivered}",
+                f"注入 DNS 非命中变体 → 命中={dns_misfire}"
+                f"（命中即说明有第三方代抓取）",
+                f"注入载荷变体 {judgment.hit_variant} → "
+                f"listener 收到 {len(judgment.hit_requests)} 次回调",
+                f"回调请求原文（含来源 IP/UA/路径）：{callbacks_path.name}",
+            ],
+            verified_by=f"{skill.name}@{skill.manifest.version}",
+            verified_at=_utc_now(),
+        )
+        if BEHAVIORAL_EVIDENCE_KIND not in finding.evidence_kinds:
+            finding.evidence_kinds.append(BEHAVIORAL_EVIDENCE_KIND)
+        finding.transition(
+            FindingState.REPRODUCED,
+            actor=skill.name,
+            reason=(
+                f"回调 listener 收到含本次 token 的请求（变体 {judgment.hit_variant}）"
+            ),
+        )
+        store.append(finding)
+
+        # 10. 证据门 → Verifier 终审 → 终态迁移（公共收尾）
+        summary = cmdi_summary_for_verifier(
+            judgment, callback_host_port=f"{bound_host}:{bound_port}"
+        )
         return self._gate_and_review(finding, skill, store, summary=summary)
 
     def _get_unauth_judge(self):

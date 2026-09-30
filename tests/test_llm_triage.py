@@ -163,15 +163,18 @@ def test_parse_accepts_empty_and_key_variants():
 
 
 def test_allowed_types_are_exactly_the_declared_ones():
-    """白名单**逐字**锁定：{sqli, xss, idor, ssrf}——多一个或少一个都红。
+    """白名单**逐字**锁定：{sqli, xss, idor, ssrf, cmdi}——多一个或少一个都红。
 
     M15 披露（断言意图已随任务变更）：原断言是“白名单 = 现有 verify-* 覆盖的
     类型”，而 M15 第一步**刻意**让 ssrf 例外——它有候选通道但没有验证器
     （`GATE_MATRIX` 无 ssrf 项 → 证据门恒 fail-closed，永远不可能 Confirmed）。
     “无验证器的类型不得有确认通道”这一原意图由下面的
     test_ssrf_is_hypothesis_only_no_confirmed_channel 承接并加强。
+
+    M18-a 披露：`cmdi`（命令注入）加入白名单——与 M15 加 ssrf 时的处理一致，
+    「加一个类型必须同步这条逐字断言」。**断言意图不变**（仍是逐字锁定）。
     """
-    assert ALLOWED_VULN_TYPES == frozenset({"sqli", "xss", "idor", "ssrf"})
+    assert ALLOWED_VULN_TYPES == frozenset({"sqli", "xss", "idor", "ssrf", "cmdi"})
 
 
 def test_ssrf_confirmed_requires_callback_method_only():

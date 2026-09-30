@@ -635,6 +635,7 @@ class OrchestratorPhases:
         verify_idor_skill: str = "verify-idor",
         verify_ssrf_skill: str = "verify-ssrf",
         verify_unauth_skill: str = "verify-unauth",
+        verify_cmdi_skill: str = "verify-cmdi",
     ):
         self._orch = orchestrator
         self.scan_skill = scan_skill
@@ -747,6 +748,25 @@ class OrchestratorPhases:
                     _builtin_risk_level(
                         verify_unauth_skill, unauth.manifest.risk_level
                     ),
+                )
+            )
+        # M18：第六 verify skill 槽位（命令注入带外回调验证是增强项，缺失不阻塞
+        # 主链路）。与其余五个槽位同纪律：未注册/未启用记 verify_skill_skipped。
+        # ⚠️ 限制 59 的教训：M16-c 就是漏了这一处，导致 verify-unauth 在生产栈
+        # 里永不调用——加类型时**必须**同时补槽位，守护测试会盯着。
+        cmdi = registry.get(verify_cmdi_skill)
+        if cmdi is None or not cmdi.enabled:
+            reason = "skill 未注册" if cmdi is None else "skill 未启用"
+            orchestrator.audit.record(
+                "verify_skill_skipped",
+                skill=verify_cmdi_skill,
+                reason=f"{reason}，跳过命令注入验证",
+            )
+        else:
+            self.verify_skills.append(
+                (
+                    verify_cmdi_skill,
+                    _builtin_risk_level(verify_cmdi_skill, cmdi.manifest.risk_level),
                 )
             )
 

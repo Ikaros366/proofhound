@@ -42,6 +42,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from proofhound.findings.finding import Finding
+from proofhound.verify.cmdi import CMDI_CONFIRMED_METHOD
 from proofhound.verify.ssrf import SSRF_CONFIRMED_METHOD
 from proofhound.verify.unauth_control import (
     UNAUTH_CONFIRMED_METHOD,
@@ -162,6 +163,23 @@ VULN_REGISTRY: dict[str, VulnSpec] = {
         # 等价性判定要拿「已认证视图」当基准，没有它就没有可比对象
         requires_session=True,
         note="M17-b 接上生产者与生产栈槽位（限制 58/59 关闭）",
+    ),
+    "cmdi": VulnSpec(
+        vuln_type="cmdi",
+        # M18：唯一认可确认手段 = **回调 listener 收到请求**（带外二值事实）。
+        # 与 ssrf 同族但**互不染指**：ssrf 证明"服务端替我们发了请求"，
+        # cmdi 证明"我们注入的命令被执行了"——前者是服务端行为，后者是命令
+        # 执行，两者的载荷与排除手段都不同（cmdi 多一道 DNS 非命中防伪）。
+        methods=frozenset({CMDI_CONFIRMED_METHOD}),
+        behavioral_kinds=frozenset({BEHAVIORAL_EVIDENCE_KIND}),
+        verify_skill="verify-cmdi",
+        # M18 裁定 C3：规则表加 `_CMDI_PARAM_HINTS` 保守表（cmd/exec/ping 这类
+        # 参数名恰是关键词表的强项）+ 模型通道补盲区，两条路都产候选。
+        in_model_whitelist=True,
+        # **不需要预置会话**：判据是"我们注入的命令发起的回调"，与身份无关
+        # （对比 ssrf/unauth-exposure 需要会话做 baseline/等价性对照）。
+        requires_session=False,
+        note="M18：带外回调确认；不做时间盲注/回显型/反弹 shell/读文件",
     ),
 }
 

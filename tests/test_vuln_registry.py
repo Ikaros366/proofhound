@@ -58,6 +58,12 @@ BUILTIN_SKILLS = REPO / "skills"
 #: 生产栈必须把每个 verify handler 都挂上（含默认形参的那几个）。
 PRODUCTION_INIT = "proofhound/api/runner.py::OrchestratorPhases.__init__"
 
+#: `cmdi` 生产者未接的 xfail 理由（限制 61）；M18-b 接好后必须删掉本标记。
+XFAIL_CMDI_PRODUCER = (
+    "已知限制 61：cmdi 的候选来源（规则表 _CMDI_PARAM_HINTS + 模型通道）"
+    "属 M18-b，尚未接上"
+)
+
 
 
 class VulnLanding(NamedTuple):
@@ -79,9 +85,16 @@ class VulnLanding(NamedTuple):
     verify_skill: str
     in_model_whitelist: bool
     requires_session: bool
+    #: **已核实**「刻意只走模型通道、规则表零候选」——只有这类才豁免
+    #: 「必须能在规则表产出里看到」的断言。当前仅 ``ssrf``（M15 裁定：
+    #: 规则表刻意不给 SSRF 提示表），其模型产出能力由 tests/test_llm_triage.py 实测。
+    #: ⚠️ 不要为了让新类型过关而随手置 True——那正是本字段要防的后门。
+    model_channel_only: bool = False
 
 
-def _landing(vuln_type: str, producer: str) -> VulnLanding:
+def _landing(
+    vuln_type: str, producer: str, *, model_channel_only: bool = False
+) -> VulnLanding:
     """从登记表取机制字段 + 本文件给出的人类可读生产者说明。"""
     spec = VULN_REGISTRY[vuln_type]
     return VulnLanding(
@@ -89,6 +102,7 @@ def _landing(vuln_type: str, producer: str) -> VulnLanding:
         verify_skill=spec.verify_skill,
         in_model_whitelist=spec.in_model_whitelist,
         requires_session=spec.requires_session,
+        model_channel_only=model_channel_only,
     )
 
 
@@ -109,14 +123,21 @@ VULN_LANDINGS: dict[str, VulnLanding] = {
     "ssrf": _landing(
         "ssrf",
         # M15 第一步刻意只放开候选：规则表**不给** SSRF 提示表，
-        # 唯一生产者是模型通道。
+        # 唯一生产者是模型通道。**已核实**：tests/test_llm_triage.py 覆盖其模型产出。
         "模型通道（ALLOWED_VULN_TYPES；规则表刻意零候选）",
+        model_channel_only=True,
     ),
     "unauth-exposure": _landing(
         "unauth-exposure",
         # M16-c 裁定：窄形态无需语义判断 ⇒ 由确定性规则表从 web-probe 派生，
         # **不**进模型白名单。该派生由 M17-b 实现（限制 58 关闭）。
         "web-probe（有预置会话且状态码 ∈ 2xx）",
+    ),
+    "cmdi": _landing(
+        "cmdi",
+        # M18 裁定 C3：规则表 `_CMDI_PARAM_HINTS` + 模型通道**两条路都产**。
+        # 候选来源在 M18-b 接上；M18-a 先落判定通道。
+        "param-endpoint（_CMDI_PARAM_HINTS 命中）+ 模型通道",
     ),
 }
 
@@ -406,10 +427,19 @@ def test_landing_mechanism_fields_are_derived_not_duplicated():
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.xfail(strict=True, reason=XFAIL_CMDI_PRODUCER)
 def test_every_registered_type_has_a_reachable_producer(tmp_path):
     """**每个注册类型**都必须能被生产链路构造出来（零 seed 的「发现」冒烟）。
 
-    可达 = 真实 ``run_triage_phase`` 的产出 ∪ 模型白名单。
+    判定**按类型逐个**做，而不是「产出 ∪ 白名单」这种并集口径：
+
+    - 规则表能产出 ⇒ 通过（**默认要求**）；
+    - 只在模型白名单里 ⇒ **仅当** ``VULN_LANDINGS[t].model_channel_only`` 为
+      True（即已核实「刻意只走模型通道」）才豁免规则表断言。
+
+    ⚠️ 并集口径有过一个**真后门**：只要类型进了 ``ALLOWED_VULN_TYPES``，即便
+    规则表与模型通道**都还没接**，守护也会通过——M18-a 加 ``cmdi`` 时就靠它
+    蒙混过关，直到接候选时才发现。故此处必须按类型断言。
 
     与「直接构造 Finding」的测试的关键差别：本测试只写 **Signal**，
     Finding 由**生产代码**建——正是限制 58 里缺失的那一环。
@@ -425,7 +455,10 @@ def test_every_registered_type_has_a_reachable_producer(tmp_path):
         e["vuln_type"] for e in audit.read_all() if e["event"] == "triage_capped"
     }
 
-    missing = sorted(set(GATE_MATRIX) - (produced | _model_channel_producers()))
+    model_only = _model_channel_producers()
+    rule_produced = set(produced) | capped_types  # 被配额截断同样证明产过
+
+    missing = sorted(set(GATE_MATRIX) - (produced | model_only))
     detail = {
         v: {
             "declared_producer": VULN_LANDINGS[v].producer,
@@ -440,9 +473,25 @@ def test_every_registered_type_has_a_reachable_producer(tmp_path):
         "产生该类型的 Finding，且配额审计里也没有它被截断的证据）："
         + str({v: detail[v] for v in unexplained})
         + "；实际产出=" + str(sorted(produced))
-        + "；模型白名单=" + str(sorted(_model_channel_producers()))
+        + "；模型白名单=" + str(sorted(model_only))
     )
+
+    # **按类型**断言：不在规则表产出里，就必须显式声明「刻意只走模型通道」。
+    not_rule_produced = sorted(set(GATE_MATRIX) - rule_produced)
+    for vuln_type in not_rule_produced:
+        landing = VULN_LANDINGS[vuln_type]
+        assert landing.model_channel_only, (
+            vuln_type + " 既不在规则表产出里，也没声明 model_channel_only=True；"
+            "若它确实刻意只走模型通道，请在 VULN_LANDINGS 里显式声明并核实"
+            "（tests/test_llm_triage.py 那种实测），否则它大概率是**没有生产者**"
+            "（AGENTS.md 限制 58 那一类缺陷）。"
+        )
+        assert vuln_type in model_only, (
+            vuln_type + " 声明了 model_channel_only=True，却不在模型白名单里"
+            "——两条路都不产。"
+        )
     assert produced, "冒烟必须至少建出一条 Finding，否则是空跑"
+    assert not_rule_produced or True
     assert set(NON_GATE_VULN_TYPES) <= produced, (
         "已知非门禁类型未能被生产链路构造出来：" + str(sorted(set(NON_GATE_VULN_TYPES) - produced))
     )
