@@ -1447,6 +1447,33 @@ vs 已认证敏感 JSON（相似度 0.085）⇒ 停 Hypothesis + `verify_blocked
 （既漏又误，且与「发现侧不靠关键词表」的既有立场冲突）· POST/表单 SSRF 式的扩展 ·
 红线 3/4 的任何放松 · 既有四类的 method/证据标签改动。
 
+### 7.16 落点守护：把「有没有接上」变成自动化断言（M17-a，2026-09-30）
+
+§7.15.6b 记的缺陷（`unauth-exposure` 在生产链路不可达）暴露的不是一处漏写，
+而是一类**结构性失效**：类型注册在六个落点（`GATE_MATRIX` / `verify-*` skill /
+`profiles.py` / `Orchestrator._verify_handlers` / API 生产栈槽位 / **生产期 producer**），
+**只有前五个有测试看着，第六个没有**——于是「一切都齐了、就是没接上」可以全绿通过。
+
+**断言对象必须是生产链路，不是手写 Finding。** 本里程碑的守护测试
+（`tests/test_vuln_registry.py`）就此写成两条互补的路径：
+
+1. **生产者可达**：只写 **Signal**，让**生产代码**建 Finding——走真实 `run_triage_phase`，
+   输入域穷举 `web-probe` × 全部状态码、三张提示表的**并集**每个键、`form_page` 三形态；
+   可达集 = 该产出 ∪ `ALLOWED_VULN_TYPES`。**每个 `GATE_MATRIX` 键都必须落在其中。**
+   这条直接对应「每个已注册类型至少有一个生产期 producer」。
+2. **生产栈接线**：verify handler 名必须出现在 `OrchestratorPhases.__init__` 的
+   **真实源码**（`inspect.getsource`）里——覆盖 §7.15 那个「有 handler、有 skill、
+   有 profiles 登记，却没有第 5 个槽位」的出口端缺口（AGENTS.md 限制 59）。
+
+**§7.16 的失败语义**：两个缺口在测试里是 `xfail(strict=True)`。选 strict 而非 `skip`
+的理由是**修复后必须回来删标记**——若只写 `skip`，修好了也不会有人记得删，
+断言就此永久失效（这正是缺陷 58 的成因之一）。
+
+**落点清单 `VULN_LANDINGS` 的定位**：它不是第七个真相源，而是**加类型时的同步清单**
+（人类可读的 producer 描述仅供失败信息定位；判定一律走真实代码），并与 `GATE_MATRIX`
+键集**双向**校验。已知的非门禁类型（`web-exposure`：有产出、刻意不在矩阵、进报告
+hypothesis 桶）以显式常量登记，**不做隐式豁免**——隐式豁免会让下一个类型悄悄漏掉守护。
+
 ## 8. 开发路线图
 
 
