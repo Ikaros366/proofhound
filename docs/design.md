@@ -1474,6 +1474,39 @@ vs 已认证敏感 JSON（相似度 0.085）⇒ 停 Hypothesis + `verify_blocked
 键集**双向**校验。已知的非门禁类型（`web-exposure`：有产出、刻意不在矩阵、进报告
 hypothesis 桶）以显式常量登记，**不做隐式豁免**——隐式豁免会让下一个类型悄悄漏掉守护。
 
+### 7.17 `unauth-exposure` 接生产：把 §7.15 的设计真正接上（M17-b，2026-09-30）
+
+§7.15.6b 的缺口（缺生产者）与 §7.16 新增的出口端缺口（API 生产栈无槽位）在本节一并闭合。
+维护者四次裁定：**并存** · **仅 2xx** · **独立上限 10** · **无会话不派生不回退**。
+
+**① 派生点**：`core/orchestrator.py::_triage_candidates(signal, *, session_available=False)`。
+新参数**缺省 False**，故所有既有调用方（含 `tests/test_dirsearch_parser.py` 的三处直接调用）
+行为逐字节不变——「能不能派生」是**策略**，由编排层按 scope 传入，纯函数不读 scope。
+生产期取 `session_available = scope.session 存在且能渲染 Cookie 头`，与
+`_verify_unauth` 的前置判据**同一谓词**（避免"能派生但必然 blocked"的不一致）。
+
+**② 为什么并存**：`web-exposure`（纯 status-code 观察，铁律 2 禁止 Confirmed，进报告
+hypothesis 桶）与 `unauth-exposure`（响应字节等价，可 Confirmed）**语义不同、不冗余**。
+且前者是**无会话 engagement 下「哪些端点可达」的唯一记录**——取代它等于让这类扫描
+丢掉全部信息类观察。两类型 `vuln_type` 分量不同 ⇒ dedup 指纹不同 ⇒ 同一端点两条 Finding。
+
+**③ 为什么只取 2xx**：见 `_UNAUTH_EXPOSED_STATUSES` 的注释——401/403 的匿名被拒是
+「要求认证」的**确定性**结局（直接 Rejected），3xx 因不跟随重定向多半 blocked，
+两者都只产噪声；该类型的立论「匿名直接拿到内容」只对应 2xx。**刻意不复用**
+`_EXPOSED_STATUSES`：那个集合服务的是 web-exposure 的「端点有反应」语义。
+
+**④ 贵验证配额诚实化**：`_verify_unauth` / `_verify_ssrf` 的前置（可用预置会话）是
+**结构上**的——缺它则每条候选都立刻 blocked，但旧实现在 `_prefilter_or_cap` 里
+**每条各消耗一次贵验证配额**。现在 `verify_precondition_blocked()` 在配额判定**之前**
+整类拦下：零配额消耗、逐条 `verify_blocked`（文案与 handler **逐字同源**）+
+收尾聚合 `verify_type_unavailable` / `verify_precondition_gate`。**终态零变化**：
+凡被拦者 handler 内也必然立刻 blocked。
+
+**⑤ 验收纪律**：`scripts/demo_unauth_zero_seed.py` **零 seed**——只写 Signal，Finding 由
+`run_triage_phase()` 建，再走真 `run_verify_phase()` 打真靶。这是 §7.15.6b 那条教训的
+制度化落地（交接单项目纪律第 11 条）：**验收脚本若自己 seed Finding，就只验了判定端**。
+原 `demo_verify_unauth.py` **保留不动**——它验的是判定通道自身，仍然有效、仍然必要。
+
 ## 8. 开发路线图
 
 

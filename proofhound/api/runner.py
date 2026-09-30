@@ -634,6 +634,7 @@ class OrchestratorPhases:
         verify_xss_skill: str = "verify-xss",
         verify_idor_skill: str = "verify-idor",
         verify_ssrf_skill: str = "verify-ssrf",
+        verify_unauth_skill: str = "verify-unauth",
     ):
         self._orch = orchestrator
         self.scan_skill = scan_skill
@@ -723,6 +724,29 @@ class OrchestratorPhases:
                 (
                     verify_ssrf_skill,
                     _builtin_risk_level(verify_ssrf_skill, ssrf.manifest.risk_level),
+                )
+            )
+        # M17-b：第五 verify skill 槽位（未授权暴露验证是增强项，缺失不阻塞主链路）。
+        # ⚠️ M16-c 的交付缺陷之二（AGENTS.md 限制 59）：当时 `verify-unauth` 的
+        # handler / skill / profiles 登记全就位，**却漏了这一处槽位** ⇒ 经 API/
+        # 控制台跑的真实 engagement 永不调用 `_verify_unauth`（只是静默记一条
+        # verify_skill_skipped）。与「缺生产者」（限制 58）是同一类缺陷的两个端。
+        # 与其余四个槽位同纪律：未注册/未启用记 verify_skill_skipped 跳过。
+        unauth = registry.get(verify_unauth_skill)
+        if unauth is None or not unauth.enabled:
+            reason = "skill 未注册" if unauth is None else "skill 未启用"
+            orchestrator.audit.record(
+                "verify_skill_skipped",
+                skill=verify_unauth_skill,
+                reason=f"{reason}，跳过未授权暴露验证",
+            )
+        else:
+            self.verify_skills.append(
+                (
+                    verify_unauth_skill,
+                    _builtin_risk_level(
+                        verify_unauth_skill, unauth.manifest.risk_level
+                    ),
                 )
             )
 

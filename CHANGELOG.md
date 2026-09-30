@@ -6,6 +6,75 @@
 
 ## [未发布]
 
+### 修复（M17-b `unauth-exposure` 接生产 —— 关闭限制 58 + 59）
+
+**做了什么**：把 v0.3.0 那个「宣称第 5 类可确认漏洞、实际生产链路不可用」的缺口闭合。
+`unauth-exposure` 现在**真的**会从扫描结果里长出来并被确认。
+
+**维护者裁定（2026-09-30，四次）**：**A-变体并存**（`web-exposure` 原样保留，不取代）·
+派生范围**仅 2xx** · **独立上限 10** · **无会话不派生不回退**。
+
+**四处改动**
+
+| # | 位置 | 内容 |
+|---|---|---|
+| ① | `api/runner.py` | `OrchestratorPhases` 加第 5 个槽位 `verify_unauth_skill="verify-unauth"`（照 `verify-ssrf` 逐句同构）——**修限制 59** |
+| ② | `core/orchestrator.py::_triage_candidates` | 新签名 `(signal, *, session_available=False)`；`web-probe` + 有会话 + 状态码 ∈ `_UNAUTH_EXPOSED_STATUSES={200,201,204}` ⇒ **追加** `unauth-exposure` 候选 |
+| ③ | 同上 | 独立上限 `_TRIAGE_UNAUTH_CAP=10` + 独立 `triage_capped` 事件 |
+| ④ | `run_verify_phase` | 前置结构上不可满足的类型（`_VERIFY_PRECONDITIONS={unauth-exposure, ssrf}`）在**贵验证配额之前**整类拦下 |
+
+**为什么是「并存」而不是「取代」**：两者**本来就不冗余**——`web-exposure` 是「端点有反应」
+的纯 status-code 观察（铁律 2 禁止其 Confirmed，进报告 hypothesis 桶，也是**无会话
+engagement 下「哪些端点可达」的唯一记录**）；`unauth-exposure` 是「匿名拿到与已认证
+等价的内容」（可 Confirmed）。取代会让无会话的扫描丢掉全部信息类观察。
+
+**为什么只取 2xx**：401/403 的匿名被拒正是「该资源本就要求认证」的**确定性**结局
+（`judge_unauth` 直接判 `requires_auth` → Rejected），派生它们纯属浪费一次贵验证配额；
+3xx 因取数不跟随重定向而多半判 `blocked`。该类型的立论「匿名直接拿到内容」只有 2xx 对应。
+
+**为什么必须有独立上限**：`web-exposure` 是全池**唯一没有上限**的类型（sqli 20 /
+xss 10 / idor 10 各有），而 M16-b 接入的 dirsearch 让它的候选量与探测路径数同阶——
+新类型每条又要花「2 次 HTTP + 1 次 T1 调用」，不设限就是给贵验证档灌水。
+
+**贵验证配额诚实化（④ 的理由）**：原行为下无会话时 `_verify_unauth` / `_verify_ssrf`
+**逐条** Finding 立刻 blocked，**却各吃掉一次贵验证配额**（`_expensive_spent += 1`）——
+配额语义不诚实，报告里还会显示成「验证过的覆盖不全」而非「该类型本 engagement 不可验证」。
+现在整类一次性拦下：零配额消耗，逐条记 `verify_blocked`（**文案与 handler 内逐字同源**，
+故既有审计断言不受影响）+ 收尾一条聚合 `verify_type_unavailable` / `verify_precondition_gate`。
+**终态语义零变化**（凡被拦者 handler 内也必然立刻 blocked）。
+
+**等价重构（不改语义，随本轮一并做）**：`_ingest_candidates` 的 6 个位置返回值
+（created/merged/四个 existing 计数）收进可变容器；三个并列上限 `if` 收成
+`_TRIAGE_CAPS` 查表——加类型时只改常量与登记处，不再扩张形参表。
+
+**验收：`scripts/demo_unauth_zero_seed.py`（真靶 · 零 seed · 发现→确认全链路）**
+
+对治的正是限制 58 复盘出的那条纪律（**验收脚本若自己 seed Finding，那就只验了判定端、
+没验接通性**）：本脚本**不构造任何 Finding**，只写 Signal，Finding 由 `run_triage_phase()`
+生产代码建，再走真实 `run_verify_phase()` 打**真实 HTTP 真靶**。五段实测：
+
+| 段 | 断言 | 实测 |
+|---|---|---|
+| A 有会话 | 3 个 2xx 端点 → 6 条 Finding（web-exposure + unauth-exposure 各 3）；leaky → CONFIRMED、protected（匿名 302）→ REJECTED、mixed → 停 Hypothesis；web-exposure 全部未被本 phase 触及 | ✅ |
+| B 无会话 | **零** `unauth-exposure`；`web-exposure` 照常 3 条（信息类记录不丢） | ✅ |
+| C 前置门 | 无会话时 unauth/ssrf 被拦、sqli 不拦；有会话时不拦 | ✅ |
+| D 上限 | 16 个 2xx 端点建 **10** 条 + `triage_capped(vuln_type=unauth-exposure, limit=10, dropped=6)` | ✅ |
+| E 生产栈 | 槽位 = `['verify-sqli','verify-xss','verify-idor','verify-ssrf','verify-unauth']` | ✅ |
+
+Confirmed 那条的 `method` = `unauth-response-equivalence`、`evidence_kinds` 含
+`unauth-response-equivalence`、四份证据引用齐备、证据门 + Verifier 全过；
+「匿名请求**未携带任何凭据**」由真靶访问日志（匿名 3 次 / 已认证 3 次）坐实。
+
+**测试**：全量 **1275 passed / 0 failed / 0 xfailed**。M17-a 留下的 3 个 strict xfail
+**全部转正**——`strict=True` 如设计般在修复后强制回来删标记（若当时写 `skip`，
+这三个断言会永久失效，正是缺陷 58 的成因之一）。
+
+**旧测试零改动**：唯一可能被打破的
+`tests/test_unauth_judge.py::test_missing_session_is_blocked_fail_closed`
+（断言 `verify_blocked` 事件文案含「预置会话」）**逐字未改**——
+通过让前置门**复用 handler 内的原话**（同一前置条件本就该同一说法）而通过。
+无任何旧测试被修改、无罐头数据对齐。
+
 ### 测试（M17-a 落点守护测试 —— 限制 58/59 的自动化断言，零行为变更）
 
 **做了什么**：新增 `tests/test_vuln_registry.py`。**这是本里程碑唯一的代码改动**——

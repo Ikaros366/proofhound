@@ -151,6 +151,18 @@ _OUTPUT_SAMPLE_LIMIT = 4096  # 失败分类的输出采样上限（字节）
 # 与 web-scan SKILL.md"存活"判定一致（2xx/3xx/401/403）；LLM triage 留后续切片。
 _EXPOSED_STATUSES = frozenset({200, 201, 204, 301, 302, 307, 308, 401, 403})
 
+# M17-b：`unauth-exposure` 候选的派生**范围收窄**（维护者 2026-09-30 裁定）。
+# 取 `_EXPOSED_STATUSES` 的 **2xx 子集**，理由逐条：
+# - **401/403 是反例**：匿名被拒正是「该资源本就要求认证」的**确定性**结局
+#   （`verify/unauth_control.py::judge_unauth` 直接判 `requires_auth` → Rejected），
+#   派生它们纯属浪费一次贵验证配额；
+# - **3xx**：`_verify_unauth` 的取数不跟随重定向，拿到的是裸跳转响应，
+#   与已认证视图比对多半判 `blocked`（覆盖不全），同样只产噪声；
+# - 而该类型的立论是「**匿名直接拿到内容**」——只有 2xx 对应这个语义。
+# 刻意**不复用** `_EXPOSED_STATUSES`：那个集合服务的是 web-exposure 的
+# 「端点有反应」语义（含 401/403/3xx），两者语义不同，不可混用。
+_UNAUTH_EXPOSED_STATUSES = frozenset({200, 201, 204})
+
 # M3d：katana 爬参（kind="param-endpoint"）→ sqli 假设的参数键启发式。
 # 精确匹配（键小写比对）：宁可漏报（保持 Signal）不可滥建——每条 sqli
 # Hypothesis 都会在 verify 阶段消耗一次 L2 确认与一次行为验证。
@@ -191,6 +203,29 @@ _IDOR_PARAM_HINTS = frozenset(
 
 # M8c：每 engagement 新建 idor Hypothesis 上限（独立计数、独立 triage_capped 事件）
 _TRIAGE_IDOR_CAP = 10
+
+# M17-b：每 engagement 新建 unauth-exposure Hypothesis 上限（独立计数、独立
+# triage_capped 事件）。**必须**有独立上限：`web-exposure` 是全池唯一**没有**
+# 上限的类型（sqli/xss/idor 各有），而新生产者的候选量与 web-probe 信号数同阶，
+# 每条又要花「2 次 HTTP + 1 次 T1 调用」——不设限会给贵验证档灌水。
+_TRIAGE_UNAUTH_CAP = 10
+
+#: 需要「scope 配了可用预置会话」才能验证的 vuln_type（M17-b）。
+#: 两类都是**等价性/基线比对**型判定，没有已认证视图就没有可比对象：
+#: - ``unauth-exposure``：匿名视图 vs 已认证视图（缺后者 ⇒ 无从比）；
+#: - ``ssrf``：带会话 baseline（缺会话 ⇒ `_verify_ssrf` 直接 blocked）。
+#: 登记在此 ⇒ 该类型的候选在缺会话时**一次也不进贵验证档**（配额仍留给真验证）。
+_VERIFY_PRECONDITIONS: frozenset[str] = frozenset({"unauth-exposure", "ssrf"})
+
+#: vuln_type → 每 engagement 新建 Hypothesis 上限（未登记的类型不限）。
+#: M17-b：由 `_ingest_candidates` 里的三个并列 if 收成一张查表——加类型时
+#: 只需在此登记，不必再改判定逻辑（漏登记表现为「该类型无上限」，显式可查）。
+_TRIAGE_CAPS: dict[str, int] = {
+    "sqli": _TRIAGE_SQLI_CAP,
+    "xss": _TRIAGE_XSS_CAP,
+    "idor": _TRIAGE_IDOR_CAP,
+    "unauth-exposure": _TRIAGE_UNAUTH_CAP,
+}
 
 # M9c②：**贵验证档**上限。启用廉价粗筛（``verify_prefilter``）时，cap 从
 # 「候选生成侧」移到这里——候选可以放开生成（模型 triage），由廉价粗筛先
@@ -283,10 +318,18 @@ def _form_page_path_hit(url: str) -> bool:
     return False
 
 
-def _triage_candidates(signal: Signal) -> list[_TriageCandidate]:
-    """triage 规则映射：可映射返回候选列表，不可映射返回空（保持 Signal）。"""
+def _triage_candidates(
+    signal: Signal, *, session_available: bool = False
+) -> list[_TriageCandidate]:
+    """triage 规则映射：可映射返回候选列表，不可映射返回空（保持 Signal）。
+
+    ``session_available``（M17-b）：scope 是否配了**可用**的预置会话——只有能
+    构造出「已认证视图」时才派生 `unauth-exposure`。缺省 ``False``，故既有调用方
+    行为逐字节不变（纯函数不读 scope，故由调用方传入；等价性判定结构上要求目标
+    能认证，无会话时该类型的验证恒 blocked ⇒ 派生即噪声）。
+    """
     if signal.kind == "web-probe" and signal.status_code in _EXPOSED_STATUSES:
-        return [
+        candidates = [
             _TriageCandidate(
                 vuln_type="web-exposure",
                 param=None,
@@ -295,6 +338,24 @@ def _triage_candidates(signal: Signal) -> list[_TriageCandidate]:
                 source="web_probe",
             )
         ]
+        # M17-b：同一份信号再按 `_UNAUTH_EXPOSED_STATUSES` 派生 unauth-exposure
+        # 候选（**并存，不取代** web-exposure——维护者 2026-09-30 裁定）。
+        # 并存的理由：两者**本来就不冗余**——`web-exposure` 是「端点有反应」的
+        # 纯 status-code 观察（铁律 2 禁止其 Confirmed，进报告 hypothesis 桶，
+        # 也是无会话 engagement 下「哪些端点可达」的**唯一**记录）；
+        # `unauth-exposure` 是「匿名拿到与已认证等价的内容」（可 Confirmed）。
+        # 取代会让无会话的扫描丢掉全部信息类观察。
+        if session_available and signal.status_code in _UNAUTH_EXPOSED_STATUSES:
+            candidates.append(
+                _TriageCandidate(
+                    vuln_type="unauth-exposure",
+                    param=None,
+                    severity="medium",
+                    evidence_kind=STATUS_CODE_EVIDENCE_KIND,
+                    source="web_probe",
+                )
+            )
+        return candidates
     if signal.kind == "param-endpoint":
         keys = _query_param_keys(signal.asset)
         candidates = [
@@ -552,9 +613,19 @@ class Orchestrator:
         if self.triage_model:
             model_by_asset = self._model_candidates_by_asset(signals, scope)
         existing_all = store.load_all()
-        sqli_existing = sum(1 for f in existing_all if f.vuln_type == "sqli")
-        xss_existing = sum(1 for f in existing_all if f.vuln_type == "xss")  # M8b
-        idor_existing = sum(1 for f in existing_all if f.vuln_type == "idor")  # M8c
+        # M17-b：按类型的既有条数收成一张表（原为 6 个位置返回值的写回样板）。
+        # 上限判定要的是「本类型已有几条」，与具体类型无关——收表后新增类型
+        # 只改常量与登记处，不再扩张 `_ingest_candidates` 的形参表。
+        existing_by_type: dict[str, int] = {}
+        for finding in existing_all:
+            existing_by_type[finding.vuln_type] = (
+                existing_by_type.get(finding.vuln_type, 0) + 1
+            )
+        # M17-b：是否可派生 unauth-exposure——需 scope 配了**可用**的预置会话
+        # （与 `_verify_unauth` 的前置判定同一谓词：有会话且能渲染出 Cookie 头）。
+        # 无会话时不派生、也**不**回退产 web-exposure（后者本来就在产）。
+        session = self._session()
+        session_available = bool(session is not None and session.cookie_header())
         findings: list[Finding] = []
         created = merged = kept = 0
         capped_by_type: dict[str, int] = {}  # M8b：按 vuln_type 分立 triage_capped
@@ -564,7 +635,11 @@ class Orchestrator:
         merged_by_source: dict[str, int] = {}
         for signal in signals:
             # M9c①：两来源候选的并集（纯模型臂即 triage_rules=False）
-            candidates = _triage_candidates(signal) if self.triage_rules else []
+            candidates = (
+                _triage_candidates(signal, session_available=session_available)
+                if self.triage_rules
+                else []
+            )
             if self.triage_model:
                 candidates = candidates + model_by_asset.get(
                     (signal.asset, signal.kind), []
@@ -583,25 +658,25 @@ class Orchestrator:
                     )
                     kept += 1
                     continue
-            mapped = self._ingest_candidates(
+            counters = {
+                "created": created,
+                "merged": merged,
+                "capped_by_type": capped_by_type,
+                "created_by_type": created_by_type,
+                "merged_by_type": merged_by_type,
+                "created_by_source": created_by_source,
+                "merged_by_source": merged_by_source,
+            }
+            hits, counters = self._ingest_candidates(
                 store,
                 findings,
                 signal,
                 candidates,
-                sqli_existing,
-                xss_existing,
-                idor_existing,
-                created,
-                merged,
-                capped_by_type,
-                created_by_type,
-                merged_by_type,
-                created_by_source,
-                merged_by_source,
+                existing_by_type,
+                counters,
             )
-            created, merged, hits, sqli_existing, xss_existing, idor_existing = (
-                mapped
-            )
+            created = counters["created"]
+            merged = counters["merged"]
             if hits == 0:
                 kept += 1
         # M8b/M8c：triage_capped 按 vuln_type 分立事件（各自上限各自记）
@@ -609,6 +684,7 @@ class Orchestrator:
             ("sqli", _TRIAGE_SQLI_CAP),
             ("xss", _TRIAGE_XSS_CAP),
             ("idor", _TRIAGE_IDOR_CAP),
+            ("unauth-exposure", _TRIAGE_UNAUTH_CAP),  # M17-b
         ):
             dropped = capped_by_type.get(vuln_type, 0)
             if dropped:
@@ -639,29 +715,29 @@ class Orchestrator:
         findings: list[Finding],
         signal: Signal,
         candidates: list[_TriageCandidate],
-        sqli_existing: int,
-        xss_existing: int,
-        idor_existing: int,
-        created: int,
-        merged: int,
-        capped_by_type: dict[str, int],
-        created_by_type: dict[str, int],
-        merged_by_type: dict[str, int],
-        created_by_source: dict[str, int],
-        merged_by_source: dict[str, int],
-    ) -> tuple[int, int, int, int, int, int]:
-        """把一批候选建/并成 Finding。
+        existing_by_type: dict[str, int],
+        counters: dict,
+    ) -> tuple[int, dict]:
+        """把一批候选建/并成 Finding，返回 ``(映射条数, counters)``。
 
-        返回 ``(created, merged, 映射条数, sqli_existing, xss_existing,
-        idor_existing)``——三个 existing 计数是**上限判定的状态**，必须写回
-        调用方，否则同一轮内多条候选会各按旧值判定、上限失效。
+        ``existing_by_type`` 是**上限判定的状态**（按 vuln_type 的既有条数），
+        必须**原地更新**，否则同一轮内多条候选会各按旧值判定、上限失效。
+        ``counters`` 汇总 created/merged/…（同样原地更新）。
 
         M9c① 从旧 ``run_triage_phase`` 内联循环体**机械抽出**（仅
         ``cand``→``candidate``、``signal_mapped``→``mapped``），逻辑与旧代码
-        逐句等价——规则路径的重建/去重/上限/计数/审计语义零改动。计数器按
-        「可变容器传入原地更新、整数由调用方按返回值写回」处理。
+        逐句等价——规则路径的重建/去重/上限/计数/审计语义零改动。
+        **M17-b 只做一处等价重构**：把 6 个位置返回值（created/merged/四个
+        existing）收进可变容器，语义不变，只为不再扩张形参表。
         """
         mapped = 0
+        created = counters["created"]
+        merged = counters["merged"]
+        capped_by_type = counters["capped_by_type"]
+        created_by_type = counters["created_by_type"]
+        merged_by_type = counters["merged_by_type"]
+        created_by_source = counters["created_by_source"]
+        merged_by_source = counters["merged_by_source"]
         for candidate in candidates:
             dedup_key = compute_dedup_key(
                 signal.asset, candidate.vuln_type, candidate.param
@@ -692,17 +768,13 @@ class Orchestrator:
                 mapped += 1
                 findings.append(existing)
                 continue
-            if candidate.vuln_type == "sqli" and sqli_existing >= _TRIAGE_SQLI_CAP:
-                # 防确认洪泛：每 engagement sqli 新建上限
-                capped_by_type["sqli"] = capped_by_type.get("sqli", 0) + 1
-                continue
-            if candidate.vuln_type == "xss" and xss_existing >= _TRIAGE_XSS_CAP:
-                # M8b：xss 独立上限（与 sqli 互不挤占）
-                capped_by_type["xss"] = capped_by_type.get("xss", 0) + 1
-                continue
-            if candidate.vuln_type == "idor" and idor_existing >= _TRIAGE_IDOR_CAP:
-                # M8c：idor 独立上限（与 sqli/xss 互不挤占）
-                capped_by_type["idor"] = capped_by_type.get("idor", 0) + 1
+            # 按类型上限查表（M17-b 由三个并列 if 收成一张表；语义零改动，
+            # 各类型仍是**独立计数、独立 triage_capped**，互不挤占）。
+            cap = _TRIAGE_CAPS.get(candidate.vuln_type)
+            if cap is not None and existing_by_type.get(candidate.vuln_type, 0) >= cap:
+                capped_by_type[candidate.vuln_type] = (
+                    capped_by_type.get(candidate.vuln_type, 0) + 1
+                )
                 continue
             finding = Finding(
                 id=store.next_id(),
@@ -737,15 +809,14 @@ class Orchestrator:
             created_by_source[candidate.source] = (
                 created_by_source.get(candidate.source, 0) + 1
             )
-            if candidate.vuln_type == "sqli":
-                sqli_existing += 1
-            if candidate.vuln_type == "xss":
-                xss_existing += 1
-            if candidate.vuln_type == "idor":
-                idor_existing += 1
+            existing_by_type[candidate.vuln_type] = (
+                existing_by_type.get(candidate.vuln_type, 0) + 1
+            )
             mapped += 1
             findings.append(finding)
-        return created, merged, mapped, sqli_existing, xss_existing, idor_existing
+        counters["created"] = created
+        counters["merged"] = merged
+        return mapped, counters
 
     def _model_candidates_by_asset(self, signals, scope):
         """M9c①：T1 档产出候选，按 ``(asset, kind)`` 归位以便并回主循环。
@@ -854,6 +925,28 @@ class Orchestrator:
             raise KeyError(f"skill 无 verify handler: {skill_name}")
         return handlers[skill_name][0]
 
+    def verify_precondition_blocked(self, vuln_type: str) -> str | None:
+        """该 vuln_type 的 handler 前置是否**结构上不可满足**；是则给出原因。
+
+        M17-b：与 handler 内第一条前置检查**逐条同构**（会话/挂 scope），故凡是
+        本方法判非 None 的 Finding，handler 内也必然立刻返回 ``blocked``——
+        本门**不改变任何终态语义**，只是把「每条各 blocked 一次、各吃掉一次贵验证
+        配额」提前成「整类一次性 blocked、零配额消耗」。
+
+        返回 ``None`` 表示前置可满足（交给正常验证流程）。
+        """
+        if vuln_type not in _VERIFY_PRECONDITIONS:
+            return None
+        scope = getattr(self.runner, "scope", None)
+        if scope is None:
+            return "runner 未挂 scope（scope 防线缺失，fail-closed）"
+        session = self._session()
+        if session is None or not session.cookie_header():
+            # 文案与 `_verify_unauth` / `_verify_ssrf` 内的原话逐字一致——它们是
+            # **同一个前置条件**，两处说法不同只会让读审计的人以为是两件事。
+            return "scope 未配置预置会话，无法构造已认证视图（fail-closed）"
+        return None
+
     def run_verify_phase(self, *, skill_name: str = "verify-sqli") -> list[Finding]:
         """跑 verify 阶段：对 Hypothesis 做行为验证 + 证据门 + Verifier 终审。
 
@@ -876,6 +969,8 @@ class Orchestrator:
         store = FindingStore(self.evidence_dir / "findings.jsonl")
         counts = {"confirmed": 0, "rejected": 0, "blocked": 0, "skipped": 0}
         processed: list[Finding] = []
+        # M17-b：前置不可满足而被整类拦下的候选（按类型聚合，收尾记一次审计）
+        unavailable: dict[str, list[str]] = {}
         try:
             for finding in store.load_all():
                 if finding.state is not FindingState.HYPOTHESIS:
@@ -890,6 +985,21 @@ class Orchestrator:
                     counts["skipped"] += 1
                     continue
                 finding.audit = self.audit  # store 回放出的 Finding 无审计句柄
+                # M17-b：前置**结构上不可满足**的类型在贵验证档之前整类拦下。
+                # 必须在 `_prefilter_or_cap` 之前——后者的 `_expensive_spent += 1`
+                # 会让「注定 blocked」的候选白吃一次配额（配额语义不诚实）。
+                blocked_reason = self.verify_precondition_blocked(finding.vuln_type)
+                if blocked_reason is not None:
+                    # 逐条记 `verify_blocked`（与 handler 内那条同语义、同文案，
+                    # 故既有审计断言不受影响），收尾再为整类记一条聚合事件。
+                    self.audit.record(
+                        "verify_blocked",
+                        finding_id=finding.id,
+                        reason=blocked_reason,
+                    )
+                    counts["blocked"] += 1
+                    unavailable.setdefault(finding.vuln_type, []).append(finding.id)
+                    continue
                 # M9c②：贵验证档前置廉价粗筛（关闭时此块零开销、零行为差）
                 if self.verify_prefilter:
                     verdict = self._prefilter_or_cap(finding, skill_name)
@@ -902,6 +1012,26 @@ class Orchestrator:
         finally:
             self._close_browser()  # M8b：phase 收尾释放浏览器（若本 phase 建过）
             self._close_ssrf_listeners()  # M16：回调 listener 同样不常驻
+        # M17-b：前置不可满足的类型**聚合记一次**（不是每条一次）——审计里能看出
+        # 「这个类型本次根本不可验证」，与「验证过但覆盖不全」区分得开。
+        for vuln_type, ids in sorted(unavailable.items()):
+            self.audit.record(
+                "verify_type_unavailable",
+                skill=skill_name,
+                vuln_type=vuln_type,
+                findings=len(ids),
+                reason=self.verify_precondition_blocked(vuln_type),
+                note="候选保持 Hypothesis（未消耗贵验证档配额，也未被驳回）",
+            )
+        if unavailable:
+            self.audit.record(
+                "verify_precondition_gate",
+                skill=skill_name,
+                blocked_types=sorted(unavailable),
+                blocked_findings=sum(len(v) for v in unavailable.values()),
+                expensive_spent=self._expensive_spent,
+                expensive_cap=self.expensive_cap,
+            )
         extra = (
             {"prefilter_advisory": self._prefilter_advisory}
             if self.verify_prefilter

@@ -57,14 +57,6 @@ BUILTIN_SKILLS = REPO / "skills"
 #: 生产栈必须把每个 verify handler 都挂上（含默认形参的那几个）。
 PRODUCTION_INIT = "proofhound/api/runner.py::OrchestratorPhases.__init__"
 
-#: 会话门控类型缺生产者的 xfail 理由（修复后 strict 会强制删标记）。
-XFAIL_NO_PRODUCER = (
-    "已知限制 58：unauth-exposure 无生产期 producer（web-probe 派生尚未实现）"
-)
-#: 生产栈槽位缺口的 xfail 理由（已知限制 59）。
-XFAIL_NO_SLOT = (
-    "已知限制 59：verify-unauth 未挂进 OrchestratorPhases 的 verify 槽位"
-)
 
 
 class VulnLanding(NamedTuple):
@@ -345,7 +337,6 @@ def test_probe_enumeration_is_saturated():
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason=XFAIL_NO_PRODUCER)
 def test_every_registered_type_has_a_reachable_producer(tmp_path):
     """**每个注册类型**都必须能被生产链路构造出来（零 seed 的「发现」冒烟）。
 
@@ -398,7 +389,6 @@ def test_real_triage_produces_only_known_types(tmp_path):
     )
 
 
-@pytest.mark.xfail(strict=True, reason=XFAIL_NO_PRODUCER)
 def test_unauth_exposure_candidate_is_derived_with_session(tmp_path):
     """有预置会话时，``web-probe`` 存活信号必须派生出 ``unauth-exposure`` 候选。"""
     findings, _audit = _run_real_triage(tmp_path, _sessioned())
@@ -469,7 +459,6 @@ def test_verify_handlers_cover_nothing_unregistered():
         assert not extra, "handler " + name + " 覆盖了未登记类型：" + str(extra)
 
 
-@pytest.mark.xfail(strict=True, reason=XFAIL_NO_SLOT)
 def test_every_registered_type_is_wired_into_production_stack():
     """**关键守护**：每个 handler 都必须在 API 生产栈的 init 里被真正挂上。
 
