@@ -131,7 +131,7 @@ def create_app(
         env_file=env_file,
     )
     management = ManagementService(manager)  # M6a 管理面（skill/scope）
-    app = FastAPI(title="ProofHound API", version="0.3.0")
+    app = FastAPI(title="ProofHound API", version="0.4.0")
     app.state.manager = manager
     auth_config = auth or resolve_auth(workspace_root, env_file)
     app.state.auth = auth_config
