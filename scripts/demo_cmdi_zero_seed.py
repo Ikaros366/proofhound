@@ -304,7 +304,11 @@ def main() -> int:
     from proofhound.api.runner import OrchestratorPhases
 
     registry = SkillRegistry(REPO / "skills").discover()
-    phases = OrchestratorPhases(SimpleNamespace(audit=SimpleNamespace()), registry)
+    # 真 AuditLog：`OrchestratorPhases.__init__` 会在"skill 在册但 scope 未显式声明
+    # request_budget"时记 `scan_skill_skipped`（M19-c 的必需留痕），假 audit 会炸。
+    phases = OrchestratorPhases(
+        SimpleNamespace(audit=AuditLog(run_dir / "phases.audit.jsonl")), registry
+    )
     slots = [name for name, _level in phases.verify_skills]
     print(f"  verify 槽位: {slots}")
     assert "verify-cmdi" in slots, f"生产栈必须挂上 verify-cmdi；实测 {slots}"

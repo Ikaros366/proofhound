@@ -85,8 +85,8 @@ def test_verify_skills_are_read_only_and_l2():
 
 
 def test_scan_skills_are_l1_and_mutating():
-    """主动扫描/爬行会向目标发真实请求，保守声明为写操作。"""
-    for name in ("web-scan", "recon-crawl"):
+    """主动扫描/爬行/字典爆破都会向目标发真实请求，保守声明为写操作。"""
+    for name in ("web-scan", "recon-crawl", "web-dirsearch"):
         p = SKILL_PROFILES[name]
         assert p.risk_level == "L1", name
         assert p.mutating is True, name

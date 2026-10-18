@@ -130,15 +130,20 @@ def _events(audit_path: Path, name: str) -> list[dict]:
     return out
 
 
-def _production_stack_verify_skills(registry):
+def _production_stack_verify_skills(registry, run_dir):
     """API 生产栈实际会调用的 verify 槽位清单（限制 59 的那处接线）。
 
     直接构造 `OrchestratorPhases`（用假编排器 + 真 registry，不需要 Docker），
     取它的 `verify_skills`——这正是 `default_phases_factory` 最后一行做的事。
+
+    audit 必须是**真** AuditLog：`__init__` 会在"skill 在册但 scope 未显式声明
+    `request_budget`"时记 `scan_skill_skipped`（M19-c 的必需留痕）。
     """
     from proofhound.api.runner import OrchestratorPhases
 
-    phases = OrchestratorPhases(SimpleNamespace(audit=SimpleNamespace()), registry)
+    phases = OrchestratorPhases(
+        SimpleNamespace(audit=AuditLog(run_dir / "phases.audit.jsonl")), registry
+    )
     return [name for name, _level in phases.verify_skills]
 
 
@@ -358,7 +363,7 @@ def main() -> int:
     print()
     print("===== E) API 生产栈真的会调用 verify-unauth（限制 59）=====")
     registry = SkillRegistry(REPO / "skills").discover()
-    slots = _production_stack_verify_skills(registry)
+    slots = _production_stack_verify_skills(registry, run_dir)
     print(f"  生产栈 verify 槽位: {slots}")
     assert "verify-unauth" in slots, (
         f"生产栈必须挂上 verify-unauth，否则经 API/控制台跑的 engagement 永不调用它"

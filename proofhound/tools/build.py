@@ -422,6 +422,12 @@ _PARAMS_MODELS = {
 }
 
 
+#: 消费 ``request_budget`` 的工具（M19-c）。原先这个事实以 ``tool == "dirsearch"``
+#: 的字面判断散在 ``build_command`` 里、而编排层完全没有对应判断（于是它从不传
+#: 预算 ⇒ 接通即报错）。收成一处登记后，加第二个"按字典发请求"的工具只需改这里。
+REQUEST_BUDGET_TOOLS: frozenset[str] = frozenset({"dirsearch"})
+
+
 def build_command(
     tool: str,
     params: dict,
@@ -439,7 +445,7 @@ def build_command(
     builder = _BUILDERS.get(tool)
     if builder is None:
         raise UnknownToolError(f"工具 {tool} 没有命令构造器")
-    if tool == "dirsearch":
+    if tool in REQUEST_BUDGET_TOOLS:
         # M16-b：请求量预算的**单一真相源是 request_budget 参数**。调用方必须显式传
         # ``scope.resolved_request_budget()``（未声明 scope 时它返回保守缺省值）。
         # **不**在 params 里静默接受这四个键——静默忽略授权值会让"以为授了限速、

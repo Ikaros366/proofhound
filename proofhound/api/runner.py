@@ -629,6 +629,7 @@ class OrchestratorPhases:
         registry,
         *,
         scan_skill: str = "web-scan",
+        scan_dirsearch_skill: str = "web-dirsearch",
         verify_skill: str = "verify-sqli",
         crawl_skill: str = "recon-crawl",
         verify_xss_skill: str = "verify-xss",
@@ -674,6 +675,40 @@ class OrchestratorPhases:
         else:
             self.scan_skills.append(
                 (crawl_skill, _builtin_risk_level(crawl_skill, crawl.manifest.risk_level))
+            )
+        # M19-c：dirsearch 字典爆路径（M16-b 交付的构造器/解析器/83 个测试此前
+        # **没有任何 skill 能触发** ⇒ 规划器永远拒绝 `run_tool(dirsearch)`，
+        # 与限制 58 同一类失败模式）。**刻意 opt-in**：只有 scope **显式声明**
+        # `request_budget` 时才挂进扫描阶段——"不声明请求量上限就默认开始爆破"
+        # 不是可接受的默认值。空字符串 = 显式不启用（不记审计噪音）。
+        dirsearch = (
+            registry.get(scan_dirsearch_skill) if scan_dirsearch_skill else None
+        )
+        if dirsearch is None:
+            pass
+        elif not dirsearch.enabled:
+            orchestrator.audit.record(
+                "scan_skill_skipped",
+                skill=scan_dirsearch_skill,
+                reason="skill 未启用，跳过字典爆路径",
+            )
+        elif not _request_budget_explicit(orchestrator):
+            orchestrator.audit.record(
+                "scan_skill_skipped",
+                skill=scan_dirsearch_skill,
+                reason=(
+                    "scope 未显式声明 request_budget（请求量授权），"
+                    "跳过字典爆路径（opt-in：先声明请求量上限再爆破）"
+                ),
+            )
+        else:
+            self.scan_skills.append(
+                (
+                    scan_dirsearch_skill,
+                    _builtin_risk_level(
+                        scan_dirsearch_skill, dirsearch.manifest.risk_level
+                    ),
+                )
             )
         # M8b：多 verify skill 清单（首项即旧式单 skill 接口的 verify_skill）
         self.verify_skills: list[tuple[str, str]] = [
@@ -798,6 +833,17 @@ def _skill_mutating(phases, skill_name: str) -> bool:
     之前逐字节一致。
     """
     return getattr(phases, "mutating_by_skill", {}).get(skill_name, True)
+
+
+def _request_budget_explicit(orchestrator) -> bool:
+    """scope 是否**显式**声明了请求量授权（M19-c，dirsearch 的 opt-in 判据）。
+
+    ``Scope.request_budget is None`` ⇒ 构造器会退回保守缺省值（50 rps / 5000 请求）。
+    对**手动触发**的工具那是"开箱即用"；对**扫描阶段自动执行**的字典爆破则不可接受
+    ——故这里只认 ``explicit``，缺省不放行。
+    """
+    scope = getattr(getattr(orchestrator, "runner", None), "scope", None)
+    return scope is not None and getattr(scope, "request_budget", None) is not None
 
 
 def _builtin_risk_level(skill_name: str, fallback: str) -> str:

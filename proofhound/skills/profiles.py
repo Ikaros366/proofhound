@@ -43,6 +43,15 @@ SKILL_PROFILES: dict[str, SkillProfile] = {
         mutating=True,
         note="爬行：向目标发起大量真实请求（katana 恒在 -cos 排除状态变更类端点）",
     ),
+    "web-dirsearch": SkillProfile(
+        risk_level="L1",
+        mutating=True,
+        note=(
+            "主动发现：按词表向目标发起大量真实请求（速率/并发/总量全部来自 "
+            "scope.request_budget，构造器永不产 -r/-F）。属写操作档，且只在 scope "
+            "**显式声明** request_budget 时才挂进扫描阶段（不声明即不爆破）"
+        ),
+    ),
     "verify-sqli": SkillProfile(
         risk_level="L2",
         mutating=False,

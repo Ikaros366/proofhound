@@ -83,7 +83,12 @@ from proofhound.llm.triage import (
 from proofhound.llm.router import ensure_router
 from proofhound.llm.usage import BudgetExceededError
 from proofhound.skills.registry import SkillRegistry
-from proofhound.tools.build import UnknownToolError, build_command, known_tools
+from proofhound.tools.build import (
+    REQUEST_BUDGET_TOOLS,
+    UnknownToolError,
+    build_command,
+    known_tools,
+)
 from proofhound.tools.manifest import load_manifest
 from proofhound.tools.parsers import PARSER_REGISTRY, parse_sqlmap_stdout
 from proofhound.tools.sandbox import RunResult, SandboxRunner
@@ -2939,14 +2944,59 @@ class Orchestrator:
 
     # ---- 单动作执行 ----
 
+    def _resolve_request_budget(self, node: TaskNode, tool: str):
+        """消费 ``request_budget`` 的工具：取授权预算并**留痕来源**（M19-c）。
+
+        限制 54 的核心论证是"缺省放行**不等于**无痕放行，因为审计里能分辨
+        ``source=default/explicit``"——但 ``Scope.request_budget_source()`` 此前
+        只有测试和 demo 在调，生产链路一次也没记过。本方法把「用了哪个来源、
+        多少速率/并发/总量/时间窗」写进 ``request_budget_resolved`` 审计。
+
+        `runner` 未挂 scope 时 fail-closed（没有授权来源就没有预算）。
+        """
+        if tool not in REQUEST_BUDGET_TOOLS:
+            return None
+        scope = getattr(self.runner, "scope", None)
+        if scope is None:
+            node.transition(
+                TaskStatus.FAILED,
+                reason=(
+                    f"工具 {tool} 需要 scope 提供请求量授权，"
+                    "但 runner 未挂 scope（fail-closed）"
+                ),
+            )
+            self.audit.record(
+                "request_budget_unavailable",
+                node_id=node.id,
+                tool=tool,
+                reason="runner 未挂 scope，无授权来源",
+            )
+            return None
+        budget = scope.resolved_request_budget()
+        self.audit.record(
+            "request_budget_resolved",
+            node_id=node.id,
+            tool=tool,
+            source=scope.request_budget_source(),
+            rate_rps=budget.rate_rps,
+            concurrency=budget.concurrency,
+            max_requests=budget.max_requests,
+            window_minutes=budget.window_minutes,
+        )
+        return budget
+
     def _exec_run_tool(self, node: TaskNode, action: PlanAction, skill) -> str:
         """执行 run_tool 动作，返回 ok/retry/failed/blocked。"""
+        request_budget = self._resolve_request_budget(node, action.tool)
+        if action.tool in REQUEST_BUDGET_TOOLS and request_budget is None:
+            return "failed"  # 迁移与审计已在 _resolve_request_budget 内完成
         try:
             argv = build_command(
                 action.tool,
                 action.params,
                 egress_proxy_url=self.runner.egress_proxy_url,
                 session=self._session(),
+                request_budget=request_budget,
             )
         except (UnknownToolError, ValueError) as exc:
             node.transition(TaskStatus.FAILED, reason=f"命令构造失败（规划缺陷）: {exc}")
