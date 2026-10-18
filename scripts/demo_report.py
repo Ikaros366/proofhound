@@ -177,10 +177,19 @@ def main() -> int:
     )
 
     rejected = next(f for f in store.load_all() if f.vuln_type == "version-cve")
+    # M6c 契约：附录 B 的排除原因取 `reason_cn or rejection_reason`。叙述一旦给出
+    # 中文归因（正常路径），单元格里就是 reason_cn，**不是** rejection_reason 原文——
+    # 原先只比对 rejection_reason 的断言因此只在"叙述没给 reason_cn"时偶然通过。
+    reasons_cn: dict[str, str] = {}
+    cn_path = evidence_dir / "rejected_reasons_cn.json"
+    if cn_path.is_file():
+        reasons_cn = json.loads(cn_path.read_text(encoding="utf-8"))
+    expected_reason = reasons_cn.get(rejected.id) or rejected.rejection_reason or ""
     check(
-        "误报附录含 version-cve 及拒绝原因",
+        "误报附录含 version-cve 及排除原因（reason_cn 优先，M6c 契约）",
         any("version-cve" in cell for cell in llm_cells)
-        and any(rejected.rejection_reason[:20] in cell for cell in llm_cells),
+        and bool(expected_reason)
+        and any(expected_reason[:20] in cell for cell in llm_cells),
     )
 
     narratives_ok = all(f.narrative for f in confirmed)

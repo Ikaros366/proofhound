@@ -1458,9 +1458,12 @@ vs 已认证敏感 JSON（相似度 0.085）⇒ 停 Hypothesis + `verify_blocked
 （`tests/test_vuln_registry.py`）就此写成两条互补的路径：
 
 1. **生产者可达**：只写 **Signal**，让**生产代码**建 Finding——走真实 `run_triage_phase`，
-   输入域穷举 `web-probe` × 全部状态码、三张提示表的**并集**每个键、`form_page` 三形态；
-   可达集 = 该产出 ∪ `ALLOWED_VULN_TYPES`。**每个 `GATE_MATRIX` 键都必须落在其中。**
-   这条直接对应「每个已注册类型至少有一个生产期 producer」。
+   输入域穷举 `web-probe` × 全部状态码、**`_PARAM_HINT_TABLES` 登记的每张提示表的并集**
+   每个键（M19-a：**从登记表派生**，不再手写"三张表"——手写清单曾漏掉 `_CMDI_PARAM_HINTS`
+   的 17 个键）、`form_page` 三形态；可达性**按类型逐条断言**：在规则表产出里即通过，
+   否则必须显式声明 `model_channel_only=True` 且已核实。
+   **不再用"产出 ∪ `ALLOWED_VULN_TYPES`"的并集口径**——那个并集曾让 `cmdi` 蒙混过关
+   （§7.18 已披露该后门）。
 2. **生产栈接线**：verify handler 名必须出现在 `OrchestratorPhases.__init__` 的
    **真实源码**（`inspect.getsource`）里——覆盖 §7.15 那个「有 handler、有 skill、
    有 profiles 登记，却没有第 5 个槽位」的出口端缺口（AGENTS.md 限制 59）。
@@ -1590,6 +1593,90 @@ handler 方法对象、`SKILL_PROFILES` 画像、API 生产栈槽位。登记表
 结构性失效，「中间件代抓取」形态无法检出。属保守方向（失效不产生假阳性，风险是
 漏检）。该形态的正命中由单测在**探针层**确定性覆盖
 （`test_dns_defense_blocks_even_when_waf_makes_the_callback`）。
+
+> **🔴 M19-a 更正**：上面把根因归给"网络可达性"是**错的**。实测该变体**从未被注入
+> 目标参数**（`dns_value` 算完即丢，`run_probe` 拿到的是对照地址本身），且探针路径
+> 缺 `/c/` 前缀（listener 只认 `/c/`、`/n/`）⇒ 防线在**结构上**不可能触发。两处已修，
+> 见 §7.21。残余只剩"中间件得能解析 `.invalid`"这一条。
+
+### 7.21 M19 修复轮：把审计查出的「文档说 A、代码是 B」逐条闭合（2026-10-18）
+
+一次**只读取证**的独立审计（1310 个测试全绿的前提下）查出 16 条问题，其中 3 条是
+真缺陷、3 条是登记/守护的结构性缺口、其余是文档与代码脱节。本节只记**判定与修法**，
+细节见仓库根目录外的审计报告与本节各条。
+
+**① `dirsearch` 在生产链路不可达（与限制 58 同类，此前无人记录）**
+`M16-b` 交付了 manifest / 构造器 / 解析器 / 依赖闭包 / 83 个测试 / 真靶验收脚本，
+但**没有任何 skill 声明 `required_tools: [dirsearch]`**，而
+`Planner._validate_semantics` 要求 `action.tool ∈ skill.manifest.required_tools`
+⇒ 一切 `run_tool(dirsearch)` 被拒；且编排层三个 `build_command` 调用点都不传
+`request_budget`，而构造器在 `None` 时 fail-closed 抛错。**修法**：新建
+`skills/web-dirsearch/`（L1、`mutating=True`）+ 画像登记 + `build.REQUEST_BUDGET_TOOLS`
+单一登记 + `_exec_run_tool` 解析预算 + `OrchestratorPhases` 加 scan 槽位（照
+`recon-crawl` 先例，避免重演限制 59 的出口端缺口）。**opt-in 取舍**：只有 scope
+**显式声明** `request_budget` 时才挂进扫描阶段——字典爆破是"按词表主动发请求"，
+不声明上限就默认开始爆破不可接受；这是维护者未单独裁定时最保守的可达形态。
+**新增守护**：`test_every_known_tool_is_reachable_through_some_skill`
+（把"工具接入"的定义从「能构造命令」改成「能被规划出来」）。
+
+**② 命令注入的 DNS 非命中防线从未生效（两处独立缺陷）**
+（a）`_verify_cmdi` 把**对照地址本身**当探测 URL，`dns_value` 算完即丢 ⇒ 变体从未
+到达靶；（b）`cmdi.dns_probe_value()` 造的路径是 `/<token>`，而 listener 只把
+`/c/`、`/n/` 前缀当候选命中 ⇒ 即使中间件硬发也记 `ignored`。后果不只是漏检——
+Confirmed 的 `baseline_diff` 与 `reproduction_steps` 一直在写"DNS 非命中变体未命中
+（排除第三方代抓取）"，那是**没有观测支撑的证据陈述**。**修法**：变体按裁定原文
+注入目标参数（`build_probe_url(asset, param, dns_value)`）、路径改用
+`CALLBACK_PATH_PREFIX`，并加两条结构性守护（探针路径必须被 listener 计入命中；
+变体必须作为目标参数值发出）。`scripts/demo_cmdi_zero_seed.py` 里那段
+「取数层特殊投递」随缺陷消失而**整段删除**——它原本只是在补生产没做的那一步。
+
+**③ 登记与守护的第三/第四处手工清单**
+`ssrf` 自 M16 起就没有 `_TRIAGE_CAPS` 条目，而注释写「`web-exposure` 是全池唯一
+没有上限的类型」；`tests/test_vuln_registry.py` 的生产者穷举器仍并**三张**提示表，
+M18-b 新增的 `_CMDI_PARAM_HINTS` 21 键里只有 4 个交集键被无意覆盖。**修法**：
+（a）规则表入口收成 `orchestrator._PARAM_HINT_TABLES` 单一真相源，`_triage_candidates`
+与穷举器都从它派生，新增 `test_param_hint_tables_are_all_registered`；
+（b）补 `_TRIAGE_SSRF_CAP = 10` + `test_every_registered_type_has_a_triage_cap`
+断言「注册类型集合 == 上限登记表集合」。
+**与 §7.18 同一教训**：能从单一真相源派生的，不要手写第二遍。
+
+**④ 证据包的磁盘放大（302.8×，实测）**
+`assemble_evidence_pack` 对**每条** Finding 各整份拷一次源文件。`web-exposure` 是唯一
+无上限的类型，dirsearch 让它的候选量第一次变得现实：300 条候选取一份 106,800 B 的
+报告 ⇒ 证据目录 **32,342,076 B**。**修法**：拷贝改**优先硬链接**（跨文件系统自动回落
+`copyfile`），同源证据只占一份，sha256 与 `finding.json` 一字不变。
+**未做**：给 `web-exposure` 加条数上限（策略参数，待裁定）、按锚点裁剪（限制 9）。
+
+**⑤ 请求量授权的"来源可审计"名不副实**
+限制 54 的核心论证是"缺省放行不等于无痕放行，因为审计能分辨 `source`"，但
+`Scope.request_budget_source()` 此前**只有测试与 demo 在调**。**修法**：
+`_resolve_request_budget()` 在每个消费预算的工具执行前记
+`request_budget_resolved{tool,source,rate_rps,concurrency,max_requests,window_minutes}`，
+runner 未挂 scope 时记 `request_budget_unavailable` 并 fail-closed。
+
+**⑥ 两条 demo 断言与实现不同步（跑全部 21 个 demo 时抓到）**
+（a）`demo_report` / `demo_report_enterprise` 的附录 B 断言只比对 `rejection_reason`，
+而 M6c 起附录 B 取契约 `reason_cn or rejection_reason`——叙述给出中文归因（正常路径）时
+必然失败。实测 `rejected_reasons_cn.json` 与报告单元格逐字相同。
+（b）`demo_cvss_dvwa` 的 `verdicts[0]` 假设"只有一条 confirmed"，实测 3 条 confirm ⇒
+取到别人的向量，误报"缺 cvss_vector"。
+**教训**：demo 里的断言同样是"规格"，也会随实现演进过期；它们**不在 pytest 里**，
+所以没有任何 CI 会替你发现——只能靠定期全量跑一遍。
+
+**⑦ 文档数字机械重生**
+`README` 的 skill 表（5 → 8）、已知限制摘要（三条垂直切片 → 六类）、测试基线
+（1136 → 1328）、发布状态（"4 个提交未推送" → 与 `origin/master` 同到 `c8a0176`）；
+`AGENTS` 的 `skills/` 清单与"5 个形参"（→ 6 verify + 3 scan）；`design` 的 §7.16
+过时口径。**纪律提炼**：凡是"N 个/N 条/N 类"这类可数断言，都应当由一个能被机械
+核对的地方产出一把就能证伪的读法（测试计数、`len(SKILL_PROFILES)`、`dir(skills/)`），
+否则它迟早会漂移——本轮 6 处漂移全部属于这一类。
+
+**⑧ 静态检查的替代方案**：本机装不上 `ruff`（PyPI 不可达），而 M13 的纪律是
+"先本地跑绿再进矩阵"，把一个本地验证不了的依赖写进 `pyproject` + `requirements.txt`
+锁 + CI 只能靠 CI 试错。故本轮用 stdlib `ast` 写了最小守护
+（`tests/test_static_hygiene.py`，只查「局部变量只存不读」这一类——正是让 DNS 防线
+整体失效的 `dns_value` 与残留的 `asset_origin` 所属的类型），并带一条自检断言防止它
+空跑。将来能装上 ruff 时，把它替换成 `ruff check --select F` 即可。
 
 ## 8. 开发路线图
 

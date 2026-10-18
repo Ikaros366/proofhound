@@ -169,7 +169,7 @@ EOF
 | httpx | 1.10.0 | HTTP 探活与指纹识别 | web-scan | L1（主动扫描） | GitHub release zip + 强制 sha256 |
 | katana | 1.7.0 | Web 爬行、带参端点发现、**JS 文件内端点解析**（`-jc` 恒在，M16-a） | recon-crawl | L1 | GitHub release zip + 强制 sha256 |
 | sqlmap | 1.10.8 | SQL 注入行为验证 | verify-sqli | L2（利用验证） | PyPI 版本 pin + 强制 sha256，隔离装进 `tools.d/sqlmap/lib` |
-| dirsearch | 0.5.0 | 字典爆路径 / 目录与文件发现（**请求量受 scope 授权约束**，M16-b） | web-dirsearch | L1（主动发现） | `tools.d/` 离线预置 **或** PyPI pin + sha256 + **26 条依赖闭包**（`image: python:3.12-alpine`） |
+| dirsearch | 0.5.0 | 字典爆路径 / 目录与文件发现（**请求量受 scope 授权约束**，M16-b；M19-c 起接入 `web-dirsearch` skill） | web-dirsearch（**opt-in**：仅当 scope 显式声明 `request_budget` 时挂进扫描阶段） | L1（主动发现） | `tools.d/` 离线预置 **或** PyPI pin + sha256 + **26 条依赖闭包**（`image: python:3.12-alpine`） |
 | （内建） | — | 未授权暴露确认：匿名/已认证**响应等价**（M16-c，**非工具**，纯确定性代码 + 独立敏感度判定器）✅ **生产链路可达**（M17-b 2026-09-30 接上生产者与 API 生产栈槽位；缺口记录见 AGENTS.md 限制 58/59，均已关闭） | verify-unauth | L2（只读验证） | 无外部二进制 |
 
 ### tools.d/ 预置教程（离线场景）
@@ -218,7 +218,7 @@ tools.d/dirsearch/
 > 改动内置 skill 即改动仓库文件（走正常代码评审）。配套的导入安全闸与上传/编辑端点
 > 因此一并移除——没有外来脚本可扫。
 
-内置 skill 五个，各自由 `SKILL.md`（YAML frontmatter + 正文 SOP）声明：
+内置 skill 八个，各自由 `SKILL.md`（YAML frontmatter + 正文 SOP）声明：
 
 | skill | 风险级 | 是否改变目标状态 | 作用 |
 |---|---|---|---|
@@ -227,6 +227,10 @@ tools.d/dirsearch/
 | `verify-sqli` | L2 | **否（只读）** | 带会话 baseline + sqlmap 确认 + Verifier 终审 |
 | `verify-xss` | L2 | **否（只读）** | 无头 Chromium canary 行为确认 |
 | `verify-idor` | L2 | **否（只读）** | 双会话属性验证（越权/IDOR） |
+| `verify-ssrf` | L2 | **否（只读）** | 带外回调确认：宿主 listener 收到回调才算（M16） |
+| `verify-unauth` | L2 | **否（只读）** | 匿名/已认证**响应等价**确认 + 独立敏感度判定器（判定器不产证据，M16-c） |
+| `verify-cmdi` | L2 | **否（只读）** | 带外回调确认 + DNS 非命中防伪（M18） |
+| `web-dirsearch` | L1 | 是 | dirsearch 字典爆路径（请求量受 scope 预算约束；**opt-in**，M19-c） |
 
 **风险画像以代码为准**：`proofhound/skills/profiles.py` 的 `SKILL_PROFILES` 是
 `risk_level` 与「是否只读」的**运行时唯一真相源**（`SKILL.md` 的 frontmatter 是
@@ -245,7 +249,7 @@ semi_auto 下可以自动执行——新增内置 skill 必须在表内登记，
 | L2 利用验证（写操作） | 需确认 | 需确认 | 自动 |
 | L2 只读验证（M9c③ 人工闸细分） | 需确认 | **自动** | 自动 |
 
-L2 内部区分「只读验证」与「写操作」：只读与否由 skill 在 `SKILL.md` 用 `mutating` 声明（**缺省 `true` = fail-closed**，未声明即按写操作对待）；内置 `verify-sqli` / `verify-xss` / `verify-idor` 声明为只读。细分级**不放宽最严格档**（supervised 一律需确认）。
+L2 内部区分「只读验证」与「写操作」：只读与否由 skill 在 `SKILL.md` 用 `mutating` 声明（**缺省 `true` = fail-closed**，未声明即按写操作对待）；内置六个 `verify-*`（sqli / xss / idor / ssrf / unauth / cmdi）全部声明为只读；`web-scan` / `recon-crawl` / `web-dirsearch` 声明为写操作。细分级**不放宽最严格档**（supervised 一律需确认）。
 
 未知风险级 fail-closed（一律禁止）。模式切换收紧自由、放宽须显式 operator 确认并记 `autonomy_mode_changed` 审计；确认请求超时默认拒绝。**任何模式下 scope 校验、预算硬闸、凭据脱敏、append-only 审计都不可旁路。**
 
@@ -266,7 +270,7 @@ L2 内部区分「只读验证」与「写操作」：只读与否由 skill 在 
 
 ## 路线图与已知限制
 
-> **状态**：M9a~**M14** 的改动**均已提交**（工作树干净），发布动作由维护者裁决；当前有 **4 个提交尚未推送**——`3e6843a` AGENTS.md 记录修正 → `f088c17` M12 沙箱隔离硬化 → `917a9ab` M13 可复现安装 + CI → `f965e02` M14 API 认证（`origin/master` 仍停在 `3c48589`）。
+> **状态**：本地工作树干净，`HEAD` 与 `origin/master` 同到 `c8a0176`（`v0.4.0` 已打标签）。后续改动是否发布、是否打新标签由维护者裁决。
 
 已完成：M1 工具底座（manifest/安装器/沙箱/scope/审计）→ M2 编排器 + 模型路由预算 → M3 Finding 生命周期 +
 证据门 + Verifier + verify-sqli + katana 发现自动化 → M4 报告引擎 + 模板适配 → M5 Web API + 自主模式闸门 + 本地控制台 →
@@ -501,11 +505,15 @@ skill 画像）仍靠守护测试而非结构保证。
   （由 `VULN_REGISTRY` 自动纳入白名单），独立上限 10。
 - **零 seed 真靶验收**：`scripts/demo_cmdi_zero_seed.py` 全绿（真漏洞 CONFIRMED /
   不取数 REJECTED / `triage_capped(dropped=8)` / API 生产栈 6 个槽位）。
-- ⚠️ **一处诚实披露的盲区（限制 62）**：DNS 防线依赖探针**能到达靶**，而 `.invalid`
-  在任何环境都解析不了 ⇒ 在无直连出口的部署里「中间件代抓取」形态**无法被检出**
-  （保守方向盲区：失效不会因此误确认，风险是漏检）。
+- ✅ **M19-a 修掉了一处真实缺陷（原限制 62 的根因）**：DNS 非命中变体此前**从未投递给
+  靶**（宿主直接去取 `.invalid` 地址，注入值算完就丢），且探针路径缺 `/c/` 前缀 ⇒
+  这道防线在结构上**不可能触发**，而 Confirmed 的证据里仍写着「已排除第三方代抓取」。
+  现变体按裁定原文**注入目标参数**、路径与 `callback_url` 同形，并新增两条结构性守护
+  （「探针路径必须被 listener 计入命中」「变体必须作为目标参数值发出」）。
+  **残余（改写后的限制 62）**：中间件要**能解析** `.invalid` 才可能命中，故在"没有
+  可疑解析器/通配 DNS"的环境里该防线仍不会报警（保守方向，不会因此误确认）。
 
-**现在有三个待裁决项**：① 是否把 `PROOFHOUND_TRIAGE_MODEL` 改为默认开启（数据支持，见第 1 项与「重复测量与方差」节）；② ~~是否投入建 `verify-ssrf`~~（**已落地**，见第 2 项）；③ **`KatanaParams.jsluice`（katana `-jsl`）的缺省值**（M16-a 实现侧的保守选择，见下面第 4 项）。
+**现在有两个待裁决项**：① 是否把 `PROOFHOUND_TRIAGE_MODEL` 改为默认开启（数据支持，见第 1 项与「重复测量与方差」节）；② **`KatanaParams.jsluice`（katana `-jsl`）的缺省值**（M16-a 实现侧的保守选择，见下面第 5 项）。
 
 1. ~~**基线数字补完**~~ **已完成（M10a + M11b + M11c）**——真可确认 fixture + `--live` 4 臂
    真实确认链路（M10a）；IDOR 判据收紧（M11b）；**方差已量化**（M11c，3 遍 × 4 臂，见上节）。
@@ -531,7 +539,7 @@ skill 画像）仍靠守护测试而非结构保证。
      `GATE_MATRIX` 加 ssrf 项 → `skills/verify-ssrf/SKILL.md`（L2）→ `skills/profiles.py` 登记
       → 编排层 `_verify_ssrf` → 证据门 → Verifier 终审 → CVSS 代码算分 → 四段式证据。
      **红线一条都不放松**（scope 五层、证据门、状态机铁律、脱敏、预算硬闸、审计 append-only）。
-4. **M16-a（已完成，2026-09-29）：katana 从 JS 里翻接口——只做发现侧。**
+3. **M16-a（已完成，2026-09-29）：katana 从 JS 里翻接口——只做发现侧。**
    维护者就「未授权访问 / 接口暴露」裁定三条方向：① JS 翻接口（**本条，已完成**）；
    ② 字典爆路径用 dirsearch 接入（**M16-b，已完成**——含速率/并发/时间窗授权语义）；
    ③ 「不需要登录就能拿到信息」的判定交独立 AI 判定器（**M16-c，已完成**——形态 B +
@@ -548,10 +556,10 @@ skill 画像）仍靠守护测试而非结构保证。
    （贴近 `mem_limit=512m`），故做成可选参数。**如实记录**：katana 1.7.0 的 JS 爬取
    每轮只吐 1~2 条接口且**不收敛**（须多轮并集，仍不保证全量，见 AGENTS.md 限制 53）、
    模板串形态 0 提取。**判定面本轮零改动**：这类端点若落 `web-exposure` 仍不可 Confirmed。
-3. ~~**成本可见性**~~ **已完成（M11a）**——口径已定为「按调用方 + 阶段归属、含修复重试」，
+4. ~~**成本可见性**~~ **已完成（M11a）**——口径已定为「按调用方 + 阶段归属、含修复重试」，
    `llm_call` 审计补归属字段，CLI / API / 控制台只读面板三处出口（见上节）。**残留**：无货币化
    （只有用量，无单价）；无跨 engagement 聚合视图；自动降级（§5.3）仍未做。
-4. **`KatanaParams.jsluice`（katana `-jsl`）的缺省值**——M16-a 落地时定为**缺省关**，
+5. **`KatanaParams.jsluice`（katana `-jsl`）的缺省值**——M16-a 落地时定为**缺省关**，
    现提请裁决（该缺省值是实现侧的保守选择，尚未经维护者裁定）。
    **数据（实测：12MB 真实 bundle + 沙箱同档 512m 容器）**：`-jc` 峰值内存 **248MiB**、
    `-jc -jsl` **447MiB**（后者已用掉 `mem_limit=512m` 的约 87%）；耗时两者均 ~13~16s
@@ -565,15 +573,15 @@ skill 画像）仍靠守护测试而非结构保证。
 
 
 > **测试基线随机器而异**：本机 `.gitignore` 排除的 `templates/custom_enterprise_template.docx`
-> **存在**，故 2 个企业模板测试在本机**真跑**（不 skip）——本机实测基线为
-> **1136 passed / 0 skipped**；文档中"1134 passed / 2 skipped"是**缺该模板的机器**上的读数。
-> 两个数都对，差别只在那一个本地模板文件在不在。
+> **存在**，故 2 个企业模板测试在本机**真跑**（不 skip）——本机实测基线（M19 修复后）为
+> **1330 passed / 0 skipped**（CI 门 `-m "not docker and not browser"`：1300 passed / 30 deselected）；
+> 缺该模板的机器会少 2 个通过、多 2 个 skipped，两个读数都对。
 
 搁置：PDF 报告管线、stored/DOM 型 XSS、垂直越权/多步业务流验证、MCP 暴露、持续监测（均非当前瓶颈）；
 **skill 机制进一步收敛（Phase 3）明确不做**——`SkillRegistry` 经 M9d 已不再是安全真相源，且
 `web-scan`/`recon-crawl` 的 SOP 仍被 T1 规划器真实读取，进一步收敛只有审美收益却要动 168 个测试函数。
 
-已知限制摘要（完整清单见 [AGENTS.md](AGENTS.md)「已知限制」）：行为验证为 sqli/xss/IDOR 三条垂直切片（各有限定场景——sqli 覆盖 GET 参数与 POST 表单、XSS 仅 reflected/GET、IDOR 仅水平越权 GET 对象且需双身份会话）；发现自动化覆盖 GET 查询参数端点与 POST 表单页；API 认证为单账户 HTTP Basic（默认口令公开、无 TLS/多用户/RBAC/登录失败锁定，见 AGENTS.md 限制 23）；沙箱出口白名单仅覆盖 HTTP(S)；控制台为轮询无 WebSocket；报告仅 docx。**成本口径为"用量"非"钱"**，且 M11a 之前的审计无可归属信息（归 `unknown` 桶、报告给出可归属比例）；单条 Finding 的成本只含 Verifier 终审（其余调用点是批次级，不摊派）。**IDOR 判据已收紧**（M11b）：新增**未认证对照探测**（区分"公开资源"与"私有对象被越权读取"）+ **确定性归属提取**（要求响应中"所有者"字段的值等于 reference 身份），三种负面形态（公开资源 / 对照无法判定 / 缺归属证据）在编排层**确定性定终态、不交给 LLM**——这正是 M10a「同一真 IDOR 在 4 个臂出现 4 种结果」的正面解法。**新的明示限制**：① 归属证据依赖目标**自报归属**，真靶场若不展示所有者则一律驳回（宁漏勿滥）；② 粗筛探测**不带凭据**，在"需认证目标"上判别力下降（不丢候选，仅建议失真）。**沙箱隔离已硬化**（M12）：容器内非 root + rootfs 只读 + capability 归零 + 进程数/FD 上限，隔离档逐项进审计；残余限制是**工具输出体积无上限**（原始输出 100% 落盘是红线，故未加日志上限，见 AGENTS.md 限制 45）。
+已知限制摘要（完整清单见 [AGENTS.md](AGENTS.md)「已知限制」）：**六类**可确认漏洞各有垂直切片与限定场景——sqli 覆盖 GET 参数与 POST 表单、XSS 仅 reflected/GET、IDOR 仅水平越权 GET 对象且需双身份会话、**SSRF 仅 GET query 参数且需回调可达**、**`unauth-exposure` 仅「匿名≡已认证」这一窄形态**、**命令注入仅 GET query 参数且 DNS 防伪依赖中间件能解析 `.invalid`**；发现自动化覆盖 GET 查询参数端点与 POST 表单页；API 认证为单账户 HTTP Basic（默认口令公开、无 TLS/多用户/RBAC/登录失败锁定，见 AGENTS.md 限制 23）；沙箱出口白名单仅覆盖 HTTP(S)；控制台为轮询无 WebSocket；报告仅 docx。**成本口径为"用量"非"钱"**，且 M11a 之前的审计无可归属信息（归 `unknown` 桶、报告给出可归属比例）；单条 Finding 的成本只含 Verifier 终审（其余调用点是批次级，不摊派）。**IDOR 判据已收紧**（M11b）：新增**未认证对照探测**（区分"公开资源"与"私有对象被越权读取"）+ **确定性归属提取**（要求响应中"所有者"字段的值等于 reference 身份），三种负面形态（公开资源 / 对照无法判定 / 缺归属证据）在编排层**确定性定终态、不交给 LLM**——这正是 M10a「同一真 IDOR 在 4 个臂出现 4 种结果」的正面解法。**新的明示限制**：① 归属证据依赖目标**自报归属**，真靶场若不展示所有者则一律驳回（宁漏勿滥）；② 粗筛探测**不带凭据**，在"需认证目标"上判别力下降（不丢候选，仅建议失真）。**沙箱隔离已硬化**（M12）：容器内非 root + rootfs 只读 + capability 归零 + 进程数/FD 上限，隔离档逐项进审计；残余限制是**工具输出体积无上限**（原始输出 100% 落盘是红线，故未加日志上限，见 AGENTS.md 限制 45）。
 
 > **用 IDOR 验证前需要声明 reference 身份**：归属比对要知道"reference 是谁"。对象页展示的
 > 通常是**用户名/所有者名**，而会话凭据往往是**随机 session id**——两者不同源。故创建

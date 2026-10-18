@@ -264,10 +264,17 @@ def main() -> int:
 
     # 3.5 附录 B 含 version-cve
     rejected = next(f for f in store.load_all() if f.vuln_type == "version-cve")
+    # M6c 契约：排除原因取 `reason_cn or rejection_reason`（同 demo_report.py 的说明）
+    reasons_cn: dict[str, str] = {}
+    cn_path = evidence_dir / "rejected_reasons_cn.json"
+    if cn_path.is_file():
+        reasons_cn = json.loads(cn_path.read_text(encoding="utf-8"))
+    expected_reason = reasons_cn.get(rejected.id) or rejected.rejection_reason or ""
     check(
-        "附录 B 含 version-cve 及排除原因",
+        "附录 B 含 version-cve 及排除原因（reason_cn 优先，M6c 契约）",
         any("version-cve" in cell for cell in cells)
-        and any(rejected.rejection_reason[:20] in cell for cell in cells),
+        and bool(expected_reason)
+        and any(expected_reason[:20] in cell for cell in cells),
     )
 
     # 3.6 1.4 流程章与源模板逐段一致

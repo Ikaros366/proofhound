@@ -133,11 +133,16 @@ def run_demo(client: TestClient, dvwa, eng_id: str) -> None:
         e for e in _audit_events(eng_dir, "verifier_verdict")
         if e.get("verdict") == "confirm"
     ]
-    assert verdicts and verdicts[0].get("cvss_vector") == vector, (
-        "verifier_verdict 审计事件缺 cvss_vector"
+    # 按 **finding_id** 精确取本 Finding 的那条事件：同一 engagement 里被 triage
+    # 模型产出的其它 Finding 也可能 confirm（实测 3 条），`verdicts[0]` 会取到别人
+    # 的向量，从而误报"缺 cvss_vector"（生产侧 verifier.py 每条都写了）。
+    mine = [e for e in verdicts if e.get("finding_id") == sqli["id"]]
+    assert mine and mine[0].get("cvss_vector") == vector, (
+        f"verifier_verdict 审计事件缺 cvss_vector（本 Finding={sqli['id']}；"
+        f"全部 confirm 事件={[(e.get('finding_id'), e.get('cvss_vector')) for e in verdicts]}）"
     )
     print(f"[*] 断言通过：verifier_verdict 审计含向量，事件原文:\n"
-          f"    {json.dumps(verdicts[0], ensure_ascii=False)}")
+          f"    {json.dumps(mine[0], ensure_ascii=False)}")
 
     # ---- 断言 3：报告读回含 CVSS 行 ----
     built = _check(

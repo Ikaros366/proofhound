@@ -274,11 +274,11 @@ def render_markdown(report: CostReport, *, title: str = "单题成本归属") ->
         "| 归属 | 调用 | token | prompt | completion | 重试次 | 重试token | 估算次 |",
         "|---|---|---|---|---|---|---|---|",
     )
-    for key, bucket, label in (
-        ("caller", report.by_caller, "按调用方"),
-        ("phase", report.by_phase, "按阶段"),
-        ("finding", report.by_finding, "按 Finding"),
-        ("tier", report.by_tier, "按档位"),
+    for bucket, label in (
+        (report.by_caller, "按调用方"),
+        (report.by_phase, "按阶段"),
+        (report.by_finding, "按 Finding"),
+        (report.by_tier, "按档位"),
     ):
         lines.append(f"## {label}")
         lines.append("")

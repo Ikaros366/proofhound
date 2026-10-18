@@ -6,7 +6,109 @@
 
 ## [未发布]
 
-（暂无）
+M19-a / M19-b / M19-c：一次**只读取证**的独立审计（在 1310 个测试全绿的前提下）
+查出 16 条问题后的修复轮。三条是真缺陷，其余是登记/守护的结构性缺口与文档脱节。
+
+### 修复（M19-a：命令注入的 DNS 防线其实从未生效）
+
+**两处独立缺陷，任一处都足以让这道防线完全失效：**
+
+1. **变体从未投递给靶**：`_verify_cmdi` 把**对照地址本身**（`http://<nonce>.invalid/…`）
+   当成探测 URL 去取，而真正的注入值 `dns_value` 算完即被丢弃 ⇒ 靶从头到尾没收到过
+   这次抓取尝试，`dns_misfire` 实际恒为 `False`。
+   更糟的是 Confirmed 的 `baseline_diff` 与 `reproduction_steps` 一直在写
+   「DNS 非命中变体未命中（排除第三方代抓取）」——那是**没有观测支撑的证据陈述**，
+   且写进了正式证据包。
+2. **路径前缀错**：`cmdi.dns_probe_value()` 造的是 `/<token>`，而 `CallbackListener`
+   只把 `/c/`、`/n/` 前缀当候选命中 ⇒ 即便中间件真的硬发一次，也只会记 `ignored`。
+   设计侧（裁定文档 §2.2、`SKILL.md`、`design.md`）写的都是 `/c/<token>`。
+
+**修法**：变体按裁定原文注入目标参数（`build_probe_url(asset, param, dns_value)`）、
+路径改用 `CALLBACK_PATH_PREFIX`；判定 JSON 同时留痕 `dns_probe_url`（对靶）与
+`dns_control_url`（本应命中的对照地址）。
+**新增两条结构性守护**：`test_verify_cmdi_injects_dns_variant_into_target`（变体必须
+作为目标参数值发出，用请求记录断言，与环境解耦）与
+`test_dns_probe_url_path_is_recognized_by_listener`（探针 URL 自身的 path 打到真
+listener 必须算命中）。后者顺带钉住了此前被写进断言的错误形态。
+**顺带清理**：`scripts/demo_cmdi_zero_seed.py` 里那段「取数层特殊投递」整段删除——
+它原本只是在补生产没做的那一步。
+
+### 修复（M19-b：登记与守护的第三/四处手工清单）
+
+- **`ssrf` 补 triage 上限**：它自 M16 起就没有 `_TRIAGE_CAPS` 条目，而代码注释与
+  AGENTS 里程碑行都写「`web-exposure` 是全池**唯一**没有上限的类型」——那是 M16 之前
+  的实况。现补 `_TRIAGE_SSRF_CAP = 10`，并新增
+  `test_every_registered_type_has_a_triage_cap`（注册类型集合 == 上限登记表集合）。
+- **参数键提示表收成单一真相源**：新增 `orchestrator._PARAM_HINT_TABLES`，
+  `_triage_candidates` 与生产者穷举器都从它派生（候选生成顺序逐条不变）。
+  此前穷举器只并**三张**表，M18-b 新增的 `_CMDI_PARAM_HINTS` 21 键里只有
+  `file`/`path`/`query`/`url` 4 个交集键被**无意**覆盖，另外 17 键从未喂过——
+  `cmdi` 的通过纯属巧合。新增 `test_param_hint_tables_are_all_registered`。
+- **证据包磁盘放大（实测 302.8×）**：`assemble_evidence_pack` 对**每条** Finding 各整份
+  拷一次源文件；`web-exposure` 是唯一无 triage 上限的类型，dirsearch 让它的候选量第一次
+  变得现实（300 条候选 × 106,800 B 报告 ⇒ 证据目录 32,342,076 B）。拷贝改为
+  **优先硬链接**（跨文件系统自动回落 `copyfile`），sha256 与 `finding.json` 一字不变。
+
+### 修复（M19-c：`dirsearch` 在生产链路不可达 + 请求量授权来源不可审计）
+
+- **可达性**：M16-b 交付的 manifest/构造器/解析器/依赖闭包/83 个测试/真靶验收脚本全都在，
+  但**没有任何 skill 声明 `dirsearch`**，而 `Planner._validate_semantics` 要求
+  `action.tool ∈ skill.manifest.required_tools` ⇒ 一切 `run_tool(dirsearch)` 被拒；
+  且编排层三个 `build_command` 调用点都不传 `request_budget`，构造器在 `None` 时
+  fail-closed 抛错。**与限制 58 同一类失败模式，此前无人记录。**
+  修法：新建 `skills/web-dirsearch/`（L1、`mutating=True`）+ 画像登记 +
+  `build.REQUEST_BUDGET_TOOLS` 单一登记 + `_exec_run_tool` 解析预算 +
+  `OrchestratorPhases` 加 scan 槽位（照 `recon-crawl` 先例，避免重演限制 59）。
+  **opt-in 取舍**：只有 scope **显式声明** `request_budget` 时才挂进扫描阶段，
+  否则记 `scan_skill_skipped` 并跳过——"不声明请求量上限就默认开始字典爆破"不可接受。
+- **来源可审计**：限制 54 声称"缺省放行不等于无痕放行，因为审计能分辨 `source`"，
+  但 `Scope.request_budget_source()` 此前只有测试与 demo 在调。现由
+  `_resolve_request_budget()` 记 `request_budget_resolved{tool,source,rate_rps,
+  concurrency,max_requests,window_minutes}`；runner 未挂 scope 记
+  `request_budget_unavailable` 并 fail-closed。
+- **新增守护**：`test_every_known_tool_is_reachable_through_some_skill`（把"工具接入"
+  的定义从「能构造命令」改成「能被规划出来」）、`test_planner_accepts_run_tool_dirsearch`、
+  `test_budget_actually_reaches_the_command_line`、opt-in 三态各一条。
+  新增文件 `tests/test_dirsearch_wiring.py`（11 个）。
+
+### 修复（M19-d：两条 demo 断言与实现不同步）
+
+跑全部 21 个 demo 时又抓到两条**断言过期**（与本轮 A 档同一类型：断言把旧形态钉死，
+且只在特定数据下才暴露）：
+
+- `demo_report.py` / `demo_report_enterprise.py` 的附录 B 断言只比对
+  `rejection_reason[:20]`。但 M6c 起附录 B 取契约 `reason_cn or rejection_reason`——
+  叙述一旦给出中文归因（**正常路径**），单元格里就是 `reason_cn`，两条断言必然失败。
+  实测证据：`rejected_reasons_cn.json` 的内容与报告单元格**逐字相同**，而
+  `rejection_reason` 是另一段文本。改为「reason_cn 优先、缺失回退 rejection_reason」，
+  与 `report/data.py` 的契约一致。
+- `demo_cvss_dvwa.py` 的断言 2 用 `verdicts[0]`，假设「只有一条 confirmed」。实测该
+  engagement 有 **3 条** confirm（都被 triage/模型产出），取到的是**别的 Finding** 的
+  向量 ⇒ 误报「缺 cvss_vector」（生产侧 `verifier.py` 每条都写了）。改为按
+  `finding_id` 精确选取。
+
+### 文档
+
+- `README`：skill 表 5 → 8（补 `verify-ssrf`/`verify-unauth`/`verify-cmdi`/`web-dirsearch`）、
+  只读声明补全六类、已知限制摘要"三条垂直切片"→ 六类并逐类列限定场景、
+  测试基线 1136 → 1328、发布状态改为"与 `origin/master` 同到 `c8a0176`"、
+  「下一步」条目编号重排（原为 1/2/4/3/4）与待裁决项 3 → 2。
+- `AGENTS`：`skills/` 清单补到八个、限制 60 的"5 个形参"→ 6 verify + 3 scan、
+  限制 54 ③ 标注为**M19-c 起才真正成立**、限制 62 追加**根因更正**、
+  新增限制 64（`web-exposure` 无上限 + 证据包硬链接）与 65（`dirsearch` opt-in）、
+  已知限制节加"只追加不改号"的编号约定。
+- `docs/design.md`：§7.16 的守护口径改为"按类型断言 + 从登记表派生"（原并集口径已废）、
+  §7.20 追加限制 62 的根因更正、**新增 §7.21** 完整记录本轮六条修复。
+
+### 测试
+
+全量 **1330 passed / 0 failed / 0 skipped**（修复前 1310；新增 20 个：
+`test_dirsearch_wiring.py` 11、cmdi 结构性守护 2、`_PARAM_HINT_TABLES` 1、
+triage 上限 1、证据包 inode 1、画像参数化 2、静态卫生守护 2）。
+CI 门 `-m "not docker and not browser"`：**1300 passed / 30 deselected**。
+**披露的旧断言改动 1 处**：`tests/test_cmdi.py::test_dns_probe_value_uses_nonresolving_tld`
+原把"缺 `/c/`"钉成了期望值（`url.startswith("http://…:8080/")`），现改为逐字锁定
+`http://…:8080/c/<token>`——断言意图不变（仍是逐字锁定地址形态），只是形态被修正。
 
 ## [0.4.0] - 2026-09-30
 
