@@ -146,8 +146,9 @@ def _synthetic_signals() -> list[Signal]:
     """覆盖规则表全部输入域的合成 Signal 集合。
 
     穷举维度：① `web-probe` × 全部状态码（含 `_EXPOSED_STATUSES` 之外的值）；
-    ② `param-endpoint` × 三张提示表的**并集**每个键；③ `form_page` ×
-    {命中页面路径回退, 命中字段名, 两者都不命中}。
+    ② `param-endpoint` × **`_PARAM_HINT_TABLES` 登记的每张提示表的并集**每个键
+    （M19-a：从登记表派生，不再手写"三张表"——手写清单曾漏掉 `_CMDI_PARAM_HINTS`）；
+    ③ `form_page` × {命中页面路径回退, 命中字段名, 两者都不命中}。
     """
     signals: list[Signal] = []
     ref = "synthetic.stdout.log#L1"
@@ -164,11 +165,9 @@ def _synthetic_signals() -> list[Signal]:
             )
         )
 
-    hint_union = (
-        orch_mod._SQLI_PARAM_HINTS
-        | orch_mod._XSS_PARAM_HINTS
-        | orch_mod._IDOR_PARAM_HINTS
-    )
+    hint_union: set[str] = set()
+    for hints, _severity in orch_mod._PARAM_HINT_TABLES.values():
+        hint_union |= hints
     for key in sorted(hint_union):
         signals.append(
             Signal(
@@ -357,12 +356,10 @@ def test_probe_enumeration_is_saturated():
         for signal in _synthetic_signals()
         if signal.kind == "param-endpoint"
     }
-    expected = (
-        orch_mod._SQLI_PARAM_HINTS
-        | orch_mod._XSS_PARAM_HINTS
-        | orch_mod._IDOR_PARAM_HINTS
-    )
-    assert exercised == set(expected)
+    expected: set[str] = set()
+    for hints, _severity in orch_mod._PARAM_HINT_TABLES.values():
+        expected |= hints
+    assert exercised == expected
     statuses = {s.status_code for s in _synthetic_signals() if s.kind == "web-probe"}
     assert set(orch_mod._EXPOSED_STATUSES) <= statuses
     assert {s.kind for s in _synthetic_signals()} == {
@@ -437,7 +434,8 @@ def test_every_registered_type_has_a_reachable_producer(tmp_path):
 
     与「直接构造 Finding」的测试的关键差别：本测试只写 **Signal**，
     Finding 由**生产代码**建——正是限制 58 里缺失的那一环。
-    另断言本轮**零 ``triage_capped``**，否则「没建出」会被配额掩盖成假绿。
+    穷举输入**故意**超出各类型配额，故 ``triage_capped`` 是预期现象——它对本次
+    判定不是噪声而是**证据**（被配额截断同样证明产过，见下方 ``capped_types``）。
     """
     findings, audit = _run_real_triage(tmp_path, _sessioned())
     produced = {f.vuln_type for f in findings}
@@ -485,7 +483,6 @@ def test_every_registered_type_has_a_reachable_producer(tmp_path):
             "——两条路都不产。"
         )
     assert produced, "冒烟必须至少建出一条 Finding，否则是空跑"
-    assert not_rule_produced or True
     assert set(NON_GATE_VULN_TYPES) <= produced, (
         "已知非门禁类型未能被生产链路构造出来：" + str(sorted(set(NON_GATE_VULN_TYPES) - produced))
     )

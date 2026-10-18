@@ -72,6 +72,7 @@ from dataclasses import dataclass, field
 from proofhound.verify.prefilter import with_query_param
 from proofhound.verify.ssrf import (
     BANNER,
+    CALLBACK_PATH_PREFIX,
     DELIVERY_PROOF_CHARS,
     CallbackListener,
     ProbeResponse,
@@ -133,11 +134,16 @@ def dns_probe_value(nonce_host: str, port: int, token: str) -> tuple[str, str]:
 
     地址的宿主是**不可解析**的随机名 ⇒ 真 shell 与"替我们抓取的中间件"**都**
     不会产生我们能收到的请求。故它命中即意味着有别的东西在代抓取。
+
+    **路径必须是** :data:`~proofhound.verify.ssrf.CALLBACK_PATH_PREFIX`（``/c/``）：
+    listener 只把 ``/c/`` 与 ``/n/`` 前缀的请求当候选命中，其余路径一律记
+    ``ignored``。M18-a 实现期此处漏了前缀（写成 ``/<token>``）⇒ 即便中间件真的
+    硬发了一次也判不出「第三方代抓取」，防线在结构上失效。
     """
     host = nonce_host if nonce_host.endswith(NONRESOLVING_TLD) else (
         nonce_host + NONRESOLVING_TLD
     )
-    url = f"http://{host}:{port}/{token}"
+    url = f"http://{host}:{port}{CALLBACK_PATH_PREFIX}{token}"
     return f";curl {url}", url
 
 

@@ -68,11 +68,13 @@ VERIFIER_CONFIRM = json.dumps(
 #:   DNS 防线**不该**拦它 ⇒ CONFIRMED（同时验证防线不误伤真漏洞）
 #: - ``/tools/safe`` **不取数**（安全形态，但参数会回显 ⇒ 交付证明成立）→ REJECTED
 #:
-#: ⚠️ **「中间件代抓取」形态刻意不在这里演示**：它要求 DNS 探针**真实到达靶**，
-#: 而 `<nonce>.invalid` 在任何环境都解析不了（本机透明代理截获并返回 502，
-#: 直连则 URLError）⇒ 端到端演示必须靠取数层特殊投递，实测会引入额外不确定性。
-#: 该防线由 `tests/test_cmdi.py::test_dns_defense_blocks_even_when_waf_makes_the_callback`
-#: **确定性**覆盖（在探针层模拟"中间件硬发"）。环境约束见 AGENTS.md 限制 62。
+#: ⚠️ **「中间件代抓取」形态刻意不在这里演示**：要让它成立，中间件必须能解析
+#: `<nonce>.invalid` 并把请求打到我们的 listener——而该名字在任何环境都解析不了
+#: （本机透明代理截获返回 502，直连 URLError）。
+#: **探测本身现在是真的投递到靶的**（M19-a 修掉"宿主自己去取 .invalid"的缺陷后，
+#: 本脚本不再需要任何取数层特殊投递）；缺的只是"中间件硬发"这一环境。
+#: 该形态由 `tests/test_cmdi.py::test_dns_defense_blocks_even_when_waf_makes_the_callback`
+#: 在探针层**确定性**覆盖。残余边界见 AGENTS.md 限制 62。
 ENDPOINTS = ("/tools/ping", "/tools/safe", "/tools/waf")
 
 
@@ -158,41 +160,6 @@ def _write_signals(run_dir: Path, urls: list[str]) -> None:
     )
 
 
-def _make_fetch(target_port: int):
-    """构造 demo 的取数函数：**普通探针照旧**，DNS 探针投递到靶的同一端点。
-
-    为什么需要这一层（**实测事实，不是设计缺陷**）：`<nonce>.invalid` 这个主机名
-    **在任何环境都不可能解析**——本机对外解析走透明代理（探针被代理截获返回 502），
-    直连则直接 `URLError: Name or service not known`。两种情况下探针都**到不了靶**，
-    于是靶的"第三方代抓取"分支无从触发，防线也就演示不出来。
-
-    ⇒ demo 把 DNS 探针**投递到靶的同一端点**（路径取自探针 URL 自身、token 作为
-    参数带上），保留"这是对不可解析名的一次抓取尝试"的语义。这**不放宽防线**：
-    `dns_misfire` 的判据始终是「**listener 是否收到这个 token**」，与探针怎么
-    送到靶无关。
-
-    生产链路不这么做：探针到不了靶时，判定自然落在 blocked（保守方向）——
-    相关边界记入 AGENTS.md 限制 62。
-    """
-
-    def _fetch(url: str, session):
-        if cmdi.NONRESOLVING_TLD in (urlparse(url).hostname or ""):
-            parsed = urlparse(url)
-            token = parsed.path.rstrip("/").rsplit("/", 1)[-1]
-            routed = f"http://127.0.0.1:{target_port}{parsed.path}?{PARAM}={token}"
-            try:
-                with urllib.request.urlopen(routed, timeout=5) as resp:  # noqa: S310
-                    return cmdi.ProbeResponse(
-                        url=url, status=resp.status,
-                        body=resp.read().decode("utf-8", errors="replace"),
-                    )
-            except Exception as exc:  # noqa: BLE001 - 拿不到响应即探针失败
-                return cmdi.ProbeResponse(url=url, error=f"{type(exc).__name__}: {exc}")
-        return cmdi.fetch(url, session)
-
-    return _fetch
-
-
 def _new_orch(run_dir: Path, port: int) -> Orchestrator:
     return Orchestrator(
         SkillRegistry(REPO / "skills").discover(),
@@ -202,7 +169,7 @@ def _new_orch(run_dir: Path, port: int) -> Orchestrator:
         _CannedRouter(),
         AuditLog(run_dir / "audit.jsonl"),
         evidence_dir=run_dir,
-        cmdi_fetch=_make_fetch(port),
+        cmdi_fetch=cmdi.fetch,
     )
 
 

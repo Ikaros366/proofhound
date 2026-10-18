@@ -121,7 +121,30 @@ def test_dns_probe_value_uses_nonresolving_tld():
     value, url = cmdi.dns_probe_value("phnonce123", 8080, "phcmdi_tok")
     assert value.startswith(";curl ")
     assert cmdi.NONRESOLVING_TLD in url, "必须用 RFC 6761 保留的不可解析顶级域"
-    assert url.startswith("http://phnonce123.invalid:8080/")
+    assert url == "http://phnonce123.invalid:8080/c/phcmdi_tok", (
+        "DNS 探针地址必须走 /c/ 前缀——listener 只认 /c/ 与 /n/ 前缀，"
+        "其余路径会被记成 ignored（M18-a 曾漏掉这一层）"
+    )
+
+
+def test_dns_probe_url_path_is_recognized_by_listener():
+    """**结构性守护**：探针 URL 自己的 path 打到真 listener 必须算命中。
+
+    这条钉住的是「DNS 防线到底能不能被触发」：路径前缀与 ``callback_url`` 一旦
+    漂移，就算中间件真的硬发了一次，listener 也只会记 ``ignored`` ⇒
+    ``dns_misfire`` 永远为 False（M18-a 的实际形态）。
+    """
+    with cmdi.CallbackListener(host="127.0.0.1", port=0).start() as listener:
+        host, port = listener.bound_address
+        token = cmdi.new_cmdi_token()
+        _value, url = cmdi.dns_probe_value("nonce123deadbeef.invalid", port, token)
+        listener.register(token)
+        # 用探针 URL **自身的 path** 打真 listener（模拟中间件"硬发"）
+        _get(f"http://{host}:{port}{urlparse(url).path}")
+        assert listener.hits(token), (
+            "DNS 探针路径不被 listener 计入命中 ⇒ 即使中间件代抓取也判不出"
+            f"（探针 URL={url}，ignored={[r.to_dict() for r in listener.ignored]}）"
+        )
 
 
 def test_build_probe_url_replaces_only_target_param():
@@ -275,10 +298,11 @@ class FakeVictim:
 
     关于 DNS 探针的复现方式：不可解析主机名（``.invalid``）在现实中**必然**解析
     失败，且"失败"的具体表现随环境而变（有透明代理时拿到 502，裸环境是
-    URLError），故**不靠真实解析**来复现中间件行为——替身改为检查**探针 URL
-    自身**的宿主是否不可解析，若是则直接把该探针路径里的 token 打到真 listener，
-    等价于"中间件硬发了一次"。这样用例与环境解耦，仍真实走完
-    listener 登记 → 命中判定 → ``judge`` 全链路。
+    URLError），故**不靠真实解析**来复现中间件行为——替身改为检查**注入的参数值
+    里**是否含不可解析宿主（那正是 DNS 非命中变体的标志），若是则认为"中间件
+    硬发了一次"，**用该候选 URL 自身的 path** 打到真 listener。这样用例与环境
+    解耦，仍真实走完 listener 登记 → 命中判定 → ``judge`` 全链路；同时因为用的是
+    候选自身的 path，它还顺带钉住「探针路径必须能被 listener 计入命中」。
     """
 
     def __init__(
@@ -306,16 +330,19 @@ class FakeVictim:
         value = _injected_value(url)
 
         if self.waf_fetches:
-            hostname = urlparse(url).hostname or ""
-            if cmdi.NONRESOLVING_TLD in hostname:
-                token = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
-                bound_host, bound_port = self.listener.bound_address
-                if token:
-                    try:
-                        _get(f"http://{bound_host}:{bound_port}/c/{token}")
-                    except Exception:  # noqa: BLE001
-                        pass
             for candidate in _extract_urls(value):
+                candidate_host = urlparse(candidate).hostname or ""
+                if cmdi.NONRESOLVING_TLD in candidate_host:
+                    # 中间件"硬发"：真实世界它解析不了 .invalid，本替身**刻意**
+                    # 模拟「解析成功并打到我们 listener」这一最不利情形。
+                    bound_host, bound_port = self.listener.bound_address
+                    path = urlparse(candidate).path
+                    if path.strip("/"):
+                        try:
+                            _get(f"http://{bound_host}:{bound_port}{path}")
+                        except Exception:  # noqa: BLE001
+                            pass
+                    continue
                 try:
                     _get(candidate)
                 except Exception:  # noqa: BLE001 - 抓取失败即失败
@@ -526,6 +553,35 @@ def test_dns_defense_blocks_even_when_waf_makes_the_callback(env):
     assert env.store.load_all()[0].state is FindingState.HYPOTHESIS
 
 
+def test_verify_cmdi_injects_dns_variant_into_target(env):
+    """**结构性守护**：DNS 非命中变体必须作为目标参数值发出。
+
+    M18-a 的生产代码把**对照地址本身**当成了探测 URL（宿主直接去取 ``.invalid``），
+    真正的注入值算完就丢 ⇒ 该变体从未到达靶，"第三方代抓取"永远观测不到，
+    而 Confirmed 的证据里仍写着"已排除第三方代抓取"。
+    本测试只断言**请求去了哪**，不依赖任何解析行为，故与环境完全解耦。
+    """
+    with cmdi.CallbackListener(host="127.0.0.1", port=0).start() as listener:
+        finding = _finding(env)
+        victim = FakeVictim(listener, executes=False)
+        orch = _orch(env, listener, victim)
+        orch._verify_cmdi(finding, env.registry.get("verify-cmdi"), env.store)
+        seen = list(victim.seen)
+
+    base = finding.asset.split("?", 1)[0]
+    injected = [
+        u for u in seen if u.startswith(base) and cmdi.NONRESOLVING_TLD in unquote(u)
+    ]
+    assert injected, (
+        "DNS 非命中变体没有投递到靶（宿主自己去取 .invalid 地址了）⇒ "
+        f"防线在结构上无法触发；实际请求={seen}"
+    )
+    direct = [
+        u for u in seen if cmdi.NONRESOLVING_TLD in (urlparse(u).hostname or "")
+    ]
+    assert not direct, f"生产不应直接把 .invalid 当探测目标；实际请求={direct}"
+
+
 def test_blocked_when_probe_errors(env):
     with cmdi.CallbackListener(host="127.0.0.1", port=0).start() as listener:
         finding = _finding(env)
@@ -584,12 +640,9 @@ def test_every_capped_type_reports_triage_capped(tmp_path, make_skill_dir):
     # cmdi 的键；每个键重复到超过该类型的上限。
     import proofhound.core.orchestrator as orch_mod
 
-    hint_union = (
-        orch_mod._SQLI_PARAM_HINTS
-        | orch_mod._XSS_PARAM_HINTS
-        | orch_mod._IDOR_PARAM_HINTS
-        | orch_mod._CMDI_PARAM_HINTS
-    )
+    hint_union: set[str] = set()
+    for hints, _severity in orch_mod._PARAM_HINT_TABLES.values():
+        hint_union |= hints
     evidence_dir = tmp_path / "evidence"
     evidence_dir.mkdir()
     raw = evidence_dir / "crawl.stdout.log"
