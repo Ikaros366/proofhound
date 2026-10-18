@@ -247,9 +247,21 @@ _TRIAGE_CMDI_CAP = 10
 
 # M17-b：每 engagement 新建 unauth-exposure Hypothesis 上限（独立计数、独立
 # triage_capped 事件）。**必须**有独立上限：`web-exposure` 是全池唯一**没有**
-# 上限的类型（sqli/xss/idor 各有），而新生产者的候选量与 web-probe 信号数同阶，
+# 上限的类型（其余各有），而新生产者的候选量与 web-probe 信号数同阶，
 # 每条又要花「2 次 HTTP + 1 次 T1 调用」——不设限会给贵验证档灌水。
+#
+# M19-b 更正：原文写「（sqli/xss/idor 各有）」并称 web-exposure 是**唯一**无上限
+# 的类型。那是 M16 之前的实况——`ssrf` 自 M16 起就没有 `_TRIAGE_CAPS` 条目
+# （规则表刻意不给它提示表、只走模型通道，加类型时漏登记了上限），故"唯一"
+# 一直是错的。现补 `_TRIAGE_SSRF_CAP`，并由
+# `tests/test_vuln_registry.py::test_every_registered_type_has_a_triage_cap`
+# 断言「注册类型集合 == 上限登记表集合」，杜绝下一次漏登记。
 _TRIAGE_UNAUTH_CAP = 10
+
+# M19-b：每 engagement 新建 ssrf Hypothesis 上限（独立计数、独立 triage_capped）。
+# `ssrf` 只由模型通道产出（`PROOFHOUND_TRIAGE_MODEL` 缺省关闭），但一旦开启就没有
+# 任何条数上界——而每条候选在验证期都要开一个回调 listener 并发带会话探测。
+_TRIAGE_SSRF_CAP = 10
 
 #: 需要「scope 配了可用预置会话」才能验证的 vuln_type —— **由
 #: `verify/gate.py::VULN_REGISTRY` 的 `requires_session` 派生**（M17-c）。
@@ -271,6 +283,7 @@ _TRIAGE_CAPS: dict[str, int] = {
     "sqli": _TRIAGE_SQLI_CAP,
     "xss": _TRIAGE_XSS_CAP,
     "idor": _TRIAGE_IDOR_CAP,
+    "ssrf": _TRIAGE_SSRF_CAP,  # M19-b
     "unauth-exposure": _TRIAGE_UNAUTH_CAP,
     "cmdi": _TRIAGE_CMDI_CAP,  # M18-b
 }

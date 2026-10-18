@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -45,6 +46,28 @@ def _collect_refs(finding: Finding) -> list[str]:
             seen.add(ref)
             unique.append(ref)
     return unique
+
+
+def _materialize(src: Path, dest: Path) -> None:
+    """把一个源证据文件"放进"证据包：**优先硬链接**，不可用才整文件拷贝。
+
+    M19-b：原实现无条件 ``shutil.copyfile`` ⇒ 同一个源文件会被**每条** Finding
+    各拷一份。`web-exposure` 是全池唯一**没有** triage 上限的类型，候选量又与
+    探测路径数同阶：实测 300 条候选取同一份 106,800 B 的 dirsearch 报告时，
+    证据目录膨胀到 **32,342,076 B（302.8×）**；按 dirsearch 的
+    ``max_requests=5000`` 上限，最坏情况是数百 MB 量级。
+
+    硬链接**不改变任何可观测语义**：包内文件照旧可单独 ``open``/``cat``，
+    ``manifest.json`` 里的 sha256 与 ``finding.json`` 一字不变，只是同源证据在
+    磁盘上只占一份。**可搬迁性**：跨文件系统时 ``os.link`` 抛 OSError 自动回落
+    为拷贝；把证据包整体 ``cp -r`` / ``tar`` 出去后各自是独立文件，语义不变。
+    """
+    if dest.exists():
+        dest.unlink()
+    try:
+        os.link(src, dest)
+    except OSError:
+        shutil.copyfile(src, dest)
 
 
 def assemble_evidence_pack(finding: Finding, *, evidence_base: str | Path) -> Path:
@@ -77,7 +100,7 @@ def assemble_evidence_pack(finding: Finding, *, evidence_base: str | Path) -> Pa
             continue
         digest = hashlib.sha256(src.read_bytes()).hexdigest()
         pack_name = f"{src.stem}-{digest[:8]}{src.suffix}"
-        shutil.copyfile(src, pack_dir / pack_name)
+        _materialize(src, pack_dir / pack_name)
         items.append(
             {
                 "file": pack_name,

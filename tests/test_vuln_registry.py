@@ -369,6 +369,49 @@ def test_probe_enumeration_is_saturated():
     }
 
 
+def test_every_registered_type_has_a_triage_cap():
+    """每个注册类型都必须登记 triage 新建上限（M19-b）。
+
+    ``_TRIAGE_CAPS`` 不是 ``VULN_REGISTRY`` 的派生视图（上限是策略参数，不属于
+    「类型事实」），所以它是**第四条手工登记处**，必须同样有守护。
+    反例：`ssrf` 从 M16 起就没有条目，而代码注释却写「`web-exposure` 是全池唯一
+    没有上限的类型」——本断言能提前抓住这类漏登记。
+    ``web-exposure`` 不在 `VULN_REGISTRY` 里（非门禁类型），故天然被排除。
+    """
+    assert set(orch_mod._TRIAGE_CAPS) == set(VULN_REGISTRY), (
+        "注册类型与 triage 上限登记表不一致：缺上限="
+        + str(sorted(set(VULN_REGISTRY) - set(orch_mod._TRIAGE_CAPS)))
+        + "；多登记="
+        + str(sorted(set(orch_mod._TRIAGE_CAPS) - set(VULN_REGISTRY)))
+    )
+    assert all(limit > 0 for limit in orch_mod._TRIAGE_CAPS.values())
+
+
+def test_param_hint_tables_are_all_registered():
+    """**规则表入口必须全部登记在** ``_PARAM_HINT_TABLES``（M19-a）。
+
+    M18-b 加 `_CMDI_PARAM_HINTS` 时只写了 `_triage_candidates` 里的一段 extend，
+    生产者穷举器仍按三张表喂输入 ⇒ cmdi 只是**碰巧**被 `file`/`query` 等 4 个
+    交集键覆盖到，另外 **17 个键从未被喂过**。本测试把「提示表 → 登记表」变成
+    断言：模块里出现新的 ``_*_PARAM_HINTS`` 却没登记，立刻失败。
+    """
+    declared = {n for n in dir(orch_mod) if n.endswith("_PARAM_HINTS")}
+    registered = {
+        name
+        for hints, _severity in orch_mod._PARAM_HINT_TABLES.values()
+        for name in declared
+        if getattr(orch_mod, name) is hints
+    }
+    assert declared == registered, (
+        "以下参数键提示表没有登记进 _PARAM_HINT_TABLES"
+        "（生产者穷举器与上限判定都会漏掉它）：" + str(sorted(declared - registered))
+    )
+    assert set(orch_mod._PARAM_HINT_TABLES) <= set(VULN_REGISTRY), (
+        "规则表产出了未登记的 vuln_type："
+        + str(sorted(set(orch_mod._PARAM_HINT_TABLES) - set(VULN_REGISTRY)))
+    )
+
+
 # --------------------------------------------------------------------------
 # 守护 0：登记表自身的自洽（M17-c）
 # --------------------------------------------------------------------------

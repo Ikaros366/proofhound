@@ -102,6 +102,34 @@ def test_assemble_pack_copies_evidence_with_sha256_manifest(evidence_dir):
     assert "1. 打开 /b" in steps and "2. 对照 /c" in steps
 
 
+def test_assemble_pack_shares_one_inode_per_source_file(evidence_dir, tmp_path):
+    """同源证据在多条 Finding 之间只占**一份**磁盘（M19-b）。
+
+    钉住的缺陷：每条 Finding 各拷一份整文件 ⇒ `web-exposure`（唯一无 triage 上限
+    的类型）在 dirsearch 场景下把证据目录放大几百倍（实测 302.8×）。
+    断言用的是 inode 身份，而不是"大小看起来差不多"——硬链接必须**是**同一份数据。
+    """
+    a = _make_finding(evidence_dir)
+    b = _make_finding(evidence_dir, id="F-2026-0002")
+    assert a.id != b.id
+    pack_a = assemble_evidence_pack(a, evidence_base=evidence_dir)
+    pack_b = assemble_evidence_pack(b, evidence_base=evidence_dir)
+
+    files_a = sorted(p for p in pack_a.iterdir() if p.suffix == ".log")
+    files_b = sorted(p for p in pack_b.iterdir() if p.suffix == ".log")
+    assert files_a and files_b, "两份证据包都应含证据原文"
+    assert files_a[0].name == files_b[0].name
+    stat_a, stat_b = files_a[0].stat(), files_b[0].stat()
+    assert (stat_a.st_dev, stat_a.st_ino) == (stat_b.st_dev, stat_b.st_ino), (
+        "同一源文件在两个证据包里应是同一份数据（硬链接）；"
+        "若这里失败说明退回了整文件拷贝"
+    )
+    # 内容与 manifest 里的 sha256 必须一字不变
+    digest = hashlib.sha256(files_a[0].read_bytes()).hexdigest()
+    manifest = json.loads((pack_a / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["items"][0]["sha256"] == digest
+
+
 def test_assemble_pack_marks_missing_source(evidence_dir):
     finding = _make_finding(
         evidence_dir,
