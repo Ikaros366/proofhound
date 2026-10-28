@@ -146,6 +146,9 @@ class Finding(BaseModel):
     narrative: str | None = None  # 报告阶段 LLM 叙述只存于此，不回写事实字段
     narrative_parts: NarrativeParts | None = None  # M4.5 三段叙述（描述/危害/建议）
     source_signal_refs: list[str] = Field(default_factory=list)
+    #: M20-b：覆盖截图引用（「这条端点测过」的证据，**不是**确认证据；
+    #: 不进 evidence_kinds / verification.evidence_refs，证据门不读它）。
+    coverage_refs: list[str] = Field(default_factory=list)
     created_at: str = Field(min_length=1)
     updated_at: str = Field(min_length=1)
     audit: AuditLog | None = Field(default=None, exclude=True)  # 运行期句柄，不落盘

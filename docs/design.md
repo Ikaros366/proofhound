@@ -1704,6 +1704,30 @@ append-only 快照里没有这条 `evidence_refs`（回放时引用丢失）。
 不扩成「任意 URL 截图」的对外能力（没有 CLI/API 入口）；`full_page` 仅保留构造参数，
 缺省关。
 
+### 7.23 覆盖截图：按类型的固定取证（M20-b，2026-10-28）
+
+**为什么再分一层**：M20 的确认截图只在 Confirmed 之后发生，它回答「这个漏洞成立吗」；
+报告还需要回答「这条端点我们到底测过没有」——尤其在被驳回 / 无法判定时。两者证据
+语义不同，不能混：覆盖截图**不进**确认证据链。
+
+**接线点**：`run_verify_phase` 在调用 handler **之前**调 `_capture_coverage(finding, store)`，
+故不论 handler 最后返回 confirmed / rejected / blocked，图都已经留下。截图后立即
+`store.append(finding)`，保证 `coverage_refs` 进 append-only 快照（handler 若另存快照，
+last-wins 语义不变）。
+
+**镜头表是单一真相源**：`verify/coverage.py::COVERAGE_SHOTS`（类型 → (label, 参数覆盖,
+会话角色)）。加漏洞类型必须同步，`tests/test_coverage_shots.py` 用 `VULN_REGISTRY`
+双向锁定；未知类型 `plan_for` 返回 None（不截图、不猜）。
+
+**会话语义**：`primary` = 预置主会话、`anonymous` = 不带任何凭据、`reference` = 第二身份
+会话。缺 reference 时**跳过**该镜头而不是回退主会话——回退会伪造出「双身份对照」。
+
+**上限**：每类型 5 条候选、单 phase 24 张；超限记 `coverage_shot_capped`。上限是资源
+调度（同 `triage_capped`），被裁掉的候选照常进验证。
+
+**边界**：覆盖截图不改变任何判定；不进 docx（报告嵌图仍未做）；探针只用 GET + 改 query
+取值，不写目标、不弹框。
+
 ## 8. 开发路线图
 
 

@@ -293,6 +293,32 @@ PROOFHOUND_SCREENSHOT=1 .venv/bin/python -m proofhound.api --workspace . --port 
 > 但截图**不是观察**——它只是补充证据。把一条已确认的 Finding 因为"没截到图"改判，
 > 等于用可用性故障污染结论；代价是"报告里没有图"只能从 `screenshot_skipped` 审计看出。
 
+### 覆盖截图（M20-b）：按漏洞类型的固定取证
+
+与上面的「确认后补证」不同：覆盖截图在**候选一进验证**时按类型的固定镜头表留图，
+**不论最后是 confirmed / rejected / blocked**——它证明的是「这条端点被真的测过」，
+不是「漏洞成立」。因此覆盖截图**不进** `evidence_kinds` 与
+`verification.evidence_refs`，只进 `Finding.coverage_refs`（证据门与 Verifier
+均不读它），但会随证据包一起落盘、可离线调出。
+
+固定镜头表（`proofhound/verify/coverage.py::COVERAGE_SHOTS`，单一真相源）：
+
+| 类型 | 固定镜头 | 说明 |
+|---|---|---|
+| `sqli` | `baseline` + `probe`（参数换成 `1'`） | 页面回显 SQL 报错即是「测过」的视觉证据 |
+| `xss` | `baseline` + `probe`（`<script>window.__ph_shot=1</script>`） | 不弹框、无副作用的探针 |
+| `idor` | `attacker`（主会话）+ `reference`（第二身份会话） | 双身份各一张；缺 reference 时该镜头记 skipped，**不拿主会话顶替** |
+| `ssrf` | `baseline` | 回调证明不是视觉证据，这里只留端点形态 |
+| `unauth-exposure` | `anonymous`（不带凭据）+ `authenticated` | 判据本身就是两视图对照 |
+| `cmdi` | `baseline` | 端点形态 |
+
+- **上限**：每类型最多 5 条候选、单 phase 最多 24 张（`CAP_PER_TYPE` / `CAP_TOTAL`），
+  超限记 `coverage_shot_capped`（资源调度，不是判定；被裁掉的候选仍照常验证）。
+- **审计**：`coverage_shot_captured`（类型/镜头/会话/URL/文件/sha256/尺寸）、
+  `coverage_shot_skipped`（缺 param / 缺 reference / 截图失败）、`coverage_shot_capped`。
+- **加类型**：必须在 `COVERAGE_SHOTS` 里登记镜头——`tests/test_coverage_shots.py`
+  用 `VULN_REGISTRY` 双向锁定（注册了没镜头表、或有镜头表没注册，测试即红）。
+
 ## 路线图与已知限制
 
 > **状态**：本地工作树干净，`HEAD` 与 `origin/master` 同到 `c8a0176`（`v0.4.0` 已打标签）。后续改动是否发布、是否打新标签由维护者裁决。

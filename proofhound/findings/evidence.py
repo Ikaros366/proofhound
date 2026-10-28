@@ -39,6 +39,9 @@ def _collect_refs(finding: Finding) -> list[str]:
     refs = list(finding.source_signal_refs)
     if finding.verification is not None:
         refs.extend(finding.verification.evidence_refs)
+    # M20-b：覆盖截图也进证据包（可离线调出），但**不进**确认证据链
+    # ——证据门与 Verifier 只读 evidence_kinds / verification.evidence_refs。
+    refs.extend(finding.coverage_refs)
     seen: set[str] = set()
     unique: list[str] = []
     for ref in refs:

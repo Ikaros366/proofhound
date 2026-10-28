@@ -115,6 +115,15 @@ from proofhound.verify.cmdi import new_cmdi_token
 from proofhound.verify.cmdi import same_origin as cmdi_same_origin
 from proofhound.verify.cmdi import summary_for_verifier as cmdi_summary_for_verifier
 from proofhound.verify.cmdi import token_delivered as cmdi_token_delivered
+from proofhound.verify.coverage import (
+    CAP_PER_TYPE as COVERAGE_CAP_PER_TYPE,
+    CAP_TOTAL as COVERAGE_CAP_TOTAL,
+)
+from proofhound.verify.coverage import build_url as coverage_build_url
+from proofhound.verify.coverage import plan_for as coverage_plan_for
+from proofhound.verify.coverage import (
+    select_session as coverage_select_session,
+)
 from proofhound.verify.cvss import base_score as cvss_base_score
 from proofhound.verify.cvss import severity_for_score
 from proofhound.verify.gate import BEHAVIORAL_EVIDENCE_KIND
@@ -575,6 +584,9 @@ class Orchestrator:
         self.screenshots = screenshots
         self.screenshot_factory = screenshot_factory
         self._screenshotter = None
+        # M20-b：覆盖截图的每类型 / 每 phase 计数（run_verify_phase 开头重置）
+        self._coverage_by_type: dict[str, int] = {}
+        self._coverage_total = 0
         # M8c：verify-idor 的取数注入口子（测试给罐头 fetch；None 时用
         # verify/idor.py 的真实 stdlib fetch）
         self._idor_fetch = idor_fetch if idor_fetch is not None else idor_fetch_default
@@ -1046,6 +1058,9 @@ class Orchestrator:
         vuln_types, handler = handlers[skill_name]
 
         store = FindingStore(self.evidence_dir / "findings.jsonl")
+        # M20-b：覆盖截图计数按 phase 重置
+        self._coverage_by_type = {}
+        self._coverage_total = 0
         counts = {"confirmed": 0, "rejected": 0, "blocked": 0, "skipped": 0}
         processed: list[Finding] = []
         # M17-b：前置不可满足而被整类拦下的候选（按类型聚合，收尾记一次审计）
@@ -1085,6 +1100,8 @@ class Orchestrator:
                     if verdict is not None:
                         counts[verdict] += 1
                         continue
+                # M20-b：按类型固定取证（不论判定结果；失败不影响验证）
+                self._capture_coverage(finding, store)
                 outcome = handler(finding, skill, store)
                 counts[outcome] += 1
                 processed.append(finding)
@@ -2911,6 +2928,155 @@ class Orchestrator:
             blocked_requests=result.blocked_requests,
         )
         return result.path
+
+    # ---- M20-b：覆盖截图（按类型的固定取证镜头） ----
+
+    def _capture_coverage(self, finding: Finding, store: FindingStore) -> None:
+        """按类型的固定镜头留图（**不论判定结果**）；引用只进 ``coverage_refs``。
+
+        与 :meth:`_capture_screenshot`（确认后补证）刻意分开：这里的图证明
+        「这条端点被真的测过」，**不是**「漏洞成立」。故：
+
+        - 不进 ``evidence_kinds``、不进 ``verification.evidence_refs``；
+        - 失败/超限只记审计，绝不影响验证流程（fail-open）；
+        - 每类型 / 每 phase 都有上限（资源调度，不是判定）。
+        """
+        if not self.screenshots:
+            return
+        plan = coverage_plan_for(finding.vuln_type)
+        if plan is None:
+            return
+        if self._coverage_by_type.get(finding.vuln_type, 0) >= COVERAGE_CAP_PER_TYPE:
+            self.audit.record(
+                "coverage_shot_capped",
+                finding_id=finding.id,
+                vuln_type=finding.vuln_type,
+                reason=f"每类型上限 {COVERAGE_CAP_PER_TYPE} 条候选",
+            )
+            return
+        if self._coverage_total >= COVERAGE_CAP_TOTAL:
+            self.audit.record(
+                "coverage_shot_capped",
+                finding_id=finding.id,
+                vuln_type=finding.vuln_type,
+                reason=f"本 phase 上限 {COVERAGE_CAP_TOTAL} 张",
+            )
+            return
+        try:
+            capturer = self._get_screenshotter()
+        except Exception as exc:
+            self.audit.record(
+                "coverage_shot_skipped",
+                finding_id=finding.id,
+                vuln_type=finding.vuln_type,
+                reason=f"截图器不可用: {exc}",
+            )
+            return
+
+        session = self._session()
+        secrets = session.secret_values() if session is not None else []
+        records: list[dict] = []
+        refs: list[str] = []
+        for shot in plan:
+            if self._coverage_total >= COVERAGE_CAP_TOTAL:
+                self.audit.record(
+                    "coverage_shot_capped",
+                    finding_id=finding.id,
+                    vuln_type=finding.vuln_type,
+                    reason=f"本 phase 上限 {COVERAGE_CAP_TOTAL} 张",
+                )
+                break
+            try:
+                url = coverage_build_url(finding.asset, finding.param, shot)
+            except ValueError as exc:
+                self.audit.record(
+                    "coverage_shot_skipped",
+                    finding_id=finding.id,
+                    vuln_type=finding.vuln_type,
+                    label=shot.label,
+                    reason=str(exc),
+                )
+                continue
+            selected, skip_reason = coverage_select_session(session, shot.session)
+            if skip_reason is not None:
+                self.audit.record(
+                    "coverage_shot_skipped",
+                    finding_id=finding.id,
+                    vuln_type=finding.vuln_type,
+                    label=shot.label,
+                    reason=skip_reason,
+                )
+                continue
+            result = capturer.capture(
+                url, name=f"cover_{finding.id}_{shot.label}", session=selected
+            )
+            self._coverage_total += 1
+            if result.error is not None or result.path is None:
+                self.audit.record(
+                    "coverage_shot_skipped",
+                    finding_id=finding.id,
+                    vuln_type=finding.vuln_type,
+                    label=shot.label,
+                    url=url,
+                    reason=result.error or "未产出文件",
+                )
+                continue
+            refs.append(str(result.path))
+            records.append(
+                {
+                    "label": shot.label,
+                    "session": shot.session,
+                    "url": url,
+                    "file": result.path.name,
+                    "sha256": result.sha256,
+                    "bytes": result.bytes,
+                    "width": result.width,
+                    "height": result.height,
+                    "status": result.status,
+                }
+            )
+            self.audit.record(
+                "coverage_shot_captured",
+                finding_id=finding.id,
+                vuln_type=finding.vuln_type,
+                label=shot.label,
+                session=shot.session,
+                url=url,
+                file=result.path.name,
+                bytes=result.bytes,
+                sha256=result.sha256,
+                width=result.width,
+                height=result.height,
+                status=result.status,
+                blocked_requests=result.blocked_requests,
+            )
+        if not refs:
+            return
+        self._coverage_by_type[finding.vuln_type] = (
+            self._coverage_by_type.get(finding.vuln_type, 0) + 1
+        )
+        finding.coverage_refs.extend(r for r in refs if r not in finding.coverage_refs)
+        sidecar = self.evidence_dir / f"coverage_{finding.id}.json"
+        sidecar.write_bytes(
+            redact_bytes(
+                (
+                    json.dumps(
+                        {
+                            "finding_id": finding.id,
+                            "vuln_type": finding.vuln_type,
+                            "asset": finding.asset,
+                            "param": finding.param,
+                            "shots": records,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+                secrets,
+            )
+        )
+        store.append(finding)  # coverage_refs 落进 append-only 快照
 
     def _run_baseline(
         self, finding: Finding, session: SessionConfig

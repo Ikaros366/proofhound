@@ -6,6 +6,30 @@
 
 ## [未发布]
 
+### 新增（M20-b 覆盖截图：按漏洞类型的固定取证，不论判定结果）
+
+**做了什么**：新增 `proofhound/verify/coverage.py`——`COVERAGE_SHOTS` 是「漏洞类型 →
+固定镜头」的单一真相源（sqli 基线 + 注入标点、xss 基线 + 无副作用探针、idor 双身份、
+ssrf 基线、unauth 匿名 + 已认证、cmdi 基线）；`run_verify_phase` 在**调用 handler 之前**
+调 `_capture_coverage`，把图写进 evidence 目录并追加到 `Finding.coverage_refs`。
+
+- **证明的是「测过」，不是「有洞」**：覆盖截图**不进** `evidence_kinds` /
+  `verification.evidence_refs`，证据门与 Verifier 一字未改；只随证据包落盘、可离线调出。
+- **判定结果无关**：confirmed / rejected / blocked 的候选都留图（截图发生在 handler 之前）。
+- **会话选择进镜头**：idor 用 attacker + reference 双身份，unauth 用 anonymous + authenticated；
+  缺 reference 时记 `coverage_shot_skipped`，**不拿主会话顶替**（否则等于伪造对照）。
+- **上限**：每类型 5 条候选 / 单 phase 24 张，超限记 `coverage_shot_capped`。
+- **审计**：`coverage_shot_captured` / `coverage_shot_skipped` / `coverage_shot_capped`。
+- **单测守护**：`tests/test_coverage_shots.py` 用 `VULN_REGISTRY` **双向锁定**镜头表
+  （加类型必须同步，漏了即红）。
+
+**测试**：新增 `tests/test_coverage_shots.py` **12** 个；实弹 `scripts/demo_screenshot.py`
+扩到 **17 条断言**（真 Chromium：六类 **10 张**固定图齐备、匿名镜头靶侧无 Cookie、
+reference 镜头真用第二会话、审计 10 条）；全量 **1357 passed / 2 skipped**。
+
+**成本**：每条候选 1~2 次真实导航（约 1~3s/次），仍受 `PROOFHOUND_SCREENSHOT` 开关控制
+（缺省关）。
+
 ### 新增（M20 证据截图：确认后给 Finding 截一张页面图，进证据包）
 
 **做了什么**：新增 `proofhound/verify/screenshot.py`（first-party 浏览器代码，定位同

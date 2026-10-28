@@ -47,6 +47,9 @@ DEFAULT_TIMEOUT_MS = 15_000  # 单次导航超时
 DEFAULT_SETTLE_MS = 500  # 加载后驻留（等异步渲染落定）
 DEFAULT_VIEWPORT = (1280, 800)
 
+#: ``capture(session=...)`` 的"未传"哨兵：与显式 ``None``（匿名）区分开。
+_SESSION_UNSET = object()
+
 #: 单张截图体积上限（8 MiB）：超出即记 error 不落盘——证据目录不该被一张
 #: 无限高的整页截图撑爆（``full_page=True`` 时尤其容易）。
 MAX_BYTES = 8 * 1024 * 1024
@@ -168,8 +171,12 @@ class ScreenshotCapturer:
 
     # ---- 单次截图 ----
 
-    def capture(self, url: str, *, name: str) -> ScreenshotResult:
+    def capture(self, url: str, *, name: str, session=_SESSION_UNSET) -> ScreenshotResult:
         """加载 ``url`` 并截图，PNG 写到 ``<evidence_dir>/<name>.png``。
+
+        ``session`` 可按次覆盖（M20-b 覆盖截图用）：传 ``None`` = **匿名**
+        （不带任何凭据），传第二身份会话 = 以 reference 视角取证；不传则用
+        构造时的主会话。
 
         失败语义：**任何**异常/超时只置 ``error`` 字段，不抛出（编排层据此
         记 ``screenshot_skipped``，已确认的 Finding 不受影响）。
@@ -197,7 +204,11 @@ class ScreenshotCapturer:
                 route.abort()
 
         try:
-            apply_session(context, self._session, url)
+            apply_session(
+                context,
+                self._session if session is _SESSION_UNSET else session,
+                url,
+            )
             page = context.new_page()
             page.set_viewport_size(
                 {"width": self._viewport[0], "height": self._viewport[1]}
