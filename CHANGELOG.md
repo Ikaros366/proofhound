@@ -6,6 +6,43 @@
 
 ## [未发布]
 
+### 新增（M24-a 从爬行产出的 JS 找接口 → 未授权确认，手工 CLI）
+
+**做了什么**：把维护者的手工手法（找 JS → 摘路径 → 拼 URL → 逐个试匿名能不能拿到
+数据）固化成 `python -m proofhound.jsimport`。输入只要一次正常 engagement 的爬行产物，
+不需要抓包。**不注册 vuln_type、不动 `VULN_REGISTRY` / `GATE_MATRIX` /
+`_verify_unauth` / 状态机 / 证据门，零新依赖，零 LLM**。
+
+- **`proofhound/jsimport/crawl.py`**：katana JSONL → `CrawlRecord` / `JsDocument`。
+  坏行、结构缺项、非 GET **分别计数**（不合并成"跳过 N 行"）；JS **按正文 sha256
+  去重**（全部 URL 保留）；文件数与单文件字节两道上限显式记 capped / oversized；
+  `CrawlSource` 协议为 M24-c 的 Burp 包留口；
+- **`jsimport/extract.py`**：第一方正则抽取——`${}` 与 `:id` 归一 `{param}`、
+  `\/` 与 `\u002f` 还原、`"/api/" + x` 判为**前缀片段丢弃**、`baseURL` 常量参与
+  `urljoin`、跨域直接丢、**锚点 = JS sha256 + 字节偏移**（minified 文件行号恒为 1）；
+- **`jsimport/match.py`**：候选过滤（公开接口 / 状态变更词表 / 数据接口线索）+
+  A/B/C 分级 + URL 合成 + **同一 URL 折叠**；
+- **`jsimport/probe.py`**：**会话自检** → 认证基线 → 匿名对照 → `judge_unauth` →
+  证据落盘；A 类基线异常记 `blocked`、**B 类记清单**（"参数不对"绝不能被写成
+  "要登录"）；
+- **`jsimport/__main__.py`**：退出码 0/1/2 = 有 confirmed / 无 confirmed /
+  结构性失败（入口错误·无会话·会话失效·scope 全拒）。
+
+**证据**：`crawl.jsonl` / `js/<sha8>.js`（目录 0700、文件 0600）/ `endpoints.jsonl` /
+`probe/<id>.json` / `inventory.jsonl` / `summary.json` / `summary.md` / `audit.jsonl`。
+**响应正文不落盘**（只落状态码 / sha256 / 相似度）⇒ Cookie 不会被顺手写进证据；
+`summary.json` 不含时间戳与输出路径 ⇒ 连跑两次逐字节一致。
+
+**测试**：新增 `tests/test_jsimport_{crawl,extract,match,probe,cli}.py` **84** 个 +
+golden fixture `tests/fixtures/katana_js_spa_1_7.jsonl`（前三条是 M16-a 实测产物的
+逐字拷贝，其余是补造的边界形态）；全量 **1560 passed / 2 skipped / 1 xfailed**；
+**旧测试零改动**。**实弹** `scripts/demo_js_endpoints.py` **12/12 全绿**：真 katana
+1.7.0 对本机 SPA 跑 `-jsonl -jc`，五形态各归其位（1 confirmed / 1 rejected /
+1 blocked / 清单 2），靶侧日志逐条核对匿名请求零 Cookie，无会话退出码 2 且零 confirmed。
+
+**未做**：注册进 `VULN_REGISTRY`、把 `js-endpoint` 接成 `unauth-exposure` 的生产者
+（M24-b）、Burp 包输入源（M24-c）。边界见 AGENTS.md 限制 73。
+
 ### 修复（M22-b 补：SSTI 确认截图与复现步骤 URL）
 
 - **确认截图没传 payload URL**：`_verify_ssti` 收尾未传 `screenshot_url`，截图落在

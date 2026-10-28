@@ -40,7 +40,7 @@
 |---|---|---|
 | 漏洞类型覆盖 | 少而精：**7 类可确认漏洞**（SQL 注入 / XSS / IDOR / SSRF / 未授权暴露 / 命令注入 / SSTI）+ **第 8 类服务器报错信息泄露用畸形请求差分确认**（M23）+ **1 个手工探测**（登录重放，M21-a）；只做能行为确认的 | 数千条特征签名，广而浅 |
 | 输出语义 | Confirmed 即铁证：行为验证 + 证据链 + Verifier 终审 + CVSS 代码算分 | Potential 待人工，误报率自担 |
-| 发现面 | Web 应用层（katana 爬行带参端点 + POST 表单页 + **JS 文件内端点**，M16-a） | 主机/端口/服务/全协议 |
+| 发现面 | Web 应用层（katana 爬行带参端点 + POST 表单页 + **JS 文件内端点**，M16-a）+ **JS 接口清单与未授权确认**（M24-a，手工 CLI，手工探测） | 主机/端口/服务/全协议 |
 | 误报治理 | 多道闸：triage 启发式宁漏勿滥 → 行为验证 → 证据门 → Verifier 对抗校验 | 主要靠特征精度 |
 
 覆盖广度沿路线图渐进扩展，但纪律不变：**新漏洞类型必须先过"能否行为确认"这一关**——不能行为确认的宁可不做，绝不为凑覆盖率引入"疑似即确认"的降级路径。
@@ -372,6 +372,50 @@ PROOFHOUND_SCREENSHOT=1 .venv/bin/python -m proofhound.api --workspace . --port 
   演示里的 generic 靶带版本头仍判 rejected；
 - **边界**：只探 HTTP 层、不发送任何凭据、TLS 校验证书（自签名靶 blocked）、
   实弹靶是形态仿真（罐头堆栈，非真 Tomcat/PHP）。
+
+## 从爬行产出的 JS 找接口 → 未授权确认（M24-a）
+
+前端把接口路径写死在 JS 里，其中一部分**不带凭据也能拿到数据**。这条链路把
+「页面引用的 JS → 里面的接口路径 → 逐个试 → 匿名能不能拿到同样的数据」做成一个
+**手工 CLI**——输入只要一次正常 engagement 的爬行产物，**不需要抓包**：
+
+```bash
+.venv/bin/python scripts/demo_js_endpoints.py          # 实弹：真 katana + 本地 SPA，五形态
+python -m proofhound.jsimport \
+  --katana-jsonl evidence/<eng>/katana.stdout.log \
+  --scope scopes/lab.yaml --out evidence/jsimport/<ts> \
+  [--param-seed 1] [--fetch-missing] [--max-js 50] [--max-probes 100]
+```
+
+判定口径与 `unauth-exposure` **同一把尺子**：同一 URL，**匿名客户端响应 ≡ 已认证
+客户端响应**（逐字节相同或相似度 ≥ 0.9）才是 confirmed；"这个接口本该要登录"仍然
+只进报告分类，**不进判定链**。
+
+| 结论 | 判据 |
+|---|---|
+| `confirmed` | 匿名 2xx 且与已认证视图等价（证据含两份响应的 sha256 与相似度） |
+| `rejected` | 匿名被拒（401/403/3xx…）→ 资源本就要求认证 |
+| `blocked` | 判不了：匿名 2xx 但视图不同、请求失败、会话自检/基线异常 |
+| 清单 | **不探测**：无会话、会话失效、公开接口（`/config`…）、合成基线非 2xx、同 URL 已覆盖、预算越界 |
+
+- **必须自己从 JS 正文抽**：katana `-jc` 的抽取是**部分的**（限制 53；实弹复现——
+  同一份 JS 里 `/api/profile` 抽到了、`/api/orders/1001` 没抽到）⇒ 本工具从
+  `response.body` 自己抽，锚点是 **JS sha256 + 字节偏移**（minified 文件的字节偏移
+  才是有效锚点，行号恒为 1）；
+- **A 类用观测实例原样重放**（参数不猜）；**B 类才合成**，且必须先过"认证基线 2xx"
+  这道门——否则"参数不对"会被误读成"要登录"；
+- **同一 URL 只探一次**：`/api/orders/1001` 与 `/api/orders/{id}` 指向同一地址时，
+  后者折叠进清单，而不是被确认两次；
+- **安全边界**：只发 GET、不发请求体、状态变更词表（logout/delete/update/…）在匹配
+  层就挡掉、匿名对照零凭据、不跟随重定向、每个 URL 前过 `check_scope`；
+- **证据不含响应正文**：`probe/*.json` 只落状态码 / sha256 / 相似度，Cookie 不会被
+  顺带写进证据；JS 原件按 0600 落盘且不进报告；`summary.json` 无时间戳 ⇒ 可逐字节复现；
+- **退出码**：0 = 至少 1 条 confirmed；1 = 无 confirmed；2 = 入口错误 / 无会话 /
+  会话失效 / scope 全拒（**结构性失败，不是"测过且安全"**）。
+
+边界（与 AGENTS.md 限制 73 同源）：只覆盖 **GET + 同源**的接口；跨域 API（SPA 调
+`api.example.com`）一律丢；正则抽取不懂运行时拼接与 webpack chunk map；POST/JSON body
+型接口不在本单范围；结果**不注册为 Finding**（报告侧接入是 M24-b）。
 
 ## 登录重放暴破探测（M21-a）
 
