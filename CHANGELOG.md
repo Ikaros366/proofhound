@@ -6,6 +6,22 @@
 
 ## [未发布]
 
+（暂无）
+
+## [0.5.0] - 2026-10-28
+
+M19-a / M19-b / M19-c / M19-d / M20 / M20-b / M20-b 修补。
+
+> **发布说明**：本版新增**证据截图能力**——确认后补证（进
+> `verification.evidence_refs`）与按漏洞类型的**覆盖取证**（只进
+> `Finding.coverage_refs`，证明「测过」而非「有洞」），两者均 opt-in
+> （`PROOFHOUND_SCREENSHOT=1`），且**不改变任何判定**：证据门、状态机铁律、
+> Verifier 输入边界一字未改。同期把 dirsearch 接进生产链路（opt-in，需 scope
+> 显式声明 `request_budget`），并修掉命令注入 DNS 防线的两处真实缺陷
+> （变体从未投递给靶 / 探针路径缺 `/c/` 前缀）。版本号四处同步：
+> `pyproject.toml`、`proofhound/__init__.py`、`api/server.py`、`/api/health`
+> 的测试锁定。
+
 ### 变更（M20-b 修补：xss 覆盖探针改为可见标记）
 
 原探针 `<script>window.__ph_shot=1</script>` 只改 JS 变量、**不改变渲染** ⇒ 截图上与

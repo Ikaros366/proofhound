@@ -321,7 +321,7 @@ PROOFHOUND_SCREENSHOT=1 .venv/bin/python -m proofhound.api --workspace . --port 
 
 ## 路线图与已知限制
 
-> **状态**：本地工作树干净，`HEAD` 与 `origin/master` 同到 `c8a0176`（`v0.4.0` 已打标签）。后续改动是否发布、是否打新标签由维护者裁决。
+> **状态**：`HEAD` 与 `origin/master` 同步（`v0.5.0` 已打标签）。后续改动是否发布、是否打新标签由维护者裁决。
 
 已完成：M1 工具底座（manifest/安装器/沙箱/scope/审计）→ M2 编排器 + 模型路由预算 → M3 Finding 生命周期 +
 证据门 + Verifier + verify-sqli + katana 发现自动化 → M4 报告引擎 + 模板适配 → M5 Web API + 自主模式闸门 + 本地控制台 →
