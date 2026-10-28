@@ -134,6 +134,12 @@ VULN_LANDINGS: dict[str, VulnLanding] = {
         # 候选来源在 M18-b 接上；M18-a 先落判定通道。
         "param-endpoint（_CMDI_PARAM_HINTS 命中）+ 模型通道",
     ),
+    "ssti": _landing(
+        "ssti",
+        # M22 裁定：规则表 `_SSTI_PARAM_HINTS`（16 键）+ 模型白名单**两条路都产**。
+        # 判定通道由 M22-b 落地（M22-a 为恒记 verify_blocked 的 fail-closed 桩）。
+        "param-endpoint（_SSTI_PARAM_HINTS 命中）+ 模型通道",
+    ),
 }
 
 

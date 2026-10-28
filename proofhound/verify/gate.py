@@ -44,6 +44,10 @@ from dataclasses import dataclass, field
 from proofhound.findings.finding import Finding
 from proofhound.verify.cmdi import CMDI_CONFIRMED_METHOD
 from proofhound.verify.ssrf import SSRF_CONFIRMED_METHOD
+from proofhound.verify.ssti import (
+    SSTI_CONFIRMED_METHOD,
+    SSTI_EVALUATION_EVIDENCE_KIND,
+)
 from proofhound.verify.unauth_control import (
     UNAUTH_CONFIRMED_METHOD,
     UNAUTH_EQUIVALENCE_EVIDENCE_KIND,
@@ -180,6 +184,22 @@ VULN_REGISTRY: dict[str, VulnSpec] = {
         # （对比 ssrf/unauth-exposure 需要会话做 baseline/等价性对照）。
         requires_session=False,
         note="M18：带外回调确认；不做时间盲注/回显型/反弹 shell/读文件",
+    ),
+    "ssti": VulnSpec(
+        vuln_type="ssti",
+        # M22：唯一认可确认手段 = **两个不同乘积都被模板引擎算了出来**
+        # （差分求值，可复现的二值事实）。页面里的模板语法回显、报错文本、
+        # 状态码一律不是证据——那只能说明「参数被看见了」，不能说明「被求值了」。
+        methods=frozenset({SSTI_CONFIRMED_METHOD}),
+        # 具名证据标签（同 unauth-exposure 的 `unauth-response-equivalence`
+        # 先例）：让「这条 Confirmed 靠的是模板求值产物」在证据层可分辨。
+        behavioral_kinds=frozenset({SSTI_EVALUATION_EVIDENCE_KIND}),
+        verify_skill="verify-ssti",
+        # 规则表 `_SSTI_PARAM_HINTS` + 模型通道两条路都产候选。
+        in_model_whitelist=True,
+        # **不需要预置会话**：判据是「服务端把参数当模板求值」，与身份无关。
+        requires_session=False,
+        note="M22：差分求值（两个不同乘积 + 基线/畸形对照）；不做盲注与模板指纹",
     ),
 }
 

@@ -6,7 +6,63 @@
 
 ## [未发布]
 
-（暂无）
+### 新增（M22-a 第 7 类漏洞的候选通道：SSTI 两步走·第一步）
+
+**做了什么**：按交接单裁定，把 **SSTI（模板注入）** 作为第 7 类可确认漏洞的**候选面**
+放开，先测发现质量、再建判定器（与 M15/M16 的 SSRF 两步走同一纪律）。九处落点：
+
+- `proofhound/verify/ssti.py`：先落两个常量 —— `SSTI_CONFIRMED_METHOD =
+  "template-eval-confirmed"` 与**具名**证据标签 `SSTI_EVALUATION_EVIDENCE_KIND =
+  "template-evaluation"`（不上笼统的 `behavioral`，让「这条 Confirmed 靠模板求值产物」
+  在证据层可分辨；同 `unauth-exposure` 先例）。登记表在登记时就要求这两个名字存在，
+  故常量必须先于登记（求值的纯函数由 M22-b 补）。
+- `verify/gate.py::VULN_REGISTRY` 加 `ssti`：三处派生视图（`GATE_MATRIX` / 模型白名单 /
+  `_VERIFY_PRECONDITIONS`）自动生效，`requires_session=False`（判据与身份无关）。
+- `skills/verify-ssti/SKILL.md`（L2、`mutating: false`、`required_tools: []`）+
+  `skills/profiles.py` 登记。
+- `core/orchestrator.py`：`_SSTI_PARAM_HINTS`（16 键：模板/布局/主题/语言/渲染/格式/
+  邮件主题/问候语/签名档…；与其余四张提示表**交集为 0**）+ `_TRIAGE_SSTI_CAP = 10`
+  + 登记进 `_PARAM_HINT_TABLES` / `_TRIAGE_CAPS` + `_verify_handlers` 挂 `verify-ssti`。
+- **`_verify_ssti` 是 fail-closed 桩**：恒记 `verify_blocked` 并返回 blocked，
+  **不确认也不驳回** —— 判定器还没建，「还没测」不得写成「测过且安全」（同限制 44）。
+- `api/runner.py::OrchestratorPhases` 第 7 槽位 `verify_ssti_skill`（限制 59 的教训：
+  不加就是死代码）。
+- `llm/triage.py` **prompt 正文**同步：「这四个」→「这五个」+ ssti 线索 + 反例
+  （只回显 / 存库 / 写日志都不算，系统会用两个乘法表达式去核实）。
+- `verify/coverage.py::COVERAGE_SHOTS` 加 ssti 镜头：`baseline` + `probe`
+  （`{{191*191}}`）——被求值时图上直接是 **36481**，回显型则原样看到 `{{191*191}}`。
+
+**基准扩到 28 端点**：新增 **F 族 5 条真 SSTI**（**真 jinja2 求值**，不是正则仿真：
+`/f/render` `template`、`/f/mail` `tpl`、`/f/layout` `layout` 表内 + `/f/page` `body`、
+`/f/card` `snippet` 表外）与 **1 条形对照** `/f/theme-preview`（参数名 `theme` 在表内、
+取值确实进页面，但**只回显不求值**）。旧 22 端点**一条没动**。
+
+**实测（真实 T1 `deepseek-flash`，3 次独立运行）**：
+
+- `rules` **31.8%（7/22）** / 误报 50.0%（3/6）；`model` **86.4%~95.5%**；`rules+model`
+  **90.9%~95.5%**；
+- **SSTI 专项**：表内 **3/3 全中**（三臂三跑、规则臂 σ=0）；表外 **0~2/2**（模型臂
+  `[1,0,2]`，区间重叠 ⇒ 模型增益**不可判**）；**形对照 3/3 跑都产出候选**（候选级
+  必然误报 —— 这正是第二步要确定性驳回的形态）；
+- **旧族逐格不变**：规则臂对旧 22 端点的漏报集合（13 条）与误报集合（`/d/safe`、
+  `/d/safe3`）与 2026-09-29 四跑基线**逐格相同**；模型臂差异落在已知方差内（限制 47）。
+
+**测试**：全量 **1387 passed / 2 skipped**（基线 1373 + 新增 14）。**披露的旧测试改动
+4 处**（断言意图均不变，先例见 M15/M16-c/M18-a）：`tests/test_vuln_registry.py` 落点
+清单加 ssti 行；`tests/test_ssrf.py` handler 集合断言加第 7 项；`tests/test_llm_triage.py`
+白名单逐字锁定加 ssti；`tests/test_bench_fixture.py` 计数 22→28（并新增 F 族两条行为
+断言：真求值两个乘积、形对照只回显不求值）。
+
+**实现期自查抓出并修掉两处缺陷（诚实记录）**：① F 族路径原名 `/f/ssti*`，而 URL path
+会进模型 triage 的 prompt ⇒ **等于把答案写在题目里**，模型臂发现率会虚高；已改为中性
+功能名。② `greeting` / `signature` 原被标为「表外（关键词盲区）」，但它们**就在**
+`_SSTI_PARAM_HINTS` 里 ⇒ 规则臂也能命中，A/B 对照的分母失真；已改为真正不在任何提示表
+里的 `body` / `snippet`。
+
+**未做（如实记录）**：判定通道（M22-b：`match_products` / `judge` / `summary_for_verifier`
++ `_verify_ssti` 真实现 + `demo_ssti.py` 三态实弹）；`--live` 重跑 Confirmed 级基线
+（历史表仍是 22 端点口径）；`${ }` / `<%= %>` 两族语法**未在真靶上验证**（本机无
+Java/Ruby 引擎，见 AGENTS.md 限制 70）。
 
 ## [0.5.0] - 2026-10-28
 

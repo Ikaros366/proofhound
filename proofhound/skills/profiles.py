@@ -85,6 +85,15 @@ SKILL_PROFILES: dict[str, SkillProfile] = {
             "另用 DNS 非命中变体排除第三方代抓取"
         ),
     ),
+    "verify-ssti": SkillProfile(
+        risk_level="L2",
+        mutating=False,
+        note=(
+            "只读验证：探针全是只读 GET（固定乘法表达式 + 一条畸形模板对照），"
+            "只改 query 取值，不写目标状态、不读文件、不产可用 RCE 载荷；"
+            "确认靠「两个不同乘积都被算出来 + 基线干净 + 畸形对照不成立」（差分求值）"
+        ),
+    ),
     "verify-unauth": SkillProfile(
         risk_level="L2",
         mutating=False,

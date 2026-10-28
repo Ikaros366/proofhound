@@ -260,6 +260,28 @@ _CMDI_PARAM_HINTS = frozenset(
 # 不设限会给贵验证档与目标同时灌水。
 _TRIAGE_CMDI_CAP = 10
 
+# M22：param-endpoint → ssti 假设的参数键启发式（保守小表，宁漏勿滥）。
+#
+# 表内容是「**文本进模板**」的强语义键：模板/布局/主题/语言/渲染/格式/邮件主题/
+# 问候语/签名档 —— 这类参数最可能被直接拼进模板源码（SSTI 的真实成因）。
+# 刻意**不收** id/page/name/msg 这类泛化键（那会让几乎每个端点都产 ssti 候选，
+# 而每条候选在 verify 阶段最多要发 8 次只读 GET）。
+#
+# 与 sqli/xss/idor/cmdi 四张表的**交集为 0**（刻意）：交集会让同一参数同产两条
+# 候选、各消耗一次 L2 确认，而 ssti 的判据（模板求值）与那四类互不重叠。
+_SSTI_PARAM_HINTS = frozenset(
+    {
+        "template", "tpl", "tmpl", "layout", "theme", "lang", "locale",
+        "render", "format", "fmt", "greeting", "subject", "email", "preview",
+        "signature", "content",
+    }
+)
+
+# M22：每 engagement 新建 ssti Hypothesis 上限（独立计数、独立 triage_capped）。
+# 独立上限是硬要求：每条 ssti 候选在 verify 阶段最多发 8 次只读 GET（基线 +
+# 逐语法两个操作数 + 畸形对照），不设限会给目标与贵验证档同时灌水。
+_TRIAGE_SSTI_CAP = 10
+
 # M17-b：每 engagement 新建 unauth-exposure Hypothesis 上限（独立计数、独立
 # triage_capped 事件）。**必须**有独立上限：`web-exposure` 是全池唯一**没有**
 # 上限的类型（其余各有），而新生产者的候选量与 web-probe 信号数同阶，
@@ -301,6 +323,7 @@ _TRIAGE_CAPS: dict[str, int] = {
     "ssrf": _TRIAGE_SSRF_CAP,  # M19-b
     "unauth-exposure": _TRIAGE_UNAUTH_CAP,
     "cmdi": _TRIAGE_CMDI_CAP,  # M18-b
+    "ssti": _TRIAGE_SSTI_CAP,  # M22-a
 }
 
 # M9c②：**贵验证档**上限。启用廉价粗筛（``verify_prefilter``）时，cap 从
@@ -322,7 +345,7 @@ _SQLI_PATH_HINTS = frozenset({"sqli", "sql", "login", "signin", "search"})
 
 #: param-endpoint → 各漏洞类型的**参数键提示表**（M19-a：规则表入口的单一真相源）。
 #:
-#: 顺序即候选生成顺序（sqli → xss → idor → cmdi），与拆分前的
+#: 顺序即候选生成顺序（sqli → xss → idor → cmdi → ssti），与拆分前的
 #: 「sqli 列表推导 + 三个 extend」逐条等价。
 #:
 #: **新增提示表必须登记在此**：`tests/test_vuln_registry.py` 的断言
@@ -336,6 +359,7 @@ _PARAM_HINT_TABLES: dict[str, tuple[frozenset[str], str]] = {
     "xss": (_XSS_PARAM_HINTS, "medium"),
     "idor": (_IDOR_PARAM_HINTS, "medium"),
     "cmdi": (_CMDI_PARAM_HINTS, "critical"),
+    "ssti": (_SSTI_PARAM_HINTS, "critical"),
 }
 
 
@@ -453,7 +477,7 @@ def _triage_candidates(
     if signal.kind == "param-endpoint":
         keys = _query_param_keys(signal.asset)
         candidates: list[_TriageCandidate] = []
-        # M19-a：四类参数键提示表由 `_PARAM_HINT_TABLES` **派生**（登记顺序即
+        # M19-a：五类参数键提示表由 `_PARAM_HINT_TABLES` **派生**（M22-a 起含 ssti；登记顺序即
         # 生成顺序，与拆分前的「sqli 列表推导 + 三个 extend」逐条等价）。
         # 表间交集参数会同产多条候选（`id` 既可能注入也可能越权、`query` 既可能
         # 进 SQL 也可能进 shell），dedup 按 vuln_type 分量区分，各自经独立
@@ -1006,6 +1030,9 @@ class Orchestrator:
             # listener 才算；响应回显/状态码/耗时一律不是证据，另用 DNS
             # 非命中变体排除第三方代抓取
             "verify-cmdi": (frozenset({"cmdi"}), self._verify_cmdi),
+            # M22：模板注入（唯一确认门径）——**同一语法下两个不同乘积都被
+            # 算了出来**才算；模板语法回显/报错文本/状态码一律不是证据
+            "verify-ssti": (frozenset({"ssti"}), self._verify_ssti),
         }
 
     def verify_skill_coverage(self, skill_name: str = "verify-sqli") -> frozenset[str]:
@@ -2812,6 +2839,32 @@ class Orchestrator:
             judgment, callback_host_port=f"{bound_host}:{bound_port}"
         )
         return self._gate_and_review(finding, skill, store, summary=summary)
+
+    def _verify_ssti(self, finding: Finding, skill, store: FindingStore) -> str:
+        """verify-ssti SOP（skills/verify-ssti/SKILL.md）的确定性执行（M22）。
+
+        **M22-a 第一步：fail-closed 桩**。候选通道（规则表 ``_SSTI_PARAM_HINTS`` +
+        模型白名单）已放开，判定通道由 M22-b 落地 —— 在那之前本 handler
+        **恒记 `verify_blocked`、绝不确认、也绝不驳回**：
+
+        - 不确认：没有差分求值的二值事实，就没有证据能过证据门；
+        - 不驳回：判定器还没建，任何「看起来干净」都不构成真阴性 —— 把「还没测」
+          记成「测过且安全」是本仓库最不能接受的形态（与限制 44 同源：故障与
+          覆盖不全必须与「安全」可分辨）。
+
+        故候选只会停在 Hypothesis，``evidence_kinds`` 也不会被污染
+        （``template-evaluation`` 标签不由桩添加）。M22-b 换成真实现时，
+        本 docstring 与这段桩一并替换。
+        """
+        self.audit.record(
+            "verify_blocked",
+            finding_id=finding.id,
+            reason=(
+                "ssti 判定通道未交付（M22-a 第一步只放开候选，差分求值判定器由 "
+                "M22-b 落地）：fail-closed 记 blocked，不驳回"
+            ),
+        )
+        return "blocked"
 
     def _get_unauth_judge(self):
         """懒建敏感度判定器（测试经 ``unauth_judge_factory`` 注入替身）。

@@ -637,6 +637,7 @@ class OrchestratorPhases:
         verify_ssrf_skill: str = "verify-ssrf",
         verify_unauth_skill: str = "verify-unauth",
         verify_cmdi_skill: str = "verify-cmdi",
+        verify_ssti_skill: str = "verify-ssti",
     ):
         self._orch = orchestrator
         self.scan_skill = scan_skill
@@ -802,6 +803,25 @@ class OrchestratorPhases:
                 (
                     verify_cmdi_skill,
                     _builtin_risk_level(verify_cmdi_skill, cmdi.manifest.risk_level),
+                )
+            )
+        # M22：第七 verify skill 槽位（模板注入差分求值验证是增强项，缺失不阻塞
+        # 主链路）。与其余六个槽位同纪律：未注册/未启用记 verify_skill_skipped。
+        # ⚠️ 限制 59 的教训（M16-c 漏槽位 ⇒ 功能在生产栈里永不触发）：加类型
+        # 时**必须**同时补槽位，守护测试会盯着这一处。
+        ssti = registry.get(verify_ssti_skill)
+        if ssti is None or not ssti.enabled:
+            reason = "skill 未注册" if ssti is None else "skill 未启用"
+            orchestrator.audit.record(
+                "verify_skill_skipped",
+                skill=verify_ssti_skill,
+                reason=f"{reason}，跳过模板注入验证",
+            )
+        else:
+            self.verify_skills.append(
+                (
+                    verify_ssti_skill,
+                    _builtin_risk_level(verify_ssti_skill, ssti.manifest.risk_level),
                 )
             )
 

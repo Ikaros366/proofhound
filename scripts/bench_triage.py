@@ -64,6 +64,34 @@ D 族换成**真安全**（含 `/d/safe4` 的真授权校验、`/d/safe2` 去掉
 提供**的形态：既有真实出网语义（服务端代取），又保证基准零外部依赖、可离线
 复现。抓取超时 1.5s——离线基准每族只抓一次，测试套件里也不至于把门拖慢。
 
+## M22 Step 1：SSTI 候选族（F 族）+ SSTI 形对照
+
+与 M15 同一套两段式：第一步**只放开候选**（`VULN_REGISTRY` 登记 `ssti` 使模型
+白名单自动纳入 + 规则表 `_SSTI_PARAM_HINTS`），判定通道由 M22-b 落地（M22-a 期间
+`_verify_ssti` 是恒记 `verify_blocked` 的 fail-closed 桩）。
+
+端点族形态：
+
+- **F 族（真 SSTI）**：服务端把取值**拼进页面源码后真求值**（jinja2，项目既有
+  依赖）。`render`/`mail`/`layout` 三条**参数名在 `_SSTI_PARAM_HINTS` 内**
+  （规则表锚点，`template`/`tpl`/`layout`）；`page`/`card` 两条**参数名在表外**
+  （关键词盲区 `body`/`snippet`，第一步要测的正这里）。
+- **`/f/theme-preview`（形对照）**：参数名（`theme`）在提示表内、取值也确实进了
+  页面，但服务端**只回显、不求值**——`{{191*191}}` 原样出现在正文里而 36481 不
+  出现。判据必须把它判 `rejected`：「看到 `{{ }}` 就确认」是最典型的 SSTI 假阳性。
+
+> **路径名刻意不含 `ssti` 字样**：URL path 会进模型 prompt 的允许输入，
+> 路径里写 `ssti` 等于把答案写在题目里、让模型臂的发现率虚高。故 F 族用中性的
+> 功能名（render / mail / layout / page / card / theme-preview）。
+
+**为什么用真引擎而不是自己写正则**：被测判据是「两个不同乘积都被算出来」。自制的
+伪引擎会让基准比真实世界**容易**（真引擎还要处理过滤器、语句块、undefined 语义、
+语法错误的报错形态）。故 F 族用真 jinja2——它本就是项目依赖（docxtpl 的传递依赖），
+不新增任何依赖。
+
+**已知边界（诚实记录）**：本机没有 Java/Ruby 引擎，故 F 族只覆盖 `{{ }}` 一族语法；
+`${ }` / `<%= %>` 两族由 `verify/ssti.py` 的纯函数单测覆盖，**未在真靶上跑过**。
+
 用法：
     .venv/bin/python scripts/bench_triage.py            # 离线确定性：三臂消融
     .venv/bin/python scripts/bench_triage.py --model    # rules+model 臂接真实 T1 档
@@ -92,6 +120,8 @@ from datetime import datetime, timezone
 from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+import jinja2  # F 族（M22）的真模板引擎；项目既有依赖（docxtpl 的传递依赖）
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -189,6 +219,22 @@ ENDPOINTS: tuple[Endpoint, ...] = (
     Endpoint(
         "/d/ssrf-like", "callback", None,
         note="对照：参数名像 SSRF 但服务端不发起请求（只登记）",
+    ),
+    # ---- F 族：真 SSTI（M22）+ SSTI 形对照 ----
+    #: 服务端把取值**拼进页面源码后真求值**（jinja2）。前三条参数名在
+    #: ``_SSTI_PARAM_HINTS`` 内（规则表锚点），后两条在表外（关键词盲区）——
+    #: 「发现率差异只可能来自参数名在不在提示表里」这条基准纪律在 SSTI 族上
+    #: 同样成立。
+    #:
+    #: **路径名刻意不含 `ssti`**：URL path 进模型 prompt，写 `ssti` 等于送答案。
+    Endpoint("/f/render", "template", "ssti", note="表内（ssti 表）模板渲染"),
+    Endpoint("/f/mail", "tpl", "ssti", note="表内（ssti 表）邮件模板"),
+    Endpoint("/f/layout", "layout", "ssti", note="表内（ssti 表）页面布局"),
+    Endpoint("/f/page", "body", "ssti", note="表外（SSTI 盲区）"),
+    Endpoint("/f/card", "snippet", "ssti", note="表外（SSTI 盲区）"),
+    Endpoint(
+        "/f/theme-preview", "theme", None,
+        note="对照：参数名像模板但服务端只回显、不求值",
     ),
 )
 
@@ -327,6 +373,51 @@ def _visit_target(value: str, label: str, param: str) -> tuple[int, str]:
             f"正文 {len(body)} 字节（节选：{sample}）"
         )
     return 200, _page(label, result)
+
+
+#: F 族（M22）的模板引擎。**真引擎，不是正则仿真**：被测判据是「两个不同乘积都被
+#: 算出来」，自制伪引擎会让基准比真实世界容易（真引擎还要处理过滤器、语句块、
+#: undefined 语义与语法错误的报错形态）。jinja2 是项目既有依赖（docxtpl 的传递
+#: 依赖，requirements.txt 已钉版本），基准因此**不新增依赖**。
+_JINJA_ENV = jinja2.Environment(autoescape=False)
+
+
+def _template_page(value: str, label: str, param: str) -> tuple[int, str]:
+    """F 族真 SSTI：把取值**拼进页面源码后真求值**（jinja2）。
+
+    ## 为什么是"拼进整页再求值"
+
+    真实的 SSTI 成因就是「页面源码由用户输入拼成，然后整份交给模板引擎」。故这里
+    先用 :func:`_page` 拼出整份 HTML（``label`` 与 footer 的端点标记在**求值前**
+    就已写入），再 ``from_string(...).render()``。这样每个端点的正文天然逐字节
+    唯一（katana 会把正文重复的 URL 当重复响应丢弃，见 :func:`_sqlite_rows` 注记）。
+
+    ## 语法错误为什么不返回 5xx
+
+    畸形对照（如 ``{{191*191}``）会让 jinja2 抛 ``TemplateSyntaxError``。此处的
+    处理是 **200 + 错误文案**，理由有两条：① 基准不变式要求端点恒 200（否则爬行
+    状态码会随探针取值漂移）；② 真实应用的"模板报错页"也常是 200。关键是错误文案
+    里**不含乘积**——那正是畸形对照要证明的事。
+    """
+    source = _page(label, f"{param}={value}")
+    try:
+        rendered = _JINJA_ENV.from_string(source).render()
+    except Exception as exc:  # noqa: BLE001 —— 任何模板错误都只意味着"没算出来"
+        return 200, _page(
+            f"{label} · 模板错误",
+            f"{param}={value} 渲染失败：{type(exc).__name__}",
+        )
+    return 200, rendered
+
+
+def _echo_page(value: str, label: str, param: str) -> tuple[int, str]:
+    """F 族形对照：取值被**原样回显**进页面，但**不被当模板求值**。
+
+    这就是「看着像 SSTI 但不是」的真实形态（转义/事后拼接/纯反射）：``{{191*191}}``
+    确实出现在正文里（参数进了页面），但 ``36481`` 不出现。判据必须判它
+    ``rejected``——「看到 ``{{ }}`` 就确认」是最典型的 SSTI 假阳性。
+    """
+    return 200, _page(label, f"{param}={value}")
 
 
 def _page(title: str, body: str, links: tuple[str, ...] = ()) -> str:
@@ -513,6 +604,26 @@ class _FixtureHandler(BaseHTTPRequestHandler):
                     "第三条：指标口径说明）。",
                 ),
             )
+            return
+
+        # ---- F 族（M22）：取值**拼进页面源码后真求值**（真 SSTI 语义） ----
+        # 与 E 族同一纪律：行为由 path 决定、参数名完全不参与行为分支。
+        # 路径名刻意不含 `ssti`（URL path 会进模型 prompt，等于送答案）。
+        if path in ("/f/render", "/f/mail", "/f/layout", "/f/page", "/f/card"):
+            key, label = {
+                "/f/render": ("template", "模板预览"),
+                "/f/mail": ("tpl", "邮件模板"),
+                "/f/layout": ("layout", "布局渲染"),
+                "/f/page": ("body", "正文渲染"),
+                "/f/card": ("snippet", "卡片片段"),
+            }[path]
+            self._respond(*_template_page(first(key), label, key))
+            return
+
+        if path == "/f/theme-preview":
+            # M22 形对照：参数名（theme）在提示表内、取值也确实进了页面，但
+            # **不被当模板求值**——只回显。判据必须把它判 rejected。
+            self._respond(*_echo_page(first("theme"), "主题预览", "theme"))
             return
 
         # ---- D 族：安全对照（**真安全**，但仍保留"诱出候选"的形态） ----

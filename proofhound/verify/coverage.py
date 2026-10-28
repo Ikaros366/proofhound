@@ -91,6 +91,13 @@ COVERAGE_SHOTS: dict[str, tuple[CoverageShot, ...]] = {
         CoverageShot("authenticated"),
     ),
     "cmdi": (CoverageShot("baseline"),),
+    # M22：探针用固定乘法表达式——被求值时图上直接是 **36481**，回显型则
+    # 原样看到 `{{191*191}}`，被转义则看到实体化文本；一张图就能分辨
+    # 「测过 + 算没算」。
+    "ssti": (
+        CoverageShot("baseline"),
+        CoverageShot("probe", param_value="{{191*191}}"),
+    ),
 }
 
 

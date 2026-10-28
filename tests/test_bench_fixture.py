@@ -34,6 +34,22 @@ SSRF 两步走的第一步只在基准上加**候选族**（`vuln_type` 白名�
    这个行为；若这里只是“看起来像”，第二步的确认数字会是假的。
 2. **不变式**：`/d/ssrf-like`（看着像 SSRF 但服务端不发起请求）必须与 D 族同款
    ——两个探测取值响应长度相同（粗筛只比长度），且**不回显取值**。
+
+## M22：F 族（真 SSTI）+ SSTI 形对照
+
+SSTI 两步走的第一步同样**只放开候选**（`VULN_REGISTRY` 登记 `ssti` ⇒ 模型白名单
+自动纳入 + 规则表 `_SSTI_PARAM_HINTS`），判定通道由 M22-b 落地。本文件补两类断言：
+
+1. **可确认性的前提——服务端真的把取值当模板求值**：F 族五个端点必须对
+   `{{191*191}}` / `{{191*192}}` 分别算出 **36481 / 36672**，且**畸形模板**
+   （少一个右括号）**不得**算出乘积。后者是差分判据的分水岭：若畸形对照也算得
+   出来，端点就属于"strip 掉非数字后照样算乘法"那一类，判据只能判 `blocked`。
+2. **形对照**：`/f/theme-preview` 回显 `{{191*191}}` 字面量但**不求值** —— 判据必须
+   判 `rejected`。「看到 `{{ }}` 就确认」是最典型的 SSTI 假阳性形态。
+
+F 族的路径名刻意**不含 `ssti`**：URL path 会进模型 triage 的 prompt（"URL path"
+是允许的输入），路径里写 `ssti` 等于把答案写在题目里，模型臂的发现率会虚高。
+两条"表外"样例的参数名（`body` / `snippet`）确实不在任何一张提示表里。
 """
 
 from __future__ import annotations
@@ -225,7 +241,7 @@ def test_identity_mapping(base):
 
 @pytest.mark.parametrize("url", _endpoint_urls())
 def test_every_endpoint_is_reachable(base, url):
-    """22 条端点全部可爬（200）——加族之后最容易踩的是新端点漏进 404。
+    """28 条端点全部可爬（200）——加族之后最容易踩的是新端点漏进 404。
 
     加这一条的理由：`test_no_two_endpoints_share_a_body` 是**带会话**取数，新端点若漏了路由会一起 404，而那条测试的失败信息会指向"正文重复"（404 页正文对多条端点相同），把根因误导成正文问题。这里用与爬行一致的视角（带会话）单独钉住可达性。
     """
@@ -322,7 +338,7 @@ def test_ssrf_like_control_never_issues_a_request(base):
 
 
 def test_no_two_endpoints_share_a_body(base):
-    """**硬性回归网**：全部 22 个端点的响应正文两两不同。
+    """**硬性回归网**：全部 28 个端点的响应正文两两不同。
 
     理由：katana 会把正文重复的 URL 当**重复响应丢弃**，端点因此根本进不了
     crawler。第一版升级把 A/B/C 三族统一到同一份正文，实测 16 个端点只剩 9 个
@@ -385,7 +401,7 @@ def test_prefilter_length_invariants_preserved(base, url, key, length_should_cha
 
 
 def test_crawl_signals_unchanged(base):
-    """确定性爬行的 Signal 语料：22 条、状态码全 200。
+    """确定性爬行的 Signal 语料：28 条、状态码全 200。
 
     端点表/首页链接/表单字段若被改动，这里会红——因为 triage 的输入变了，
     三臂消融就不再可比。
@@ -393,32 +409,40 @@ def test_crawl_signals_unchanged(base):
     M15 披露：计数 16 → 22、param-endpoint 14 → 20，是**加了 E 族（5 条真 SSRF）
     与 SSRF 形对照（1 条）**的必然结果，不是既有端点被动过——A/B/C/D 四族的
     16 条仍逐条在列（由 test_endpoint_table_shape_unchanged 的族分量断言钉死）。
+
+    M22 披露：计数 22 → 28、param-endpoint 20 → 26，是**加了 F 族（5 条真 SSTI）
+    与 SSTI 形对照（1 条）**的必然结果；E 族与既有各族的 Signal 一条没动。
     """
     signals, _ = bench.crawl(base)
-    assert len(signals) == 22
+    assert len(signals) == 28
     assert {s.status_code for s in signals} == {200}
     kinds: dict[str, int] = {}
     for signal in signals:
         kinds[signal.kind] = kinds.get(signal.kind, 0) + 1
-    assert kinds == {"param-endpoint": 20, "form_page": 2}
+    assert kinds == {"param-endpoint": 26, "form_page": 2}
 
 
 def test_endpoint_table_shape_unchanged():
-    """ground truth 端点表形态：22 条、17 真漏洞 / 5 安全对照。
+    """ground truth 端点表形态：28 条、22 真漏洞 / 6 安全对照。
 
     误报率分母（对照端点数）与发现率分母（真漏洞数）一变，历史数字即不可比——
-    故 M15 的分母变化必须**显式**写在这里（16/12/4 → 22/17/5：新增 5 条真 SSRF
-    + 1 条 SSRF 形对照），并由下面的族分量断言钉死“旧族一条没动”。
+    故每次加族的分母变化必须**显式**写在这里：
+
+    - M15：16/12/4 → 22/17/5（新增 5 条真 SSRF + 1 条 SSRF 形对照）；
+    - M22：22/17/5 → 28/22/6（新增 5 条真 SSTI + 1 条 SSTI 形对照）。
+
+    并由下面的族分量断言钉死「旧族一条没动」。
     """
-    assert len(bench.ENDPOINTS) == 22
-    assert sum(1 for e in bench.ENDPOINTS if e.vuln is not None) == 17
-    assert sum(1 for e in bench.ENDPOINTS if e.vuln is None) == 5
-    # M15：族分量——A/B/C/D 四族逐条不变，新增的只有 E 族与 SSRF 形对照
+    assert len(bench.ENDPOINTS) == 28
+    assert sum(1 for e in bench.ENDPOINTS if e.vuln is not None) == 22
+    assert sum(1 for e in bench.ENDPOINTS if e.vuln is None) == 6
+    # 族分量——A/B/C/D/E 五族逐条不变，新增的只有 F 族与 SSTI 形对照
     families: dict[str, int] = {}
     for ep in bench.ENDPOINTS:
         families[ep.path.split("/")[1]] = families.get(ep.path.split("/")[1], 0) + 1
-    assert families == {"a": 4, "b": 6, "c": 2, "d": 5, "e": 5}
+    assert families == {"a": 4, "b": 6, "c": 2, "d": 5, "e": 5, "f": 6}
     assert sum(1 for e in bench.ENDPOINTS if e.vuln == "ssrf") == 5
+    assert sum(1 for e in bench.ENDPOINTS if e.vuln == "ssti") == 5
     # 族计数还不够——同族换一条也能骗过计数，故**逐条列名**断言旧 16 条仍在
     present = {ep.path for ep in bench.ENDPOINTS}
     missing = [path for path in LEGACY_ENDPOINTS if path not in present]
@@ -426,6 +450,58 @@ def test_endpoint_table_shape_unchanged():
     assert tuple(bench.OUT_OF_TABLE) == (
         "article_id", "sku", "ref", "bh", "no", "token", "product", "code",
     )
+
+# ------------------------------------------------- M22：F 族（真 SSTI）
+
+
+@pytest.mark.parametrize(
+    ("path", "key"),
+    [
+        ("/f/render", "template"),
+        ("/f/mail", "tpl"),
+        ("/f/layout", "layout"),
+        ("/f/page", "body"),
+        ("/f/card", "snippet"),
+    ],
+)
+def test_ssti_endpoints_really_evaluate_templates(base, path, key):
+    """F 族**真的**把取值当模板求值——SSTI 的行为本体。
+
+    这条是第二步（`verify-ssti`，确认手段 = 两个不同乘积都被算出来）的地基：
+    若端点只是"把取值回显出来"，差分求值的判定器永远看不到乘积，第二步的数字
+    就是假的。故这里直接钉住两件事：**两个不同乘积**都出现，且**畸形模板**
+    不成立。
+    """
+    for expression, product in (("{{191*191}}", "36481"), ("{{191*192}}", "36672")):
+        status, body = _get(
+            f"{base}{path}?" + urllib.parse.urlencode({key: expression})
+        )
+        assert status == 200, (path, status)
+        assert product in body, (path, expression, "端点没有真的求值")
+
+    # 畸形模板（少一个右括号）不得算出乘积——否则它属于"strip 掉非数字后照样
+    # 算乘法"那一类端点，差分判据必须判 blocked 而不是 confirmed。
+    _, malformed = _get(
+        f"{base}{path}?" + urllib.parse.urlencode({key: "{{191*191}"})
+    )
+    assert "36481" not in malformed, (path, "畸形对照也出了乘积")
+
+
+def test_template_echo_control_reflects_without_evaluating(base):
+    """`/f/theme-preview` 是**形对照**：取值进了页面，但没被求值。
+
+    `{{191*191}}` 原样出现在正文里（证明参数确实被回显）、`36481` 不出现
+    （证明没被当模板执行）。判据必须判它 rejected——「看到 `{{ }}` 就确认」
+    是最典型的 SSTI 假阳性。
+    """
+    status, body = _get(
+        f"{base}/f/theme-preview?"
+        + urllib.parse.urlencode({"theme": "{{191*191}}"})
+    )
+    assert status == 200, status
+    assert "{{191*191}}" in body, "对照端点没有回显取值（不再是'回显不渲染'形态）"
+    assert "36481" not in body, "对照端点把取值当模板求值了——ground truth 被破坏"
+
 
 # ------------------------------------------------- M11b：fixture 控制面语义
 
