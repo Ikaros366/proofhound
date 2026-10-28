@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 
 from proofhound.compliance.audit import AuditLog
 from proofhound.compliance.scope import Scope
@@ -61,30 +62,36 @@ REF_COOKIE_VALUE = "reference-cookie-value"
 #: 页面里故意引用一个**跨源**资源：route 防线必须 abort 它。
 CROSS_ORIGIN = "http://192.0.2.10:9/beacon.png"
 
-PAGE = f"""<!doctype html>
+#: 页面把 query 的 ``q`` **原样**回显——**故意**不转义的演示靶：要让可见探针
+#: 在截图上真的渲染出来（真实目标是否转义由目标自己决定）。
+PAGE_TEMPLATE = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>ProofHound screenshot fixture</title></head>
 <body>
   <h1>证据截图靶</h1>
   <p id="marker">this page is captured by ProofHound</p>
+  <p id="echo">q=__Q__</p>
   <img src="{CROSS_ORIGIN}" alt="cross-origin beacon">
 </body></html>
-""".encode("utf-8")
+"""
 
 
 class _Handler(BaseHTTPRequestHandler):
-    """任何 GET 都回同一页；记录 path 与 Cookie（会话选择的证据）。"""
+    """任何 GET 都回同一页；``q`` 被**原样**回显（故意的演示靶）。"""
 
     hits: list[dict] = []
 
     def do_GET(self):  # noqa: N802 - stdlib 接口
+        query = parse_qs(urlparse(self.path).query)
+        reflected = query.get("q", [""])[0]
+        body = PAGE_TEMPLATE.replace("__Q__", reflected).encode("utf-8")
         type(self).hits.append(
             {"path": self.path, "cookie": self.headers.get("Cookie", "")}
         )
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(PAGE)))
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(PAGE)
+        self.wfile.write(body)
 
     def log_message(self, *args):  # 静默：请求记录走 hits
         pass
@@ -238,6 +245,7 @@ def main() -> int:
         orch.screenshot_factory = lambda: capturer
 
         produced: list[str] = []
+        paths_by_type: dict[str, list[Path]] = {}
         for index, vuln_type in enumerate(sorted(coverage.COVERAGE_SHOTS), start=1):
             finding = _new_finding(vuln_type, f"{base}/app?q=1", index)
             finding.audit = audit
@@ -255,6 +263,7 @@ def main() -> int:
                 checks,
             )
             produced.extend(str(path) for path in shots)
+            paths_by_type[vuln_type] = shots
 
         ok &= _check(
             "覆盖截图总张数 = 镜头表总数",
@@ -270,6 +279,14 @@ def main() -> int:
             checks,
         )
 
+        xss_paths = paths_by_type.get("xss", [])
+        ok &= _check(
+            "xss 可见探针改变渲染（图与基线不同）",
+            len(xss_paths) == 2
+            and xss_paths[0].read_bytes() != xss_paths[1].read_bytes(),
+            f"{[p.stat().st_size for p in xss_paths]} B",
+            checks,
+        )
         anonymous = [hit for hit in _Handler.hits if not hit["cookie"]]
         ok &= _check(
             "匿名镜头不带凭据",

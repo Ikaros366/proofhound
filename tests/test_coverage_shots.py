@@ -88,6 +88,15 @@ def test_shot_labels_are_unique_within_each_type():
         assert len(labels) == len(set(labels)), vuln_type
 
 
+def test_xss_probe_is_a_visible_marker():
+    """xss 覆盖探针必须**可见**：只改 JS 变量的探针在截图上等于没测。"""
+    probe = {shot.label: shot for shot in coverage.COVERAGE_SHOTS["xss"]}["probe"]
+    payload = probe.param_value or ""
+    assert "ProofHound XSS probe" in payload
+    assert "<h2" in payload
+    assert "<script" not in payload  # 纯 HTML：CSP 也拦不住
+
+
 def test_plan_for_unknown_type_is_none():
     assert coverage.plan_for("nope") is None
 

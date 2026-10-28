@@ -6,6 +6,15 @@
 
 ## [未发布]
 
+### 变更（M20-b 修补：xss 覆盖探针改为可见标记）
+
+原探针 `<script>window.__ph_shot=1</script>` 只改 JS 变量、**不改变渲染** ⇒ 截图上与
+基线几乎一模一样，「证明测过」的价值大打折扣。现改为纯 HTML 可见标记
+`"><h2 style="color:#c00;font:700 18px sans-serif">ProofHound XSS probe</h2>`：
+反射到页面即出现红色标题，被转义则原样显示探针文本——两种情况下图里都有可辨认的
+证据，且不依赖 JS（CSP 也拦不住）。demo 靶同步改为**原样回显** `q`，并新增断言
+「xss 探针图与基线图不同」（证明可见标记真的渲染出来了）。
+
 ### 新增（M20-b 覆盖截图：按漏洞类型的固定取证，不论判定结果）
 
 **做了什么**：新增 `proofhound/verify/coverage.py`——`COVERAGE_SHOTS` 是「漏洞类型 →
@@ -23,9 +32,9 @@ ssrf 基线、unauth 匿名 + 已认证、cmdi 基线）；`run_verify_phase` �
 - **单测守护**：`tests/test_coverage_shots.py` 用 `VULN_REGISTRY` **双向锁定**镜头表
   （加类型必须同步，漏了即红）。
 
-**测试**：新增 `tests/test_coverage_shots.py` **12** 个；实弹 `scripts/demo_screenshot.py`
-扩到 **17 条断言**（真 Chromium：六类 **10 张**固定图齐备、匿名镜头靶侧无 Cookie、
-reference 镜头真用第二会话、审计 10 条）；全量 **1357 passed / 2 skipped**。
+**测试**：新增 `tests/test_coverage_shots.py` **13** 个；实弹 `scripts/demo_screenshot.py`
+扩到 **18 条断言**（真 Chromium：六类 **10 张**固定图齐备、匿名镜头靶侧无 Cookie、
+reference 镜头真用第二会话、审计 10 条）；全量 **1358 passed / 2 skipped**。
 
 **成本**：每条候选 1~2 次真实导航（约 1~3s/次），仍受 `PROOFHOUND_SCREENSHOT` 开关控制
 （缺省关）。

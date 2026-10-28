@@ -306,7 +306,7 @@ PROOFHOUND_SCREENSHOT=1 .venv/bin/python -m proofhound.api --workspace . --port 
 | 类型 | 固定镜头 | 说明 |
 |---|---|---|
 | `sqli` | `baseline` + `probe`（参数换成 `1'`） | 页面回显 SQL 报错即是「测过」的视觉证据 |
-| `xss` | `baseline` + `probe`（`<script>window.__ph_shot=1</script>`） | 不弹框、无副作用的探针 |
+| `xss` | `baseline` + `probe`（可见标记 `<h2>ProofHound XSS probe</h2>`） | 纯 HTML、不依赖 JS/CSP；反射与否图上直接可见 |
 | `idor` | `attacker`（主会话）+ `reference`（第二身份会话） | 双身份各一张；缺 reference 时该镜头记 skipped，**不拿主会话顶替** |
 | `ssrf` | `baseline` | 回调证明不是视觉证据，这里只留端点形态 |
 | `unauth-exposure` | `anonymous`（不带凭据）+ `authenticated` | 判据本身就是两视图对照 |

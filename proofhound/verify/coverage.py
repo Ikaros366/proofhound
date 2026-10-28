@@ -64,8 +64,8 @@ class CoverageShot:
 #:
 #: 取值原则：只用**无副作用**的探针——GET、只改 query 取值、不写目标、
 #: 不弹框。探针要能让人从图上看懂「这里测过什么」：
-#: sqli 用注入标点（页面回显 SQL 报错即是证据）、xss 用一条不弹框的
-#: script 探针、idor/unauth 用双身份对照。
+#: sqli 用注入标点（页面回显 SQL 报错即是证据）、xss 用**可见 HTML 标记**
+#: （图里能直接看到探针文本，不依赖 JS）、idor/unauth 用双身份对照。
 COVERAGE_SHOTS: dict[str, tuple[CoverageShot, ...]] = {
     "sqli": (
         CoverageShot("baseline"),
@@ -73,7 +73,13 @@ COVERAGE_SHOTS: dict[str, tuple[CoverageShot, ...]] = {
     ),
     "xss": (
         CoverageShot("baseline"),
-        CoverageShot("probe", param_value="<script>window.__ph_shot=1</script>"),
+        CoverageShot(
+            "probe",
+            # 可见标记：反射到页面即出现红色标题；被转义则原样显示探针文本。
+            # 纯 HTML、不依赖 JS（CSP 也拦不住），图本身就带「测过」的证据。
+            param_value='"><h2 style="color:#c00;font:700 18px sans-serif">'
+            "ProofHound XSS probe</h2>",
+        ),
     ),
     "idor": (
         CoverageShot("attacker"),
