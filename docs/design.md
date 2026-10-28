@@ -1691,7 +1691,8 @@ runner 未挂 scope 时记 `request_budget_unavailable` 并 fail-closed。
 append-only 快照里没有这条 `evidence_refs`（回放时引用丢失）。
 
 **URL 选择**：缺省 `finding.asset`；verify-xss 传 **canary 命中的那个 URL**
-（payload 已内嵌）——比裸 asset 更能说明「这条 Finding 的复现长什么样」。
+（payload 已内嵌）；verify-ssti 传**命中语法族**的表达式探针 URL——两者都比裸
+asset 更能说明「这条 Finding 的复现长什么样」。
 
 **授权与隔离**：与 XSS 验证器同一套——导航前 `allow_request` 自检 + `page.route`
 逐请求「同源 ∧ scope」判定，跨源/越界 `abort` 计数进 `screenshot_captured`
@@ -1871,6 +1872,15 @@ RCE"的保守读数——正是 M6b「按证据定指标、不按类型套模板
 **本里程碑明确不做**：`--live` 重跑 Confirmed 级基线（历史表仍是 22 端点口径）；
 `${ }` / `<%= %>` 的真靶验证；盲注型 SSTI；POST/JSON body 型候选；模板指纹识别与
 可用 RCE 载荷（探针只有一个乘法表达式）。
+
+**M23 补记（2026-10-28，缺陷修复）**：M22-b 的确认收尾有两处漏项，已修并加回归
+测试：① `_verify_ssti` 没像 `_verify_xss` 那样传 `screenshot_url`，确认截图落在
+**裸 asset**（未求值的页面）上 ⇒ 现传**命中语法族**的表达式探针 URL，图里能直接
+看到乘积；② `expr_probes` 收集的是**所有尝试过**的表达式探针，非第一族命中时
+`[0]/[1]` 指向**失败族** ⇒ 复现步骤的 URL 照抄不可复现（实测：命中 `${ }` 时
+步骤里写的是 `{{ }}` 的 URL），现按 `syntax == hit.label` 过滤后再取。
+`tests/test_ssti.py` 新增 `dollar` 族靶与
+`test_later_syntax_family_uses_its_own_probe_urls`。
 
 ### 7.27 服务器报错信息泄露：畸形请求的差分判定（M23，2026-10-28）
 

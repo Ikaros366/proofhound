@@ -6,6 +6,18 @@
 
 ## [未发布]
 
+### 修复（M22-b 补：SSTI 确认截图与复现步骤 URL）
+
+- **确认截图没传 payload URL**：`_verify_ssti` 收尾未传 `screenshot_url`，截图落在
+  裸 `asset`（未求值的页面）⇒ 现传**命中语法族**的表达式探针 URL，图里能看到
+  36481/36672（与 verify-xss 传 canary URL 同一取舍）；
+- **非第一语法族命中时复现步骤 URL 写错**：`expr_probes` 含失败族探针，
+  `[0]/[1]` 会指向 `{{ }}` 族（照抄不可复现）⇒ 现按 `syntax == hit.label` 过滤，
+  复现步骤与畸形对照均取命中族；
+- 回归：`tests/test_ssti.py` 增 `dollar` 族靶 + 1 个用例（30 个）；全量
+  **1474 passed / 4 skipped / 1 xfailed**。`scripts/demo_screenshot.py` 的
+  「六类」表述同步为八类。
+
 ### 新增（M23 第 8 类可确认漏洞：服务器报错信息泄露 · 畸形请求差分判定）
 
 **做了什么**：新增 `vuln_type=error-disclosure`——把**畸形请求**发给同一 host，

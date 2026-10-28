@@ -380,6 +380,7 @@ def _make_victim(mode: str):
     """可控的罐头取数：模拟真实目标的四种形态。
 
     - ``jinja``：只对 ``{{ }}`` 求值（真实的真引擎形态）；
+    - ``dollar``：只对 ``${ }`` 求值（第二语法族，用于钉「命中族 URL」）；
     - ``erb``：只对 ``<%= %>`` 求值（第三语法族，用于钉 8 次预算）；
     - ``echo``：**只回显不求值**（形对照，必须 rejected）；
     - ``naive``：strip 掉非数字/非 ``*`` 后**强算**（畸形对照也出数，必须 blocked）。
@@ -401,6 +402,9 @@ def _make_victim(mode: str):
             pairs = {"{{191*191}}": "36481", "{{191*192}}": "36672"}
             if mode == "erb":
                 pairs = {"<%= 191*191 %>": "36481", "<%= 191*192 %>": "36672"}
+            elif mode == "dollar":
+                # 第二语法族命中：前面 `{{ }}` 族的探针全部落空
+                pairs = {"${191*191}": "36481", "${191*192}": "36672"}
             rendered = pairs.get(value)
             body = (
                 f"<div>渲染结果 {rendered}</div>"
@@ -605,3 +609,43 @@ def test_verifier_reject_on_confirmed_facts_leaves_reproduced(env):
     assert outcome == "rejected", outcome
     assert env.store.load_all()[0].state is FindingState.REJECTED
     assert env.router.calls == 1
+
+
+class _ShotRecorder:
+    """记录确认截图的 ``(url, name)``；返回 skipped（不写文件、不影响判定）。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def capture(self, url: str, *, name: str, session=None):
+        self.calls.append((url, name))
+        return SimpleNamespace(error="测试替身：只记录不落盘", path=None)
+
+
+def test_later_syntax_family_uses_its_own_probe_urls(env):
+    """命中第二语法族：复现步骤与确认截图都必须用**命中族**的探针 URL。
+
+    M22-b 的实测缺陷（本轮修）：``expr_probes`` 收集的是**所有尝试过**的表达式
+    探针，非第一族命中时 ``[0]/[1]`` 指向失败族 ⇒ 复现步骤写出的 URL 照抄
+    **不可复现**；确认截图也落在裸 asset 上（看不到 36481）。
+    """
+    finding = _finding(env)
+    orch = _orch(env, _make_victim("dollar"))
+    recorder = _ShotRecorder()
+    orch.screenshots = True
+    orch.screenshot_factory = lambda: recorder
+
+    outcome = orch._verify_ssti(finding, env.registry.get("verify-ssti"), env.store)
+
+    assert outcome == "confirmed", outcome
+    stored = env.store.load_all()[0]
+    expected_a = ssti.build_probe_url(ASSET, PARAM, "${191*191}")
+    expected_b = ssti.build_probe_url(ASSET, PARAM, "${191*192}")
+    expected_control = ssti.build_probe_url(ASSET, PARAM, "${191*191")
+    steps = stored.verification.reproduction_steps
+    assert expected_a in steps[1], steps
+    assert expected_b in steps[2], steps
+    assert expected_control in steps[3], steps
+    assert "%7B%7B" not in steps[1], "失败族的 {{ }} URL 不得冒充复现步骤"
+    # 确认截图 = 命中族的探针 URL（图里应出现 36481），而不是裸 asset
+    assert recorder.calls == [(expected_a, f"shot_{finding.id}")]

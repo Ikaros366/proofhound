@@ -3126,8 +3126,14 @@ class Orchestrator:
 
         # 4c. 成立：证据入包（具名标签 + 差分求值 method + 四段式）
         evidence_paths.append(j_path)
-        baseline_probe, expr_probes = probes[0], [
-            p for p in probes if p.kind == SSTI_KIND_EXPRESSION
+        baseline_probe = probes[0]
+        # 只取**命中族**的表达式探针：`probes` 里还留着前面失败族的探针，
+        # 直接用 [0]/[1] 会在非第一族命中时写出**照抄不可复现**的 URL
+        # （实测缺陷：命中 `${ }` 族时复现步骤写的是 `{{ }}` 族的 URL）。
+        hit_probes = [
+            p
+            for p in probes
+            if p.kind == SSTI_KIND_EXPRESSION and p.syntax == hit.label
         ]
         control_probe = next(
             (p for p in probes if p.kind == SSTI_KIND_CONTROL), None
@@ -3138,7 +3144,7 @@ class Orchestrator:
             baseline_diff=(
                 f"基线 {baseline_probe.status}（正文不含 "
                 f"{SSTI_PRODUCT_A}/{SSTI_PRODUCT_B}）；"
-                f"表达式探针 {len(expr_probes)} 次中命中两个不同乘积；"
+                f"命中族 {hit.label} 的两个表达式探针都出现乘积；"
                 f"畸形模板对照 "
                 f"{'未执行' if control_probe is None else f'{control_probe.status}（不含乘积）'}"
             ),
@@ -3158,8 +3164,8 @@ class Orchestrator:
             reproduction_steps=[
                 f"GET {baseline_probe.url}（基线）→ {baseline_probe.status}，"
                 f"正文不含 {SSTI_PRODUCT_A}/{SSTI_PRODUCT_B}",
-                f"GET {expr_probes[0].url} → 正文出现 {SSTI_PRODUCT_A}",
-                f"GET {expr_probes[1].url} → 正文出现 {SSTI_PRODUCT_B}",
+                f"GET {hit_probes[0].url} → 正文出现 {SSTI_PRODUCT_A}",
+                f"GET {hit_probes[1].url} → 正文出现 {SSTI_PRODUCT_B}",
                 f"GET {control_probe.url if control_probe else url}（畸形模板对照）"
                 " → 正文不含乘积（排除「strip 非数字后强算」）",
             ],
@@ -3179,8 +3185,16 @@ class Orchestrator:
         )
         store.append(finding)
 
-        # 5. 证据门 → Verifier 终审 → 终态迁移（公共收尾）
-        return self._gate_and_review(finding, skill, store, summary=summary)
+        # 5. 证据门 → Verifier 终审 → 终态迁移（公共收尾）。
+        # 确认截图取**命中族**的探针 URL：图里应直接看到乘积（如 36481），
+        # 截裸 asset 只会得到未求值的页面（与 XSS 传 canary URL 同一取舍）。
+        return self._gate_and_review(
+            finding,
+            skill,
+            store,
+            summary=summary,
+            screenshot_url=hit_probes[0].url,
+        )
 
     def _ssti_probe(
         self,

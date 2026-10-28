@@ -10,7 +10,7 @@
 4. scope 兜底：scope 外 URL 零导航零请求。
 
 第二阶段（M20-b，覆盖截图）：
-5. **六类漏洞的固定镜头全部产出**：``coverage.COVERAGE_SHOTS`` 里每类每条镜头
+5. **八类漏洞的固定镜头全部产出**：``coverage.COVERAGE_SHOTS`` 里每类每条镜头
    都真截到 PNG（无会话/有会话/双身份都覆盖）；
 6. **匿名镜头不带凭据**：unauth-exposure 的 ``anonymous`` 镜头靶侧看不到 Cookie；
 7. **第二身份镜头用 reference 会话**：idor 的 ``reference`` 镜头靶侧看到的是
@@ -231,7 +231,7 @@ def main() -> int:
         summary["denied_error"] = denied.error
 
         # ---------- 第二阶段：按类型的覆盖截图 ----------
-        print("[*] 覆盖截图：六类漏洞的固定镜头")
+        print("[*] 覆盖截图：八类漏洞的固定镜头")
         audit = AuditLog(run_dir / "audit.jsonl")
         store = FindingStore(run_dir / "findings.jsonl")
         orch = Orchestrator(

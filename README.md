@@ -284,7 +284,7 @@ PROOFHOUND_SCREENSHOT=1 .venv/bin/python -m proofhound.api --workspace . --port 
 | 维度 | 行为 |
 |---|---|
 | 触发点 | `_gate_and_review` 确认之后、`store.append` 之前 ⇒ append-only 快照里带这条引用 |
-| 目标 URL | 缺省 `finding.asset`；XSS 取 **canary 命中的那个 URL**（payload 已内嵌） |
+| 目标 URL | 缺省 `finding.asset`；XSS 取 **canary 命中的那个 URL**（payload 已内嵌）；SSTI 取**命中语法族**的表达式探针 URL（图里能看到乘积） |
 | 授权 | 导航前 scope 自检 + `page.route` 按「同源 ∧ scope」拦截子请求（跨源 abort 计数进审计） |
 | 会话 | 复用 `apply_session`：Cookie 按 origin 绑定、额外请求头全量 ⇒ 截的是登录后页面 |
 | 失败 | **fail-open**：浏览器缺失 / 超时 / 越界只记 `screenshot_skipped`，**不改判**、不阻断确认 |
