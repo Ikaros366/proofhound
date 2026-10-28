@@ -34,6 +34,7 @@ import urllib.error
 import urllib.request
 from urllib.parse import urljoin
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from proofhound.verify import captcha_ocr
 from proofhound.verify.raw_request import (
@@ -101,6 +102,8 @@ class ProbeReport:
     attempts: list[Attempt] = field(default_factory=list)
     target: str = ""
     calibrated: bool = False
+    #: 证据附件（登录页截图 / 验证码图）；由 CLI 在判定后补充。
+    artifacts: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -109,6 +112,7 @@ class ProbeReport:
             "reasons": list(self.reasons),
             "target": self.target,
             "calibrated": self.calibrated,
+            "artifacts": list(self.artifacts),
             "attempts": [a.__dict__ for a in self.attempts],
         }
 
@@ -193,6 +197,8 @@ class ProbeConfig:
     sms_code_field: str | None = None
     test_phone: str = "18888888888"
     wrong_password: str = WRONG_PASSWORD
+    #: 证据附件目录（验证码图片落盘）；None = 不落盘。
+    artifact_dir: Path | None = None
     captcha_error_regex: str | None = None
     credential_error_regex: str | None = None
 
@@ -353,6 +359,9 @@ def run_image_probe(config: ProbeConfig) -> ProbeReport:
     credential_ref: LoginResponse | None = None
     for index in range(config.ocr_retries):
         image = session.request("GET", image_url, headers={"Accept": "image/*"})
+        if config.artifact_dir is not None:
+            config.artifact_dir.mkdir(parents=True, exist_ok=True)
+            (config.artifact_dir / "captcha.png").write_bytes(image.body)
         code = captcha_ocr.solve(image.body)
         if not code:
             continue
@@ -518,6 +527,59 @@ def _looks_like_login_success(response: LoginResponse, baseline: LoginResponse) 
     return similarity(response.body, baseline.body) < 0.6
 
 
+def capture_login_artifacts(
+    scope,
+    request: RawRequest,
+    out_dir: str | Path,
+    *,
+    timeout: float = 15.0,
+) -> list[str]:
+    """证据附件：登录页截图 + 验证码图片（失败只返回已成功部分，绝不抛）。
+
+    与判定解耦：截图证明的是「登录页长什么样（有没有图形验证码）」，**不是**
+    「25 次重放成立」——后者由 ``probe.json`` 的尝试序列证明。故这里任何失败
+    （浏览器缺失/超时/找不到验证码图）都不影响判定结论。
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    artifacts: list[str] = []
+    session = LoginSession(
+        timeout, cookies=_parse_cookie_header(request.header("cookie"))
+    )
+    try:
+        page = session.request("GET", request.url, headers={"Accept": "text/html"})
+    except ProbeError:
+        return artifacts
+    image_url = find_captcha_image(page.text, page.url)
+    if image_url:
+        try:
+            image = session.request("GET", image_url)
+            captcha_path = out / "captcha.png"
+            captcha_path.write_bytes(image.body)
+            artifacts.append(str(captcha_path))
+        except ProbeError:
+            pass
+    try:
+        from proofhound.compliance.session import SessionConfig
+        from proofhound.verify.screenshot import ScreenshotCapturer
+
+        capturer = ScreenshotCapturer(
+            scope=scope,
+            evidence_dir=out,
+            session=SessionConfig(cookies=session.cookies),
+        )
+        try:
+            capturer.start()
+            result = capturer.capture(request.url, name="login-page")
+        finally:
+            capturer.close()
+    except Exception:  # noqa: BLE001 - 截图是附件，失败不影响判定
+        return artifacts
+    if result.path is not None:
+        artifacts.append(str(result.path))
+    return artifacts
+
+
 __all__ = [
     "Attempt",
     "LoginResponse",
@@ -528,6 +590,7 @@ __all__ = [
     "ProbeReport",
     "SMS_TEST_CODES",
     "WRONG_PASSWORD",
+    "capture_login_artifacts",
     "classify",
     "find_captcha_image",
     "judge_image",

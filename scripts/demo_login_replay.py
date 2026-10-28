@@ -191,7 +191,9 @@ def _raw_request(port: int, path: str, *, sms: bool = False) -> str:
     )
 
 
-def _run_case(port: int, scope: Scope, *, path: str, sms: bool = False, **kwargs):
+def _run_case(
+    port: int, scope: Scope, *, path: str, sms: bool = False, artifact_dir=None, **kwargs
+):
     request = parse_raw_request(_raw_request(port, path, sms=sms), scheme="http")
     config = ProbeConfig(
         request=request,
@@ -201,6 +203,7 @@ def _run_case(port: int, scope: Scope, *, path: str, sms: bool = False, **kwargs
         phone_field="phone" if sms else None,
         sms_code_field="sms_code" if sms else None,
         attempts=25,
+        artifact_dir=artifact_dir,
         **kwargs,
     )
     return run_sms_probe(config) if sms else run_image_probe(config)
@@ -238,7 +241,9 @@ def main() -> int:
     try:
         for name, sms, path, expected in cases:
             print(f"[*] 场景 {name}: 期望 {expected}")
-            report = _run_case(port, scope, path=path, sms=sms)
+            report = _run_case(
+                port, scope, path=path, sms=sms, artifact_dir=run_dir / name
+            )
             (run_dir / f"{name}.json").write_text(
                 json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n",
                 encoding="utf-8",
@@ -255,6 +260,15 @@ def main() -> int:
                     "reasons": report.reasons,
                 }
             )
+            if not sms:
+                captcha_png = run_dir / name / "captcha.png"
+                artifact_ok = captcha_png.is_file() and captcha_png.read_bytes().startswith(
+                    b"\x89PNG"
+                )
+                passed = passed and artifact_ok
+                ok &= artifact_ok
+                checks.append({"case": f"{name}:captcha.png", "ok": artifact_ok})
+                print(f"    -> 证据附件 captcha.png: {'PASS' if artifact_ok else 'FAIL'}")
             print(
                 f"    -> {report.verdict}（{len(report.attempts)} 次尝试）"
                 f" {'PASS' if passed else 'FAIL'}"

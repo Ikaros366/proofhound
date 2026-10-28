@@ -26,6 +26,7 @@ from proofhound.verify.login_probe import (
     run_image_probe,
     run_sms_probe,
 )
+from proofhound.verify.login_probe import capture_login_artifacts
 from proofhound.verify.raw_request import (
     RawRequestError,
     field_names,
@@ -56,6 +57,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--captcha-error-regex", default=None, help="可选：验证码错误文案正则")
     parser.add_argument("--credential-error-regex", default=None, help="可选：凭证错误文案正则")
     parser.add_argument("--timeout", type=float, default=15.0)
+    parser.add_argument(
+        "--no-screenshot",
+        action="store_true",
+        help="不截登录页/验证码图（缺省会截，失败不影响判定）",
+    )
     parser.add_argument("--list-fields", action="store_true", help="只打印请求里的表单字段并退出")
     return parser
 
@@ -111,6 +117,9 @@ def main(argv: list[str] | None = None) -> int:
 
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    config.artifact_dir = out
+    if not args.no_screenshot:
+        report.artifacts.extend(capture_login_artifacts(scope, request, out))
     evidence = out / "probe.json"
     evidence.write_text(
         json.dumps(report.to_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"

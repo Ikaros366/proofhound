@@ -39,6 +39,8 @@ M19-a / M19-b / M19-c / M19-d / M20 / M20-b / M20-b 修补。
 锁定 = `rejected`；OCR 失败、两态不可区分、未知响应 = `blocked`。**OCR 失败绝不判
 rejected**（否则等于把"认不出"当成"有防护"）。
 
+**证据附件**：默认截登录页（`login-page.png`）+ 保存验证码图（`captcha.png`），`--no-screenshot` 关闭；截图失败不影响判定（附件不是判据）。
+
 **CLI**：`python -m proofhound.loginprobe --request login.txt --scope scopes/lab.yaml
 --user admin --captcha-field code --attempts 25`（退出码 0/1/2；证据 JSON 落 `--out`）。
 

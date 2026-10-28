@@ -332,6 +332,9 @@ python -m proofhound.loginprobe \
     --user admin --captcha-field code --attempts 25
 ```
 
+证据附件：默认截一张登录页（`login-page.png`）并保存验证码图（`captcha.png`），
+`--no-screenshot` 关闭；截图失败**不影响判定**（附件是证据，不是判据）。
+
 判定链路（纯确定性代码，零 LLM）：
 
 1. GET 登录页 → 找验证码图片 → OCR 识别（认错就**换一张重试 ≤3 次**）；
