@@ -6,6 +6,66 @@
 
 ## [未发布]
 
+### 新增（M22-b 第 7 类可确认漏洞：SSTI 模板注入 · 差分求值判定通道）
+
+**做了什么**：把 M22-a 的 `_verify_ssti` fail-closed 桩换成**真实现**，并交付
+`proofhound/verify/ssti.py` 的判定器：
+
+- `match_products`：**数字边界**匹配（`136481` 里的 `36481` 不算命中——否则处处假阳性）；
+- `SYNTAX_FAMILIES`：`{{ }}`（Jinja2/Twig/Django）、`${ }`（EL/FreeMarker）、
+  `<%= %>`（ERB/EJS）三族，每族两条表达式（`191*191`=36481 / `191*192`=36672）
+  与**一条畸形对照**（少一个右括号）；
+- `judge`：三态纯函数。**判定优先级**（宁漏勿滥）：基线失败或基线本身含乘积 →
+  `blocked`（反事实不可测）；某族两个乘积全中、但畸形对照**也出数** → `blocked`
+  （这是「strip 掉非数字后照样强算」的端点：三个探针全中却**证明不了**是模板引擎
+  算的）；只中一个 → `blocked`；全部探针干净未命中 → `rejected`；任何探针出错且
+  未命中 → `blocked`；
+- `summary_for_verifier`：只给枚举/计数/状态码/乘积，**响应体一行都不进** Verifier
+  （红线 3 零放松）。
+
+**编排**（`_verify_ssti`）：scope 自检 → 缺 `param` / POST 表单型候选 → `blocked`
+（不凭空造 URL）→ 基线 → 逐语法两条探针（**两个乘积都中即停**）→ 补该语法畸形
+对照 → 差分判定 → 三态。confirmed 走既有 `_gate_and_review`（证据门 + Verifier +
+CVSS 代码算分 + 四段式）；rejected 是**真阴性**；blocked **停在 Hypothesis**。
+每候选 **≤8 次只读 GET**（1 基线 + 3 族 × 2 + 1 畸形对照）。
+
+**审计**：`ssti_probe_attempt`（逐探针：label/kind/syntax/status/products）、
+`ssti_judged`（verdict/syntax/products/probes/budget）、blocked 走
+`verify_blocked`（写清是"覆盖不全"而不是"安全"）。
+
+**实弹验收** `scripts/demo_ssti.py`（真 jinja2 靶、零 seed、`--canned` 与真实 T2
+各跑一遍全绿）：
+
+| 端点 | 形态 | 终态 | 探针数 |
+|---|---|---|---|
+| `/render` | 真模板求值 | **CONFIRMED**（method=`template-eval-confirmed`、证据 `template-evaluation`、CVSS 代码算分、四段式齐全） | 4 |
+| `/echo` | 只回显不求值（形对照） | **REJECTED**（真阴性、不误报） | 7 |
+| `/calc` | strip 非数字后强算（畸形对照也出数） | **停在 Hypothesis**（判不了，绝不驳回） | 4 |
+
+**一条实测观察（如实记录）**：同一事实的 CVSS 向量，罐头裁定给 9.8，而真实 T2
+（`deepseek-v4-pro`）给 **5.3**（两跑实测的 C/I/A 分量不同：`C:N/I:L/A:N` 与 `C:L/I:N/A:N`，分数都是 5.3）——后者是「只证明了算术求值、没
+证明 RCE」的保守读数。这正是 M6b「按证据定指标、不按类型套模板」的**正面表现**
+（不是缺陷）：模型没看到代码执行证据，就不该按模板注入的典型后果打分。
+
+**顺带登记一处同类静默失效**（AGENTS.md 限制 71）：`cmdi` 自 M18-a 起在模型白名单
+里，但 `SYSTEM_PROMPT` 正文**从未提到过这个词** ⇒ 模型通道对 cmdi **恒零产出**
+（基线 4 跑 + 本次 3 跑，实测 0 条；`rules+model` 臂里的 cmdi 全部来自规则表）。
+**本轮只登记不修**：修 prompt 会改变另一类型的候选行为，而该行为没有任何对照数据。
+用 **strict xfail** 把它钉成断言（
+`tests/test_llm_triage.py::test_prompt_mentions_every_whitelisted_type`）——修好后
+不删标记即失败。
+
+**测试**：新增 `tests/test_ssti.py` **29** 个（纯函数 17：数字边界/三族/预算算术/
+`judge` 八种形态/摘要不含响应体；编排 12：三态、证据门只认具名标签、四段式、预算
+4/7/8、scope 越界、缺 param、POST 表单、Verifier 否决）。全量 **1416 passed /
+1 xfailed / 2 skipped**；**旧测试零改动**（`tests/test_llm_triage.py` 只补
+`SYSTEM_PROMPT` import 与追加那条 xfail）。
+
+**未做（如实记录）**：`--live` 重跑 Confirmed 级基线（仍是 22 端点口径）；`${ }` /
+`<%= %>` 两族的**真靶**验证（本机无 Java/Ruby 引擎 → 只有纯函数单测，见限制 70）；
+盲注型 SSTI、POST/JSON body 型候选、模板指纹识别与 RCE 载荷（探针只有一个乘法
+表达式，从不投递可用攻击载荷）。
+
 ### 新增（M22-a 第 7 类漏洞的候选通道：SSTI 两步走·第一步）
 
 **做了什么**：按交接单裁定，把 **SSTI（模板注入）** 作为第 7 类可确认漏洞的**候选面**

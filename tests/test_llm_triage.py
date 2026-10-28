@@ -24,6 +24,7 @@ from proofhound.llm.router import Tier
 from proofhound.llm.triage import (
     ALLOWED_VULN_TYPES,
     BATCH_SIZE,
+    SYSTEM_PROMPT,
     HypothesisBatch,
     HypothesisItem,
     ModelTriageError,
@@ -354,3 +355,29 @@ def test_audit_records_dropped_ungrounded(tmp_path):
     events = [e for e in audit.read_all() if e["event"] == "llm_triage_batch"]
     assert events[0]["candidates"] == 1
     assert events[0]["dropped"] and "ghost" in events[0]["dropped"][0]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "AGENTS.md 限制 71：`cmdi` 自 M18-a 起在模型白名单里，但 SYSTEM_PROMPT 正文"
+        "从未提到它 ⇒ 模型通道对 cmdi 恒零产出（实测 7 跑 0 条）。修好 prompt 后"
+        "本用例应转正并**删除此标记**（strict 会强制这一步）。"
+    ),
+)
+def test_prompt_mentions_every_whitelisted_type():
+    """白名单与 prompt 正文是**两处**——漏改即静默失效（交接单 §5 第 8 落点的守护）。
+
+    这条守的是**接口一致性**，不是模型能力：模型只可能输出它在 prompt 里见过的
+    类型名。`cmdi` 就是活反例——白名单里有、prompt 里没有，于是模型通道静默失效，
+    而 `GATE_MATRIX`、skill、生产栈槽位、29 个测试全部「看起来正常」。
+    """
+    missing = sorted(
+        vuln_type
+        for vuln_type in ALLOWED_VULN_TYPES
+        if f"``{vuln_type}``" not in SYSTEM_PROMPT
+    )
+    assert not missing, (
+        "以下类型在模型白名单里，但 prompt 正文一次都没提到（模型通道对它们静默"
+        "失效）：" + str(missing)
+    )

@@ -141,6 +141,26 @@ from proofhound.verify.idor_control import (
 from proofhound.verify.prefilter import screen as prefilter_screen
 from proofhound.verify.prefilter import with_query_param as prefilter_with_query_param
 from proofhound.verify.screenshot import ScreenshotCapturer
+from proofhound.verify.ssti import (
+    KIND_BASELINE as SSTI_KIND_BASELINE,
+)
+from proofhound.verify.ssti import KIND_CONTROL as SSTI_KIND_CONTROL
+from proofhound.verify.ssti import KIND_EXPRESSION as SSTI_KIND_EXPRESSION
+from proofhound.verify.ssti import PROBE_BUDGET as SSTI_PROBE_BUDGET
+from proofhound.verify.ssti import PRODUCT_A as SSTI_PRODUCT_A
+from proofhound.verify.ssti import PRODUCT_B as SSTI_PRODUCT_B
+from proofhound.verify.ssti import SSTI_CONFIRMED_METHOD
+from proofhound.verify.ssti import (
+    SSTI_EVALUATION_EVIDENCE_KIND,
+)
+from proofhound.verify.ssti import SYNTAX_FAMILIES as SSTI_SYNTAX_FAMILIES
+from proofhound.verify.ssti import VERDICT_REJECTED as SSTI_VERDICT_REJECTED
+from proofhound.verify.ssti import Probe as SstiProbe
+from proofhound.verify.ssti import build_probe_url as ssti_build_probe_url
+from proofhound.verify.ssti import fetch as ssti_fetch_default
+from proofhound.verify.ssti import judge as ssti_judge
+from proofhound.verify.ssti import match_products as ssti_match_products
+from proofhound.verify.ssti import summary_for_verifier as ssti_summary_for_verifier
 from proofhound.verify.ssrf import (
     CALLBACK_PATH_PREFIX,
     NON_LOOPBACK_WARNING,
@@ -576,6 +596,7 @@ class Orchestrator:
         ssrf_fetch=None,
         unauth_judge_factory=None,
         cmdi_fetch=None,
+        ssti_fetch=None,
         triage_rules: bool = True,
         triage_model: bool = False,
         verify_prefilter: bool = False,
@@ -625,6 +646,9 @@ class Orchestrator:
         # verify/cmdi.py 的真实实现）。listener 复用 SSRF 的 ssrf_listener_factory
         # ——两者是同一件基础设施（`CallbackListener`），共用即可。
         self._cmdi_fetch = cmdi_fetch if cmdi_fetch is not None else cmdi_fetch_default
+        # M22-b：verify-ssti 的取数注入口子（测试给罐头 fetch；None 时用
+        # verify/ssti.py 的真实 stdlib fetch）。判据与身份无关，故会话可为 None。
+        self._ssti_fetch = ssti_fetch if ssti_fetch is not None else ssti_fetch_default
         # 回调 listener 按 finding 分桶（每条候选一个独立 listener + 独立 token 空间），
         # phase 收尾统一释放（与 _close_browser 同范式）
         self._ssrf_listeners: dict[str, CallbackListener] = {}
@@ -2841,30 +2865,279 @@ class Orchestrator:
         return self._gate_and_review(finding, skill, store, summary=summary)
 
     def _verify_ssti(self, finding: Finding, skill, store: FindingStore) -> str:
-        """verify-ssti SOP（skills/verify-ssti/SKILL.md）的确定性执行（M22）。
+        """verify-ssti SOP（skills/verify-ssti/SKILL.md）的确定性执行（M22-b）。
 
-        **M22-a 第一步：fail-closed 桩**。候选通道（规则表 ``_SSTI_PARAM_HINTS`` +
-        模型白名单）已放开，判定通道由 M22-b 落地 —— 在那之前本 handler
-        **恒记 `verify_blocked`、绝不确认、也绝不驳回**：
+        确认铁律：**同一语法下两个不同乘积都被算了出来**，且基线干净、**畸形
+        模板对照**不成立。页面里的模板语法回显、报错文本、状态码一律不是证据
+        ——「参数被看见了」不等于「被求值了」。
 
-        - 不确认：没有差分求值的二值事实，就没有证据能过证据门；
-        - 不驳回：判定器还没建，任何「看起来干净」都不构成真阴性 —— 把「还没测」
-          记成「测过且安全」是本仓库最不能接受的形态（与限制 44 同源：故障与
-          覆盖不全必须与「安全」可分辨）。
+        判定（``verify/ssti.py::judge``，纯函数，宁漏勿滥）：
 
-        故候选只会停在 Hypothesis，``evidence_kinds`` 也不会被污染
-        （``template-evaluation`` 标签不由桩添加）。M22-b 换成真实现时，
-        本 docstring 与这段桩一并替换。
+        - 两个乘积都中 + 基线干净 + 畸形对照干净 → REPRODUCED → 证据门 → Verifier；
+        - 三个语法族的探针全部干净未命中 → **REJECTED**（真阴性，actor=本 skill）；
+        - 只中一个 / 基线本身含乘积 / 畸形对照也出数 / 请求出错 / 缺 param /
+          POST 表单型候选 → blocked（覆盖不全，**绝不驳回**）。
+
+        探针固定、只 GET、无副作用，每候选 **≤8 次**（1 基线 + 3 语法 × 2 探针 +
+        1 畸形对照，命中即停）。请求构造与判定全是确定性代码（红线 1），唯一
+        LLM 调用是收尾的 Verifier 终审。
         """
+        scope = getattr(self.runner, "scope", None)
+        if scope is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="runner 未挂 scope，ssti 验证缺 scope 防线（fail-closed）",
+            )
+            return "blocked"
+        param = finding.param
+        if not param:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="ssti 候选缺 param，无法构造模板探针（fail-closed，不凭空造 URL）",
+            )
+            return "blocked"
+        if CRAWL_FORM_EVIDENCE_KIND in finding.evidence_kinds:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="POST 表单型候选的 ssti 验证未实现（本轮只覆盖 GET query 参数）",
+            )
+            return "blocked"
+        url = finding.asset
+        decision = check_scope(scope, [url])  # 红线 5：请求任何 URL 前过 scope
+        if not decision.allowed:
+            self.audit.record(
+                "verify_scope_rejected",
+                finding_id=finding.id,
+                violations=decision.violations,
+            )
+            return "blocked"
+
+        # 判据与身份无关：有预置会话就带上（提高可达性），没有也照判
+        session = self._session()
+        secrets = session.secret_values() if session is not None else []
+
+        probes: list = []
+        evidence_paths: list[Path] = []
+
+        # 1. 基线：原样响应必须**不含**这两个乘积（反事实的落脚点）
+        evidence_paths.append(
+            self._ssti_probe(
+                finding,
+                url,
+                label="baseline",
+                kind=SSTI_KIND_BASELINE,
+                syntax=None,
+                session=session,
+                secrets=secrets,
+                probes=probes,
+            )
+        )
+
+        # 2. 逐语法：两个乘积都中即停，并补该语法的**畸形模板对照**
+        hit = None
+        for family in SSTI_SYNTAX_FAMILIES:
+            errored = False
+            for suffix, expression in (("a", family.expr_a), ("b", family.expr_b)):
+                evidence_paths.append(
+                    self._ssti_probe(
+                        finding,
+                        ssti_build_probe_url(url, param, expression),
+                        label=f"{family.label}-expr-{suffix}",
+                        kind=SSTI_KIND_EXPRESSION,
+                        syntax=family.label,
+                        session=session,
+                        secrets=secrets,
+                        probes=probes,
+                    )
+                )
+                if probes[-1].error is not None:
+                    errored = True
+            first, second = probes[-2], probes[-1]
+            if (
+                not errored
+                and SSTI_PRODUCT_A in first.products
+                and SSTI_PRODUCT_B in second.products
+            ):
+                hit = family
+                break
+
+        if hit is not None:
+            evidence_paths.append(
+                self._ssti_probe(
+                    finding,
+                    ssti_build_probe_url(url, param, hit.malformed),
+                    label=f"{hit.label}-malformed",
+                    kind=SSTI_KIND_CONTROL,
+                    syntax=hit.label,
+                    session=session,
+                    secrets=secrets,
+                    probes=probes,
+                )
+            )
+
+        # 3. 差分求值判定（纯函数；判定依据全量落盘供离线复核）
+        judgment = ssti_judge(probes)
+        summary = ssti_summary_for_verifier(
+            judgment, probes, url=url, param=param
+        )
+        j_path = self.evidence_dir / f"ssti_{finding.id}_judgment.json"
+        j_path.write_bytes(
+            redact_bytes(
+                (
+                    json.dumps(
+                        {"finding_id": finding.id, **summary},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+                secrets,
+            )
+        )
         self.audit.record(
-            "verify_blocked",
+            "ssti_judged",
             finding_id=finding.id,
+            verdict=judgment.verdict,
+            syntax=judgment.syntax,
+            products=list(judgment.products),
+            probes=len(probes),
+            budget=SSTI_PROBE_BUDGET,
+        )
+
+        # 4a. 判不了：覆盖不全（不驳回）
+        if not judgment.confirmed and judgment.verdict != SSTI_VERDICT_REJECTED:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=(
+                    "ssti 差分求值未完成（覆盖不全，不驳回）: "
+                    + "；".join(judgment.reasons)
+                ),
+            )
+            return "blocked"
+
+        # 4b. 真阴性：三个语法族全部干净未命中 ⇒ 驳回
+        if judgment.verdict == "rejected":
+            finding.transition(
+                FindingState.REJECTED,
+                actor=skill.name,
+                reason=(
+                    "ssti 差分求值不成立："
+                    + "；".join(judgment.reasons)
+                    + f"（判定依据见 {j_path.name}）"
+                ),
+            )
+            store.append(finding)
+            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+            return "rejected"
+
+        # 4c. 成立：证据入包（具名标签 + 差分求值 method + 四段式）
+        evidence_paths.append(j_path)
+        baseline_probe, expr_probes = probes[0], [
+            p for p in probes if p.kind == SSTI_KIND_EXPRESSION
+        ]
+        control_probe = next(
+            (p for p in probes if p.kind == SSTI_KIND_CONTROL), None
+        )
+        finding.verification = Verification(
+            method=SSTI_CONFIRMED_METHOD,
+            evidence_refs=[str(path) for path in evidence_paths],
+            baseline_diff=(
+                f"基线 {baseline_probe.status}（正文不含 "
+                f"{SSTI_PRODUCT_A}/{SSTI_PRODUCT_B}）；"
+                f"表达式探针 {len(expr_probes)} 次中命中两个不同乘积；"
+                f"畸形模板对照 "
+                f"{'未执行' if control_probe is None else f'{control_probe.status}（不含乘积）'}"
+            ),
+            claim=(
+                f"参数 {param} 的取值被服务端当模板求值"
+                f"（{judgment.engines or judgment.syntax}）"
+            ),
+            expected=(
+                "原样响应不应出现模板表达式算出的乘积：参数只应被回显或转义，"
+                "畸形模板（少一个右括号）也不应算出任何数字"
+            ),
+            actual=(
+                f"探针 {hit.expr_a} / {hit.expr_b} 的响应分别出现 "
+                f"{SSTI_PRODUCT_A} / {SSTI_PRODUCT_B}；"
+                f"畸形模板对照未出现乘积；判定依据见 {j_path.name}"
+            ),
+            reproduction_steps=[
+                f"GET {baseline_probe.url}（基线）→ {baseline_probe.status}，"
+                f"正文不含 {SSTI_PRODUCT_A}/{SSTI_PRODUCT_B}",
+                f"GET {expr_probes[0].url} → 正文出现 {SSTI_PRODUCT_A}",
+                f"GET {expr_probes[1].url} → 正文出现 {SSTI_PRODUCT_B}",
+                f"GET {control_probe.url if control_probe else url}（畸形模板对照）"
+                " → 正文不含乘积（排除「strip 非数字后强算」）",
+            ],
+            verified_by=f"{skill.name}@{skill.manifest.version}",
+            verified_at=_utc_now(),
+        )
+        if SSTI_EVALUATION_EVIDENCE_KIND not in finding.evidence_kinds:
+            finding.evidence_kinds.append(SSTI_EVALUATION_EVIDENCE_KIND)
+        finding.transition(
+            FindingState.REPRODUCED,
+            actor=skill.name,
             reason=(
-                "ssti 判定通道未交付（M22-a 第一步只放开候选，差分求值判定器由 "
-                "M22-b 落地）：fail-closed 记 blocked，不驳回"
+                f"模板求值成立（{judgment.syntax}）：两个不同乘积 "
+                f"{SSTI_PRODUCT_A}/{SSTI_PRODUCT_B} 都被算出，基线干净、"
+                "畸形模板对照未出数"
             ),
         )
-        return "blocked"
+        store.append(finding)
+
+        # 5. 证据门 → Verifier 终审 → 终态迁移（公共收尾）
+        return self._gate_and_review(finding, skill, store, summary=summary)
+
+    def _ssti_probe(
+        self,
+        finding: Finding,
+        url: str,
+        *,
+        label: str,
+        kind: str,
+        syntax: str | None,
+        session,
+        secrets: list[str],
+        probes: list,
+    ) -> Path:
+        """一次 ssti 探针：请求 → 按次审计 → 证据落盘（脱敏）→ 记入 probes。
+
+        返回证据文件路径（进 ``verification.evidence_refs``，可离线调出）。
+        """
+        resp = self._ssti_fetch(url, session)
+        products = ssti_match_products(resp.body)
+        self.audit.record(
+            "ssti_probe_attempt",
+            finding_id=finding.id,
+            label=label,
+            kind=kind,
+            syntax=syntax,
+            status=resp.status,
+            error=resp.error is not None,
+            products=sorted(products),
+        )
+        path = self.evidence_dir / f"ssti_{finding.id}_{label}_response.txt"
+        text = f"GET {url}\nstatus: {resp.status}\n"
+        if resp.error is not None:
+            text += f"error: {resp.error}\n"
+        text += f"\n{resp.body}"
+        path.write_bytes(redact_bytes(text.encode("utf-8"), secrets))
+        probes.append(
+            SstiProbe(
+                label=label,
+                kind=kind,
+                syntax=syntax,
+                url=url,
+                status=resp.status,
+                error=resp.error,
+                products=products,
+            )
+        )
+        return path
 
     def _get_unauth_judge(self):
         """懒建敏感度判定器（测试经 ``unauth_judge_factory`` 注入替身）。
