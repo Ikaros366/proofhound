@@ -153,6 +153,28 @@ def allow_request(request_url: str, page_url: str, scope: Scope) -> bool:
     return scope.check_target(Target(host=host, port=port, is_ip=is_ip)) is None
 
 
+def apply_session(context, session: SessionConfig | None, url: str) -> None:
+    """把预置会话挂进浏览器 context（Cookie 按 origin 绑定；额外请求头全量）。
+
+    M20：从 ``BrowserVerifier._inject_session`` 抽出为模块级函数，供截图器
+    （``proofhound.verify.screenshot``）复用——同一套会话注入语义只写一遍，
+    避免"改一处忘一处"的静默不一致。
+    """
+    if session is None:
+        return
+    if session.cookies:
+        parsed = urlparse(url)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        context.add_cookies(
+            [
+                {"name": k, "value": v, "url": origin}
+                for k, v in session.cookies.items()
+            ]
+        )
+    if session.headers:
+        context.set_extra_http_headers(dict(session.headers))
+
+
 def canary_events(
     raw_events: list | None,
     marker_hit: bool,
@@ -360,20 +382,8 @@ class BrowserVerifier:
     # ---- 内部：会话注入 / 监听器 / 证据落盘 ----
 
     def _inject_session(self, context, url: str) -> None:
-        """把预置会话挂进浏览器 context（Cookie 按 origin 绑定；额外请求头全量）。"""
-        if self._session is None:
-            return
-        if self._session.cookies:
-            parsed = urlparse(url)
-            origin = f"{parsed.scheme}://{parsed.netloc}"
-            context.add_cookies(
-                [
-                    {"name": k, "value": v, "url": origin}
-                    for k, v in self._session.cookies.items()
-                ]
-            )
-        if self._session.headers:
-            context.set_extra_http_headers(dict(self._session.headers))
+        """把预置会话挂进浏览器 context（M20 起委托模块级 :func:`apply_session`）。"""
+        apply_session(context, self._session, url)
 
     def _on_route(self, route, page_url: str, requests: list[dict]) -> None:
         """route 拦截（红线 5）：跨 origin / 越 scope 一律 abort 并记链。"""

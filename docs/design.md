@@ -1678,6 +1678,32 @@ runner 未挂 scope 时记 `request_budget_unavailable` 并 fail-closed。
 整体失效的 `dns_value` 与残留的 `asset_origin` 所属的类型），并带一条自检断言防止它
 空跑。将来能装上 ruff 时，把它替换成 `ruff check --select F` 即可。
 
+### 7.22 证据截图：确认后的视觉证据（M20，2026-10-28）
+
+**定位**：截图是**证据**，不是判定手段。判定链（行为验证 → 证据门 → Verifier）一字未改；
+截图只在 `_gate_and_review` 把 Finding 迁到 CONFIRMED **之后**发生，且失败不改判
+（fail-open）——与所有验证器的 fail-closed 刻意相反：截图缺失不降低「已确认」的证据
+强度，把 Finding 改判反而是**用可用性故障污染结论**。
+
+**接线点（为什么是这里）**：`_gate_and_review` 是所有 verify handler 的公共收尾，
+在这里截图能一次覆盖全部类型；位置必须在 `store.append(finding)` **之前**，否则
+append-only 快照里没有这条 `evidence_refs`（回放时引用丢失）。
+
+**URL 选择**：缺省 `finding.asset`；verify-xss 传 **canary 命中的那个 URL**
+（payload 已内嵌）——比裸 asset 更能说明「这条 Finding 的复现长什么样」。
+
+**授权与隔离**：与 XSS 验证器同一套——导航前 `allow_request` 自检 + `page.route`
+逐请求「同源 ∧ scope」判定，跨源/越界 `abort` 计数进 `screenshot_captured`
+（`blocked_requests`）。截图器不自建 scope 语义，也不接受任何未过 scope 的 URL。
+
+**失败语义与审计**：`screenshot_skipped`（浏览器不可用/超时/越界/超限/非 PNG）与
+`screenshot_captured`（url/file/bytes/sha256/宽高/status/blocked_requests）分开记，
+「没截图」永远能在审计里查到原因，不静默。
+
+**边界（不做的）**：不嵌入 docx（报告层渲染图片未做）；不截交互态（点击/表单提交后）；
+不扩成「任意 URL 截图」的对外能力（没有 CLI/API 入口）；`full_page` 仅保留构造参数，
+缺省关。
+
 ## 8. 开发路线图
 
 

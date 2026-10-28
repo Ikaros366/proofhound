@@ -6,6 +6,36 @@
 
 ## [未发布]
 
+### 新增（M20 证据截图：确认后给 Finding 截一张页面图，进证据包）
+
+**做了什么**：新增 `proofhound/verify/screenshot.py`（first-party 浏览器代码，定位同
+`verify/browser.py`）+ 编排接线。每条 Finding 变 Confirmed 之后、`store.append` 之前，
+用无头 Chromium 给复现页面截一张 1280×800 的 PNG，写进 evidence 目录并追加到
+`verification.evidence_refs`——证据包 `manifest.json` 与报告证据索引自此多一条视觉证据。
+
+- **不参与判定**：截图**不改变任何 Confirmed / Rejected 判定**，它只是补充证据。
+- **opt-in**：`PROOFHOUND_SCREENSHOT=1` 才启用（缺省关）⇒ 默认行为与 M20 之前逐字节等价。
+- **fail-open**：浏览器缺失/超时/越界只记 `screenshot_skipped`，绝不把已确认的 Finding
+  改判或卡住（与各验证器 fail-closed 刻意相反，理由见 README「证据截图」节）。
+- **授权与隔离**：导航前 scope 自检 + `page.route` 按「同源 ∧ scope」拦截全部子请求
+  （跨源 abort 计数进审计）；复用 `apply_session` 注入预置会话（Cookie 按 origin 绑定）。
+- **审计**：`screenshot_captured`（url/file/bytes/sha256/宽高/status/blocked_requests）、
+  `screenshot_skipped`（原因）。
+- **复用而非复制**：`browser.py` 的 `_inject_session` 抽出为模块级 `apply_session`
+  （零行为变更），截图器与 XSS 验证器共用同一套会话注入。
+- **不做**：不嵌入 docx 报告（图片渲染未做）；不截点击/交互后的状态；不扩成「任意 URL
+  截图」的对外能力；`full_page` 只留构造参数、缺省关（防证据目录被超高图撑爆）。
+
+**测试**：新增 `tests/test_screenshot.py` **17** 个（`png_size` 纯函数 6 / capture 全序
+与失败路径 6 / 编排「确认后补截图 + refs + 审计」与释放 5）；**旧测试零改动**。实弹
+`scripts/demo_screenshot.py` **7 条断言全绿**（真 Chromium + 真 ThreadingHTTPServer）：
+PNG 1280×800 / 15,633 B、靶侧收到预置 Cookie、跨源 beacon 被 route abort
+（`blocked_requests=1`）、scope 外 URL 零导航零请求。全量 **1345 passed / 2 skipped**。
+
+**如实边界**：PNG 是二进制，`redact_bytes` 只能处理文本 ⇒ 截图内容**不按值脱敏**
+（与已落盘的 DOM/响应正文同源，证据目录整体按敏感数据对待）；截图失败只从审计可见，
+报告里可能没有图。
+
 M19-a / M19-b / M19-c：一次**只读取证**的独立审计（在 1310 个测试全绿的前提下）
 查出 16 条问题后的修复轮。三条是真缺陷，其余是登记/守护的结构性缺口与文档脱节。
 

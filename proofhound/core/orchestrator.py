@@ -131,6 +131,7 @@ from proofhound.verify.idor_control import (
 )
 from proofhound.verify.prefilter import screen as prefilter_screen
 from proofhound.verify.prefilter import with_query_param as prefilter_with_query_param
+from proofhound.verify.screenshot import ScreenshotCapturer
 from proofhound.verify.ssrf import (
     CALLBACK_PATH_PREFIX,
     NON_LOOPBACK_WARNING,
@@ -535,6 +536,8 @@ class Orchestrator:
         context_policy: ContextPolicy | None = None,
         tool_images: dict | None = None,
         browser_factory=None,
+        screenshot_factory=None,
+        screenshots: bool = False,
         idor_fetch=None,
         ssrf_listener_factory=None,
         ssrf_fetch=None,
@@ -567,6 +570,11 @@ class Orchestrator:
         # _verify_xss 懒建真实 BrowserVerifier 并缓存于 self._browser）
         self.browser_factory = browser_factory
         self._browser = None
+        # M20：证据截图（opt-in，缺省关闭 ⇒ 默认行为与 M20 之前逐字节等价）。
+        # screenshot_factory 是测试注入口子；None 时懒建真实 ScreenshotCapturer。
+        self.screenshots = screenshots
+        self.screenshot_factory = screenshot_factory
+        self._screenshotter = None
         # M8c：verify-idor 的取数注入口子（测试给罐头 fetch；None 时用
         # verify/idor.py 的真实 stdlib fetch）
         self._idor_fetch = idor_fetch if idor_fetch is not None else idor_fetch_default
@@ -1083,6 +1091,7 @@ class Orchestrator:
         finally:
             self._close_browser()  # M8b：phase 收尾释放浏览器（若本 phase 建过）
             self._close_ssrf_listeners()  # M16：回调 listener 同样不常驻
+            self._close_screenshotter()  # M20：截图器同样不常驻
         # M17-b：前置不可满足的类型**聚合记一次**（不是每条一次）——审计里能看出
         # 「这个类型本次根本不可验证」，与「验证过但覆盖不全」区分得开。
         for vuln_type, ids in sorted(unavailable.items()):
@@ -1318,6 +1327,7 @@ class Orchestrator:
         skill,
         store: FindingStore,
         summary: dict | None = None,
+        screenshot_url: str | None = None,
     ) -> str:
         """REPRODUCED 之后的公共收尾（verify-sqli / verify-xss 共用）：
         证据门（§5.4.2）→ Verifier 终审（T2，§5.4.4）→ CONFIRMED/REJECTED。
@@ -1380,6 +1390,12 @@ class Orchestrator:
                 FindingState.REJECTED, actor="verifier", reason=verdict.reason
             )
             outcome = "rejected"
+        # M20：确认后补一张证据截图（opt-in；失败只记 screenshot_skipped，不改判）。
+        # 必须在 store.append 之前追加 evidence_refs，否则落盘快照里没有这条引用。
+        if outcome == "confirmed":
+            shot = self._capture_screenshot(finding, screenshot_url or finding.asset)
+            if shot is not None:
+                finding.verification.evidence_refs.append(str(shot))
         store.append(finding)
         assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
         return outcome
@@ -1545,7 +1561,8 @@ class Orchestrator:
         store.append(finding)
 
         # 6. 证据门 → Verifier 终审 → 终态（与 verify-sqli 同一收尾）
-        return self._gate_and_review(finding, skill, store)
+        # M20：截图取 canary 命中的那个 URL（payload 已内嵌），而不是裸 asset
+        return self._gate_and_review(finding, skill, store, screenshot_url=hit.url)
 
     def _ssrf_listener(self, finding_id: str) -> CallbackListener:
         """懒建并缓存本 finding 的回调 listener（M16）。
@@ -2820,6 +2837,80 @@ class Orchestrator:
             except Exception:
                 pass
             self._browser = None
+
+    # ---- M20：证据截图 ----
+
+    def _get_screenshotter(self):
+        """懒建截图器：首次截图时才启动 Chromium，phase 收尾统一释放。"""
+        if self._screenshotter is not None:
+            return self._screenshotter
+        if self.screenshot_factory is not None:
+            self._screenshotter = self.screenshot_factory()
+            return self._screenshotter
+        scope = getattr(self.runner, "scope", None)
+        if scope is None:
+            raise BrowserUnavailableError(
+                "runner 未挂 scope，截图缺 scope 防线（fail-closed）"
+            )
+        capturer = ScreenshotCapturer(
+            scope=scope,
+            evidence_dir=self.evidence_dir,
+            session=self._session(),
+        )
+        capturer.start()  # 不可用即抛 BrowserUnavailableError
+        self._screenshotter = capturer
+        return capturer
+
+    def _close_screenshotter(self) -> None:
+        """释放 verify phase 建过的截图器（若有）；异常吞咽（不遮蔽主链路）。"""
+        if self._screenshotter is not None:
+            try:
+                self._screenshotter.close()
+            except Exception:
+                pass
+            self._screenshotter = None
+
+    def _capture_screenshot(self, finding: Finding, url: str):
+        """给已确认的 Finding 截一张页面图（M20）；失败只记审计，**不改判**。
+
+        返回 PNG 路径或 None。刻意**不抛异常**：截图是补充证据，浏览器缺失/
+        超时都不该让一条已确认的 Finding 变成 blocked——这与各验证器的
+        fail-closed 语义相反（fail-open），理由与边界写在 README「证据截图」节。
+        """
+        if not self.screenshots:
+            return None
+        try:
+            capturer = self._get_screenshotter()
+            result = capturer.capture(url, name=f"shot_{finding.id}")
+        except Exception as exc:  # 浏览器不可用 / 注入替身异常
+            self.audit.record(
+                "screenshot_skipped",
+                finding_id=finding.id,
+                url=url,
+                reason=f"截图器不可用（fail-open，不阻断确认）: {exc}",
+            )
+            return None
+        if result.error is not None or result.path is None:
+            self.audit.record(
+                "screenshot_skipped",
+                finding_id=finding.id,
+                url=url,
+                reason=result.error or "未产出文件",
+            )
+            return None
+        self.audit.record(
+            "screenshot_captured",
+            finding_id=finding.id,
+            url=url,
+            file=result.path.name,
+            bytes=result.bytes,
+            sha256=result.sha256,
+            width=result.width,
+            height=result.height,
+            status=result.status,
+            blocked_requests=result.blocked_requests,
+        )
+        return result.path
 
     def _run_baseline(
         self, finding: Finding, session: SessionConfig

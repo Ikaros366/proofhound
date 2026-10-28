@@ -953,6 +953,8 @@ def default_phases_factory(rt: EngagementRuntime) -> OrchestratorPhases:
         # 显式开启后：模型 triage 补关键词盲区，廉价粗筛只出建议、不丢候选。
         triage_model=_env_flag("PROOFHOUND_TRIAGE_MODEL"),
         verify_prefilter=_env_flag("PROOFHOUND_VERIFY_PREFILTER"),
+        # M20：证据截图（opt-in；未设即关闭，默认行为与 M20 之前逐字节等价）
+        screenshots=_env_flag("PROOFHOUND_SCREENSHOT"),
     )
     return OrchestratorPhases(orch, registry)
 

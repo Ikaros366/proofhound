@@ -268,6 +268,31 @@ L2 内部区分「只读验证」与「写操作」：只读与否由 skill 在 
 - **沙箱隔离**：每 engagement 独立容器；工具目录只读挂载；网络出口限速 + 白名单（默认 restricted）；CPU/内存配额；**隔离硬化档**（M12，缺省严格）——容器内非 root、rootfs 只读（仅 `/tmp` 为 64m tmpfs 可写）、capability 全部丢弃、禁提权、进程数与 FD 有上限，且**隔离档逐项写入审计**（与执行证据同源可查）；受限环境可用 `PROOFHOUND_SANDBOX_HARDENING=relaxed` 退回旧参数。
 - **append-only 审计**：每条命令、每段输出、每次 LLM 调用、每次状态迁移全部落盘，兼作报告证据链。
 
+## 证据截图（M20）
+
+Finding **确认之后**，系统会用无头 Chromium 给复现页面截一张图，作为**补充证据**
+写进证据包（`shot_<finding_id>.png`，进 `manifest.json` 与报告证据索引）。截图
+**不参与判定**：Confirmed 仍然只由「行为证据 + 证据门 + Verifier」决定。
+
+```bash
+PROOFHOUND_SCREENSHOT=1 .venv/bin/python -m proofhound.api --workspace . --port 8000
+.venv/bin/python scripts/demo_screenshot.py     # 实弹验收（真 Chromium + 真 HTTP 靶）
+```
+
+| 维度 | 行为 |
+|---|---|
+| 触发点 | `_gate_and_review` 确认之后、`store.append` 之前 ⇒ append-only 快照里带这条引用 |
+| 目标 URL | 缺省 `finding.asset`；XSS 取 **canary 命中的那个 URL**（payload 已内嵌） |
+| 授权 | 导航前 scope 自检 + `page.route` 按「同源 ∧ scope」拦截子请求（跨源 abort 计数进审计） |
+| 会话 | 复用 `apply_session`：Cookie 按 origin 绑定、额外请求头全量 ⇒ 截的是登录后页面 |
+| 失败 | **fail-open**：浏览器缺失 / 超时 / 越界只记 `screenshot_skipped`，**不改判**、不阻断确认 |
+| 审计 | `screenshot_captured`（url/file/bytes/sha256/宽高/status/blocked_requests）、`screenshot_skipped`（原因） |
+| 限制 | PNG 不适用按值脱敏；只截静态页面（不截点击后的交互态）；尚未嵌入 docx 报告 |
+
+> ⚠️ **为什么是 fail-open**：各验证器的失败语义是 fail-closed（观察不全就不判），
+> 但截图**不是观察**——它只是补充证据。把一条已确认的 Finding 因为"没截到图"改判，
+> 等于用可用性故障污染结论；代价是"报告里没有图"只能从 `screenshot_skipped` 审计看出。
+
 ## 路线图与已知限制
 
 > **状态**：本地工作树干净，`HEAD` 与 `origin/master` 同到 `c8a0176`（`v0.4.0` 已打标签）。后续改动是否发布、是否打新标签由维护者裁决。
