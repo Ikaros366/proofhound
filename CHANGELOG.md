@@ -22,6 +22,33 @@ M19-a / M19-b / M19-c / M19-d / M20 / M20-b / M20-b 修补。
 > `pyproject.toml`、`proofhound/__init__.py`、`api/server.py`、`/api/health`
 > 的测试锁定。
 
+### 新增（M21-a 登录重放暴破探测：原始请求 + OCR + 25 次重放）
+
+**做了什么**：新增一条**手工入口**的探测能力——把 Burp/Yakit 抓到的登录请求原文喂进来，
+判断它能不能被简单重放。三个新模块：
+
+- `verify/raw_request.py`：原始请求解析（请求行/Host/headers/body）+ 表单字段替换
+  （缺字段、非 urlencoded **fail-closed**，不凭空追加字段）；
+- `verify/captcha_ocr.py`：`ddddocr` 懒导入的图形验证码识别（可选依赖，
+  `pip install -e ".[ocr]"`；未装即 `blocked`）；
+- `verify/login_probe.py`：带 Cookie 的会话（可从抓包 Cookie 播种）+ 校准 + OCR 重试
+  + 25 次重放 + 三态判定，全部确定性代码、零 LLM。
+
+**判定**：先校准两个失败指纹（故意错码 = 验证码错误；正确码 + 错密码 = 凭证错误）→
+复用同一验证码连打 25 次 → 全凭证错误且无 429/锁定 = `confirmed`；出现验证码错误或
+锁定 = `rejected`；OCR 失败、两态不可区分、未知响应 = `blocked`。**OCR 失败绝不判
+rejected**（否则等于把"认不出"当成"有防护"）。
+
+**CLI**：`python -m proofhound.loginprobe --request login.txt --scope scopes/lab.yaml
+--user admin --captcha-field code --attempts 25`（退出码 0/1/2；证据 JSON 落 `--out`）。
+
+**测试**：新增 `tests/test_login_probe.py` **15** 个；实弹 `scripts/demo_login_replay.py`
+**5/5 通过**（真 OCR + 真 HTTP：验证码可复用→confirmed、一次性→rejected、统一文案→blocked、
+固定短信码→confirmed、随机短信码→rejected）。全量 **1373 passed / 2 skipped**。
+
+**未做（如实记录）**：未注册进 `VULN_REGISTRY`（因此还不参与报告/证据门/覆盖截图）；
+不支持 CSRF 轮换、JSON/multipart 登录；短信只试固定码，不做真暴破。
+
 ### 变更（M20-b 修补：xss 覆盖探针改为可见标记）
 
 原探针 `<script>window.__ph_shot=1</script>` 只改 JS 变量、**不改变渲染** ⇒ 截图上与

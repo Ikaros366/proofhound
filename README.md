@@ -319,6 +319,37 @@ PROOFHOUND_SCREENSHOT=1 .venv/bin/python -m proofhound.api --workspace . --port 
 - **加类型**：必须在 `COVERAGE_SHOTS` 里登记镜头——`tests/test_coverage_shots.py`
   用 `VULN_REGISTRY` 双向锁定（注册了没镜头表、或有镜头表没注册，测试即红）。
 
+## 登录重放暴破探测（M21-a）
+
+判断一条**抓到的登录请求**能不能被简单重放（Burp 连点 25 次）——判的不是"密码能否
+猜中"，而是"验证码能不能复用、有没有锁定"。输入是原始 HTTP 请求，输出是三态结论 +
+逐次尝试的证据 JSON。
+
+```bash
+pip install -e ".[ocr]"      # 图形验证码识别（可选；未装则结论为 blocked）
+python -m proofhound.loginprobe \
+    --request login.txt --scope scopes/lab.yaml \
+    --user admin --captcha-field code --attempts 25
+```
+
+判定链路（纯确定性代码，零 LLM）：
+
+1. GET 登录页 → 找验证码图片 → OCR 识别（认错就**换一张重试 ≤3 次**）；
+2. 校准两个失败指纹：故意发错码（验证码错误）与正确码 + 错密码（凭证错误）；
+3. 复用**同一张**验证码连打 25 次：中途出现验证码错误 ⇒ 一次性生效 ⇒ `rejected`；
+   25 次全是凭证错误且无 429/锁定 ⇒ `confirmed`；
+4. 两种失败态不可区分 ⇒ `blocked`（宁可判不了，也不猜）。
+
+| 结论 | 含义 |
+|---|---|
+| `confirmed` | 验证码可复用 + 25 次内无锁定 ⇒ 可简单重放暴破 |
+| `rejected` | 验证码一次性生效 / 出现频率限制 / 固定短信码不成立 |
+| `blocked` | OCR 失败、两种失败态不可区分、响应无法归类（原因写进证据） |
+
+边界：只支持 `application/x-www-form-urlencoded`；CSRF 每请求轮换的站点会 `blocked`；
+25 次是上限可配的启发式（≤50）；短信分支只试 4 个固定码，结论是"是否存在固定码"，
+**不是**"短信验证码不可暴破"。
+
 ## 路线图与已知限制
 
 > **状态**：`HEAD` 与 `origin/master` 同步（`v0.5.0` 已打标签）。后续改动是否发布、是否打新标签由维护者裁决。
