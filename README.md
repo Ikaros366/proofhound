@@ -219,7 +219,7 @@ tools.d/dirsearch/
 > 改动内置 skill 即改动仓库文件（走正常代码评审）。配套的导入安全闸与上传/编辑端点
 > 因此一并移除——没有外来脚本可扫。
 
-内置 skill 十个，各自由 `SKILL.md`（YAML frontmatter + 正文 SOP）声明：
+内置 skill 十一个，各自由 `SKILL.md`（YAML frontmatter + 正文 SOP）声明：
 
 | skill | 风险级 | 是否改变目标状态 | 作用 |
 |---|---|---|---|
@@ -231,6 +231,7 @@ tools.d/dirsearch/
 | `verify-ssrf` | L2 | **否（只读）** | 带外回调确认：宿主 listener 收到回调才算（M16） |
 | `verify-unauth` | L2 | **否（只读）** | 匿名/已认证**响应等价**确认 + 独立敏感度判定器（判定器不产证据，M16-c） |
 | `verify-cmdi` | L2 | **否（只读）** | 带外回调确认 + DNS 非命中防伪（M18） |
+| `verify-ssti` | L2 | **否（只读）** | 模板注入差分求值（基线 + 两个乘积 + 畸形对照，M22-b） |
 | `verify-error-disclosure` | L2 | **否（只读）** | 畸形请求错误页差分（≥2 类标记；版本头不算证据，M23） |
 | `web-dirsearch` | L1 | 是 | dirsearch 字典爆路径（请求量受 scope 预算约束；**opt-in**，M19-c） |
 
@@ -251,7 +252,7 @@ semi_auto 下可以自动执行——新增内置 skill 必须在表内登记，
 | L2 利用验证（写操作） | 需确认 | 需确认 | 自动 |
 | L2 只读验证（M9c③ 人工闸细分） | 需确认 | **自动** | 自动 |
 
-L2 内部区分「只读验证」与「写操作」：只读与否由 skill 在 `SKILL.md` 用 `mutating` 声明（**缺省 `true` = fail-closed**，未声明即按写操作对待）；内置六个 `verify-*`（sqli / xss / idor / ssrf / unauth / cmdi）全部声明为只读；`web-scan` / `recon-crawl` / `web-dirsearch` 声明为写操作。细分级**不放宽最严格档**（supervised 一律需确认）。
+L2 内部区分「只读验证」与「写操作」：只读与否由 skill 在 `SKILL.md` 用 `mutating` 声明（**缺省 `true` = fail-closed**，未声明即按写操作对待）；内置八个 `verify-*`（sqli / xss / idor / ssrf / unauth / cmdi / ssti / error-disclosure）全部声明为只读；`web-scan` / `recon-crawl` / `web-dirsearch` 声明为写操作。细分级**不放宽最严格档**（supervised 一律需确认）。
 
 未知风险级 fail-closed（一律禁止）。模式切换收紧自由、放宽须显式 operator 确认并记 `autonomy_mode_changed` 审计；确认请求超时默认拒绝。**任何模式下 scope 校验、预算硬闸、凭据脱敏、append-only 审计都不可旁路。**
 
