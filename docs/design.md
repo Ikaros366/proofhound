@@ -219,6 +219,7 @@ Signal ──(triage 通过)──> Hypothesis ──(PoC 复现)──> Reprodu
 | 版本型 CVE | 非破坏性 payload 行为验证；无法安全验证的标"疑似未验证"进附录 |
 | 越权/IDOR | 双角色对照：A 凭证访问 B 资源，响应对比证明越权 |
 | 暴露面板/敏感路径 | baseline 对照后仍存在可归因内容差异 |
+| 服务器报错信息泄露 | 同一 host 基线干净，且畸形请求返回 4xx/5xx 的响应正文命中 **≥2 类**技术披露标记（堆栈/异常/中间件版本/源码路径）；版本头不算证据 |
 
 > **M3b 落地注记**（2026-08-07）：证据门实现于 `proofhound/verify/gate.py`——每 `vuln_type` 在 `GATE_MATRIX` 声明 `verification.method` 白名单与行为类 `evidence_kinds` 标签要求（当前仅落 sqli：method ∈ {sqlmap-confirmed, boolean-diff, time-blind-diff} 且含 `behavioral` 标签）；`check(finding) -> GateResult{passed, missing}` 产出缺项清单，未知 `vuln_type` fail-closed。编排层（`run_verify_phase`）在 `transition(CONFIRMED)` 前必过本门，与 M3a 状态机铁律构成**双层防守**；门不过记审计 `verify_gate_failed`，Finding 停于 Reproduced。XSS/LFI 等其余类型随对应 verify-* skill 扩展矩阵项。
 >
@@ -1870,6 +1871,64 @@ RCE"的保守读数——正是 M6b「按证据定指标、不按类型套模板
 **本里程碑明确不做**：`--live` 重跑 Confirmed 级基线（历史表仍是 22 端点口径）；
 `${ }` / `<%= %>` 的真靶验证；盲注型 SSTI；POST/JSON body 型候选；模板指纹识别与
 可用 RCE 载荷（探针只有一个乘法表达式）。
+
+### 7.27 服务器报错信息泄露：畸形请求的差分判定（M23，2026-10-28）
+
+**类型定位**：`vuln_type=error-disclosure`、method `error-trace-confirmed`、具名证据
+标签 `error-trace`（同 `unauth-response-equivalence` / `template-evaluation` 先例：
+让"这条 Confirmed 靠错误页里的技术细节"在证据层可分辨）、`requires_session=False`、
+只读、**不进**模型白名单（窄形态无需语义判断）。
+
+**为什么必须是差分**：单个错误页"看起来像堆栈"是观感，不是事实——站点可能本来
+就在页面上贴示例。判据是同一个 host、只改请求形态：正常 GET 正文**零标记**，
+畸形请求 4xx/5xx 且正文命中 **≥2 类**标记。七类标记：Java 堆栈 / PHP 错误 /
+Python 异常 / .NET 异常 / Node 堆栈 / 中间件版本 / **源码绝对路径 + 行号**
+（第 7 类是维护者 2026-10-28 裁定新增：PHP 的 `Fatal error:` 与 `#0 /...` 同属
+一类，只保留六类会让交接单 §7 的 php-like 靶只命中一类而被判 blocked）。
+
+**为什么必须自己发 socket**：urllib / httpx / requests 会在客户端拒绝或规范化非法
+请求行（`…` 的 E2 80 A6、`%zz`、控制字符、`HTTP/9.9`），探针根本到不了服务器。
+`verify/raw_http.py` 只做一件事：把调用方给的字节写进 socket，再按 `\r\n\r\n`
+切开；响应体只留前 256KB；TLS 用系统信任库校验证书，**刻意不提供**"不校验"开关
+（给测试靶开的口子会被顺手用到真靶）。
+
+**五条探针**（每 host ≤1 基线 + ≤5 探针，命中即停）：U+2026 路径 / `%zz` /
+`HTTP/9.9` / `G\x01ET` / 8KB 超长 URI。禁用请求走私（CL+TE 冲突）、header 洪泛、
+Host 注入。**不发任何凭据**（判据与身份无关）。
+
+**判定优先级**：
+
+```
+基线失败 / 基线本身命中标记              → blocked（反事实不可测）
+某条畸形请求 4xx/5xx 且命中 ≥2 类       → confirmed
+某条畸形请求 4xx/5xx 但只命中 1 类      → blocked
+畸形请求没能完成（重置/超时/不可解析）  → blocked
+全部有响应、零标记、至少一条 4xx/5xx    → rejected（通用错误页/WAF 页）
+畸形请求未被拒绝（全 2xx/3xx）          → blocked（没触发错误路径）
+```
+
+**版本头不算证据**（维护者裁定）：`Server: nginx/1.25` 几乎所有站点都有，算进结论
+= 100% 误报。故只记 `server_header_disclosed` 审计与判定 JSON 字段；演示靶里
+generic 明明带 `nginx/1.25.3` 仍判 rejected，就是这条的实测。
+
+**host 级粒度**：候选由 `web-probe` 信号按 **origin**（`scheme://host[:port]`）派生，
+同 host 多条 URL 合成一条 Finding（`_TriageCandidate.asset` 覆盖 + dedup 用 origin）；
+独立上限 `_TRIAGE_ERROR_DISCLOSURE_CAP=10`。中间件错误页是 host 级现象，按端点去重
+只会重复测同一层。
+
+**证据形态**：逐探针一文件（状态行 + `Server` + `Content-Type` + 标记类别 + 正文前
+256KB，经 `redact_bytes`）+ 判定 JSON；**原始畸形请求字节不进证据**（含控制字符），
+只记转义 repr 与 sha256。审计：`error_disclosure_probe_attempt` 按次、
+`error_disclosure_judged` 终审、`server_header_disclosed` 版本头。
+
+**实弹验收**：`scripts/demo_error_disclosure.py` 起五个**裸 socket** 本地靶
+（tomcat-like / php-like / generic / waf / noisy-baseline），零 seed 走
+`run_triage_phase` + `run_verify_phase`，断言五态与预算（confirmed 2 次、
+rejected 6 次、基线污染 1 次），并由靶侧记录坐实 `E2 80 A6` 真的到达服务器。
+
+**边界**：形态仿真（堆栈是罐头，非真 Tomcat/PHP）；只探 HTTP 层；自签名 TLS 靶
+blocked；代理/WAF 拦截时会在判定 JSON 与 blocked 原因里记录"响应来自哪一层"；
+错误页截图不做（浏览器无法导航到畸形请求的响应），覆盖截图只留基线页。
 
 ## 8. 开发路线图
 

@@ -638,6 +638,7 @@ class OrchestratorPhases:
         verify_unauth_skill: str = "verify-unauth",
         verify_cmdi_skill: str = "verify-cmdi",
         verify_ssti_skill: str = "verify-ssti",
+        verify_error_disclosure_skill: str = "verify-error-disclosure",
     ):
         self._orch = orchestrator
         self.scan_skill = scan_skill
@@ -822,6 +823,28 @@ class OrchestratorPhases:
                 (
                     verify_ssti_skill,
                     _builtin_risk_level(verify_ssti_skill, ssti.manifest.risk_level),
+                )
+            )
+        # M23：第八 verify skill 槽位（报错信息泄露差分验证是增强项，缺失不阻塞
+        # 主链路）。与其余七个槽位同纪律：未注册/未启用记 verify_skill_skipped。
+        # ⚠️ 限制 59 的教训（M16-c 漏槽位 ⇒ 功能在生产栈里永不触发）：加类型
+        # 时**必须**同时补槽位，守护测试会盯着这一处。
+        error_disclosure = registry.get(verify_error_disclosure_skill)
+        if error_disclosure is None or not error_disclosure.enabled:
+            reason = "skill 未注册" if error_disclosure is None else "skill 未启用"
+            orchestrator.audit.record(
+                "verify_skill_skipped",
+                skill=verify_error_disclosure_skill,
+                reason=f"{reason}，跳过报错信息泄露验证",
+            )
+        else:
+            self.verify_skills.append(
+                (
+                    verify_error_disclosure_skill,
+                    _builtin_risk_level(
+                        verify_error_disclosure_skill,
+                        error_disclosure.manifest.risk_level,
+                    ),
                 )
             )
 

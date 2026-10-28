@@ -38,7 +38,7 @@
 
 | 维度 | ProofHound | 传统扫描器 |
 |---|---|---|
-| 漏洞类型覆盖 | 少而精：**6 类可确认漏洞**（SQL 注入 / XSS / IDOR / SSRF / 未授权暴露 / 命令注入）+ **第 7 类 SSTI（模板注入）用差分求值确认**（M22-b）+ **1 个手工探测**（登录重放，M21-a）；只做能行为确认的 | 数千条特征签名，广而浅 |
+| 漏洞类型覆盖 | 少而精：**7 类可确认漏洞**（SQL 注入 / XSS / IDOR / SSRF / 未授权暴露 / 命令注入 / SSTI）+ **第 8 类服务器报错信息泄露用畸形请求差分确认**（M23）+ **1 个手工探测**（登录重放，M21-a）；只做能行为确认的 | 数千条特征签名，广而浅 |
 | 输出语义 | Confirmed 即铁证：行为验证 + 证据链 + Verifier 终审 + CVSS 代码算分 | Potential 待人工，误报率自担 |
 | 发现面 | Web 应用层（katana 爬行带参端点 + POST 表单页 + **JS 文件内端点**，M16-a） | 主机/端口/服务/全协议 |
 | 误报治理 | 多道闸：triage 启发式宁漏勿滥 → 行为验证 → 证据门 → Verifier 对抗校验 | 主要靠特征精度 |
@@ -219,7 +219,7 @@ tools.d/dirsearch/
 > 改动内置 skill 即改动仓库文件（走正常代码评审）。配套的导入安全闸与上传/编辑端点
 > 因此一并移除——没有外来脚本可扫。
 
-内置 skill 九个，各自由 `SKILL.md`（YAML frontmatter + 正文 SOP）声明：
+内置 skill 十个，各自由 `SKILL.md`（YAML frontmatter + 正文 SOP）声明：
 
 | skill | 风险级 | 是否改变目标状态 | 作用 |
 |---|---|---|---|
@@ -231,6 +231,7 @@ tools.d/dirsearch/
 | `verify-ssrf` | L2 | **否（只读）** | 带外回调确认：宿主 listener 收到回调才算（M16） |
 | `verify-unauth` | L2 | **否（只读）** | 匿名/已认证**响应等价**确认 + 独立敏感度判定器（判定器不产证据，M16-c） |
 | `verify-cmdi` | L2 | **否（只读）** | 带外回调确认 + DNS 非命中防伪（M18） |
+| `verify-error-disclosure` | L2 | **否（只读）** | 畸形请求错误页差分（≥2 类标记；版本头不算证据，M23） |
 | `web-dirsearch` | L1 | 是 | dirsearch 字典爆路径（请求量受 scope 预算约束；**opt-in**，M19-c） |
 
 **风险画像以代码为准**：`proofhound/skills/profiles.py` 的 `SKILL_PROFILES` 是
@@ -313,6 +314,7 @@ PROOFHOUND_SCREENSHOT=1 .venv/bin/python -m proofhound.api --workspace . --port 
 | `unauth-exposure` | `anonymous`（不带凭据）+ `authenticated` | 判据本身就是两视图对照 |
 | `cmdi` | `baseline` | 端点形态 |
 | `ssti` | `baseline` + `probe`（参数换成 `{{191*191}}`） | 被求值时图上直接是 **36481**；回显型则原样看到 `{{191*191}}`——一张图分辨「测过 + 算没算」 |
+| `error-disclosure` | `baseline` | 错误页是**畸形请求**的响应，浏览器无法导航到它；披露证据是错误页正文（进证据文件），截图只证明端点被真的测过 |
 
 - **上限**：每类型最多 5 条候选、单 phase 最多 24 张（`CAP_PER_TYPE` / `CAP_TOTAL`），
   超限记 `coverage_shot_capped`（资源调度，不是判定；被裁掉的候选仍照常验证）。
@@ -344,6 +346,31 @@ PROOFHOUND_SCREENSHOT=1 .venv/bin/python -m proofhound.api --workspace . --port 
 - **边界**：不覆盖盲注型（求值结果不回显）、只覆盖 GET query 参数、真引擎只验证过
   `{{ }}` 一族（本机无 Java/Ruby 引擎，`${ }` / `<%= %>` 只有纯函数单测）；
   探针不投递任何可用 RCE 载荷（只有一个乘法表达式）。
+
+## 服务器报错信息泄露验证（M23）
+
+把**畸形请求**发给同一 host：正常 GET 干净、畸形请求返回 4xx/5xx 且正文命中
+**≥2 类**技术披露标记，才算 Confirmed。判据是**差分**，不是「错误页看起来像堆栈」：
+
+```bash
+.venv/bin/python scripts/demo_error_disclosure.py            # 实弹五态（五个本地裸 TCP 靶 + 真实 T2）
+.venv/bin/python scripts/demo_error_disclosure.py --canned   # 罐头 T2 裁定（离线/省费用）
+```
+
+| 结论 | 判据 |
+|---|---|
+| `confirmed` | 基线正文零标记 ∧ 某条畸形请求 4xx/5xx ∧ 正文命中 ≥2 类标记（Java/PHP/Python/.NET/Node 堆栈、中间件版本、源码路径） |
+| `rejected` | 畸形请求全部有响应、零标记、至少一条 4xx/5xx（通用错误页 / WAF 页） |
+| `blocked` | 基线本身带标记 · 只命中 1 类 · 连接重置/超时 · 畸形请求未被拒绝（全 2xx/3xx） |
+
+- **探针 ≤5 条**：`…`（E2 80 A6）/ `%zz` / `HTTP/9.9` / `G\x01ET` / 8KB 超长 URI，
+  每 host 另加 1 次基线；命中即停；
+- **必须裸 TCP**：urllib/httpx 在客户端就会拒绝或规范化非法请求行，探针发不出去
+  （`proofhound/verify/raw_http.py`）；
+- **版本头不是证据**：`Server: nginx/1.25` 只记 `server_header_disclosed` 审计——
+  演示里的 generic 靶带版本头仍判 rejected；
+- **边界**：只探 HTTP 层、不发送任何凭据、TLS 校验证书（自签名靶 blocked）、
+  实弹靶是形态仿真（罐头堆栈，非真 Tomcat/PHP）。
 
 ## 登录重放暴破探测（M21-a）
 

@@ -43,6 +43,10 @@ from dataclasses import dataclass, field
 
 from proofhound.findings.finding import Finding
 from proofhound.verify.cmdi import CMDI_CONFIRMED_METHOD
+from proofhound.verify.error_disclosure import (
+    ERROR_DISCLOSURE_CONFIRMED_METHOD,
+    ERROR_TRACE_EVIDENCE_KIND,
+)
 from proofhound.verify.ssrf import SSRF_CONFIRMED_METHOD
 from proofhound.verify.ssti import (
     SSTI_CONFIRMED_METHOD,
@@ -200,6 +204,22 @@ VULN_REGISTRY: dict[str, VulnSpec] = {
         # **不需要预置会话**：判据是「服务端把参数当模板求值」，与身份无关。
         requires_session=False,
         note="M22：差分求值（两个不同乘积 + 基线/畸形对照）；不做盲注与模板指纹",
+    ),
+    "error-disclosure": VulnSpec(
+        vuln_type="error-disclosure",
+        # M23：唯一认可确认手段 = **畸形请求触发的错误页里命中 ≥2 类技术披露
+        # 标记**（基线干净、可归因）。版本头（`Server: nginx/1.x`）**不是**
+        # 证据——几乎所有站点都有，算进结论会 100% 误报（维护者 2026-10-28
+        # 裁定）。
+        methods=frozenset({ERROR_DISCLOSURE_CONFIRMED_METHOD}),
+        behavioral_kinds=frozenset({ERROR_TRACE_EVIDENCE_KIND}),
+        verify_skill="verify-error-disclosure",
+        # 由**确定性规则表**从 web-probe 信号按 host 派生（中间件错误页是
+        # host 级现象，无需语义判断），故刻意**不进**模型白名单。
+        in_model_whitelist=False,
+        # 判据与身份无关：基线与畸形请求都不带任何凭据
+        requires_session=False,
+        note="M23：畸形请求错误页差分（≥2 类标记）；版本头只记审计，不算证据",
     ),
 }
 

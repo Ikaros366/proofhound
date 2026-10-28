@@ -93,13 +93,21 @@ def test_evidence_and_judgement_fields_are_separated():
 
 
 def test_maps_to_web_exposure_through_existing_channel():
-    """走 M3a 起就有的 web-probe → web-exposure 映射（零 triage 改动）。"""
+    """走 M3a 起就有的 web-probe → web-exposure 映射（零 triage 改动）。
+
+    M23 披露：web-probe 现在**同产** host 级 error-disclosure 候选（每个信号一条，
+    到 triage 落盘时按 origin 去重），故本用例把断言收窄到 web-exposure 通道本身。
+    """
     signals, _ = _parse(REAL_SHAPE)
     candidates = [c for s in signals for c in _triage_candidates(s)]
-    assert len(candidates) == 2
-    assert {c.vuln_type for c in candidates} == {"web-exposure"}
-    assert {c.source for c in candidates} == {"web_probe"}
-    assert {c.evidence_kind for c in candidates} == {"status-code"}
+    web = [c for c in candidates if c.vuln_type == "web-exposure"]
+    assert len(web) == 2
+    assert {c.vuln_type for c in candidates} == {
+        "web-exposure",
+        "error-disclosure",
+    }
+    assert {c.source for c in web} == {"web_probe"}
+    assert {c.evidence_kind for c in web} == {"status-code"}
 
 
 def test_status_outside_exposed_set_stays_signal_without_candidate():

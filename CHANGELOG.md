@@ -6,6 +6,52 @@
 
 ## [未发布]
 
+### 新增（M23 第 8 类可确认漏洞：服务器报错信息泄露 · 畸形请求差分判定）
+
+**做了什么**：新增 `vuln_type=error-disclosure`——把**畸形请求**发给同一 host，
+正常 GET 干净、畸形请求返回 4xx/5xx 且正文命中 **≥2 类**技术披露标记，才算
+Confirmed。判据是**差分**，不是「错误页看起来像堆栈」。
+
+- **`proofhound/verify/raw_http.py`**：裸 TCP 发送器。`send_raw(host, port, payload,
+  *, tls, timeout)` 把调用方给的字节**原样**写进 socket（urllib/httpx 会在客户端
+  拒绝或规范化非法请求行，探针根本发不出去），按 `\r\n\r\n` 切响应头，正文只留
+  前 256KB；错误归类为 `connect` / `timeout` / `tls` / `reset` / `empty-response` /
+  `protocol`，让 blocked 可归因。TLS 用系统信任库**校验证书**，刻意不提供关闭开关；
+- **`proofhound/verify/error_disclosure.py`**：七类标记（Java 堆栈 / PHP 错误 /
+  Python 异常 / .NET 异常 / Node 堆栈 / 中间件版本 / **源码绝对路径 + 行号**，
+  第 7 类是维护者裁定新增）、五条畸形探针（`…` E2 80 A6 / `%zz` / `HTTP/9.9` /
+  `G\x01ET` / 8KB 超长 URI）、`judge` 三态、`server_header_disclosed`（版本头只记
+  审计）、`summary_for_verifier`（只给枚举/计数/类名/转义请求摘要，响应体一行不进）；
+- **登记与接线**：`VULN_REGISTRY` 加 `error-disclosure`（method
+  `error-trace-confirmed`、具名证据标签 `error-trace`、`requires_session=False`、
+  不进模型白名单）；`skills/verify-error-disclosure/SKILL.md`（L2、只读）+
+  `profiles.py`；`orchestrator._verify_error_disclosure` 真实现 + `_verify_handlers`；
+  API 生产栈第 8 槽位；`COVERAGE_SHOTS` 加 `baseline` 镜头；
+- **生产者**：`web-probe` 信号按 **origin** 派生（`_TriageCandidate.asset` 覆盖 +
+  dedup 用 origin），同 host 多条 URL 合成一条 Finding，独立上限 10；
+- **证据**：逐探针一文件（状态行/`Server`/标记类别/正文前 256KB，经 `redact_bytes`）
+  + 判定 JSON；**原始畸形请求字节不进证据**（含控制字符），只记 repr 与 sha256；
+  审计 `error_disclosure_probe_attempt` / `error_disclosure_judged` /
+  `server_header_disclosed`。
+
+**实弹验收**：`scripts/demo_error_disclosure.py` 起五个**裸 socket** 本地靶，
+零 seed 走 `run_triage_phase` + `run_verify_phase`，五态各一：tomcat-like /
+php-like **CONFIRMED**（后者靠 PHP 错误 + 源码路径两类），generic（带 nginx
+版本头）/ waf **REJECTED**，noisy-baseline **blocked**（基线自带示例堆栈）。
+靶侧记录坐实 `E2 80 A6` 真的到达服务器；预算实测 confirmed 2 次、rejected 6 次、
+基线污染 1 次。
+
+**测试**：新增 `tests/test_raw_http.py` 13 个 + `tests/test_error_disclosure.py`
+44 个；全量 **1473 passed / 4 skipped / 1 xfailed**。**旧测试改动 4 处**（均为
+「web-probe 同产第二类候选」与 handler 集合扩容，断言意图不变）：`test_triage.py`
+3 个（created/merged/快照行数/合并事件改为按类型计数）、`test_dirsearch_parser.py`
+1 个（断言收窄到 web-exposure 通道）；另有 `test_ssrf.py` handler 集合加第 8 项、
+`test_vuln_registry.py` 落点清单 + `verify-[a-z-]+` 正则放宽（skill 名可含两个连字符）。
+
+**边界**：形态仿真（堆栈是罐头，非真 Tomcat/PHP）；只探 HTTP 层；自签名 TLS 靶
+blocked；代理/WAF 拦截时归因到网关页（`rejected`），不区分目标自答与网关代答；
+错误页截图不做（覆盖截图只留基线页）。
+
 ### 新增（M22-b 第 7 类可确认漏洞：SSTI 模板注入 · 差分求值判定通道）
 
 **做了什么**：把 M22-a 的 `_verify_ssti` fail-closed 桩换成**真实现**，并交付

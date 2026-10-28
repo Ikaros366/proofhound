@@ -85,7 +85,14 @@ def test_triage_maps_merges_and_keeps_signals(env):
     orch.run_triage_phase()
 
     store = FindingStore(evidence_dir / "findings.jsonl")
-    findings = store.load_all()
+    all_findings = store.load_all()
+    # M23 披露：web-probe 现在**同产** host 级 error-disclosure 候选（asset=origin）
+    # ⇒ 两条 200 各产两类、各自合并一次。本用例的断言对象仍是 web-exposure 通道。
+    assert {f.vuln_type for f in all_findings} == {
+        "web-exposure",
+        "error-disclosure",
+    }
+    findings = [f for f in all_findings if f.vuln_type == "web-exposure"]
     assert len(findings) == 1  # 两条 200 合并为一条
     finding = findings[0]
     assert finding.state is FindingState.HYPOTHESIS
@@ -96,24 +103,24 @@ def test_triage_maps_merges_and_keeps_signals(env):
     assert len(finding.source_signal_refs) == 2  # 合并两条证据引用
     assert all(ref.endswith(("#L1", "#L2")) for ref in finding.source_signal_refs)
 
-    # findings.jsonl 快照追加：建行 + 合并行
+    # findings.jsonl 快照追加：两类各「建 + 并」一行
     lines = store.path.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 2
+    assert len(lines) == 4
 
     # 审计链
     events = audit.read_all()
     state_events = [e for e in events if e["event"] == "finding_state"]
-    assert len(state_events) == 1
-    assert state_events[0]["from"] == "signal"
-    assert state_events[0]["to"] == "hypothesis"
-    assert state_events[0]["actor"] == "triage"
+    assert len(state_events) == 2  # 两条 Finding 各一次 signal→hypothesis
+    assert {e["from"] for e in state_events} == {"signal"}
+    assert {e["to"] for e in state_events} == {"hypothesis"}
+    assert {e["actor"] for e in state_events} == {"triage"}
     dedup_events = [e for e in events if e["event"] == "finding_deduplicated"]
-    assert len(dedup_events) == 1
-    assert dedup_events[0]["finding_id"] == finding.id
+    assert len(dedup_events) == 2  # 两类各并一次
+    assert finding.id in {e["finding_id"] for e in dedup_events}
     summary = [e for e in events if e["event"] == "triage_completed"]
     assert summary[0]["signals"] == 3
-    assert summary[0]["created"] == 1
-    assert summary[0]["merged"] == 1
+    assert summary[0]["created"] == 2  # web-exposure + error-disclosure
+    assert summary[0]["merged"] == 2
     assert summary[0]["kept_signal"] == 1  # 404 保持 Signal
 
     # 证据包就位：manifest 两项、含 sha256
@@ -155,9 +162,9 @@ def test_triage_rerun_is_idempotent(env):
     orch.run_triage_phase()  # 重复跑：证据已归并，不再产生变更
 
     store = FindingStore(evidence_dir / "findings.jsonl")
-    assert len(store.load_all()) == 1
+    assert len(store.load_all()) == 2  # M23 起 web-probe 同产两类
     lines = store.path.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 2  # 仍是首轮的建+并两行
+    assert len(lines) == 4  # 仍是首轮的建+并四行（两类各两行）
     summaries = [e for e in audit.read_all() if e["event"] == "triage_completed"]
     assert summaries[1]["created"] == 0
     assert summaries[1]["merged"] == 0
@@ -174,8 +181,13 @@ def test_triage_rejected_finding_does_not_absorb(env):
 
     orch.run_triage_phase()  # 同资产 Signal 仍在盘上
     all_findings = store.load_all()
-    assert len(all_findings) == 2
+    # M23 披露：另一类（error-disclosure）不计入本用例；断言对象仍是
+    # 「已 Rejected 的同指纹 web-exposure 不被吸收」。
+    web = [f for f in all_findings if f.vuln_type == "web-exposure"]
+    assert len(web) == 2
+    assert {f.state for f in web} == {
+        FindingState.REJECTED,
+        FindingState.HYPOTHESIS,
+    }
     states = {f.id: f.state for f in all_findings}
     assert states[first.id] is FindingState.REJECTED
-    new_id = next(i for i in states if i != first.id)
-    assert states[new_id] is FindingState.HYPOTHESIS

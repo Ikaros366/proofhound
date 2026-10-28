@@ -701,13 +701,15 @@ def test_listeners_are_released_after_phase(env, listener):
 
 
 def test_verify_handlers_cover_ssrf_and_stay_disjoint():
-    """七类漏洞的 method 白名单与 verify skill 覆盖面**互不染指**。
+    """八类漏洞的 method 白名单与 verify skill 覆盖面**互不染指**。
 
     M16-c 披露：本用例的期望集合新增 `verify-unauth`（第 5 个 handler）。
     M18-a 披露：期望集合再新增 `verify-cmdi`（第 6 个 handler，命令注入）——
     与 M16-c 那次同一处、同一做法（替身补一个属性 + 期望集加一项）。
     M22-a 披露：期望集合再新增 `verify-ssti`（第 7 个 handler，模板注入）——
     与 M16-c / M18-a 同一处、同一做法；标题里的类型数同步（六→七）。
+    M23 披露：期望集合再新增 `verify-error-disclosure`（第 8 个 handler）——
+    与上面三次同一处、同一做法；标题里的类型数同步（七→八）。
     **断言意图不变**——仍是"每个 verify skill 只覆盖自己的 vuln_type、
     两两不相交"。
     **断言意图不变**——仍是"每个 verify skill 只覆盖自己的 vuln_type、两两不相交"。
@@ -720,11 +722,12 @@ def test_verify_handlers_cover_ssrf_and_stay_disjoint():
         SimpleNamespace(
             _verify_sqli=1, _verify_xss=1, _verify_idor=1, _verify_ssrf=1,
             _verify_unauth=1, _verify_cmdi=1, _verify_ssti=1,
+            _verify_error_disclosure=1,
         )
     )
     assert set(handlers) == {
         "verify-sqli", "verify-xss", "verify-idor", "verify-ssrf", "verify-unauth",
-        "verify-cmdi", "verify-ssti",
+        "verify-cmdi", "verify-ssti", "verify-error-disclosure",
     }
     expected = {
         "verify-sqli": frozenset({"sqli"}),
@@ -734,6 +737,7 @@ def test_verify_handlers_cover_ssrf_and_stay_disjoint():
         "verify-unauth": frozenset({"unauth-exposure"}),
         "verify-cmdi": frozenset({"cmdi"}),
         "verify-ssti": frozenset({"ssti"}),
+        "verify-error-disclosure": frozenset({"error-disclosure"}),
     }
     for name, vuln_types in expected.items():
         assert handlers[name][0] == vuln_types, name

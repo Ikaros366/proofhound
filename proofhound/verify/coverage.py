@@ -98,6 +98,10 @@ COVERAGE_SHOTS: dict[str, tuple[CoverageShot, ...]] = {
         CoverageShot("baseline"),
         CoverageShot("probe", param_value="{{191*191}}"),
     ),
+    # M23：错误页是**畸形请求**的响应，浏览器无法「导航」到它——故这里只留
+    # 基线页（证明端点被真的测过）；错误页正文与标记摘录进证据文件，截图
+    # 不作为披露证据（维护者裁定：本轮不加 capture_html）。
+    "error-disclosure": (CoverageShot("baseline"),),
 }
 
 

@@ -140,6 +140,12 @@ VULN_LANDINGS: dict[str, VulnLanding] = {
         # 判定通道由 M22-b 落地（M22-a 为恒记 verify_blocked 的 fail-closed 桩）。
         "param-endpoint（_SSTI_PARAM_HINTS 命中）+ 模型通道",
     ),
+    "error-disclosure": _landing(
+        "error-disclosure",
+        # M23 裁定：由确定性规则表从 web-probe 信号按 **host** 派生（asset=origin），
+        # **不**进模型白名单。中间件错误页是 host 级现象，无需语义判断。
+        "web-probe（按 origin 去重，host 级一条）",
+    ),
 }
 
 
@@ -647,9 +653,14 @@ def test_production_init_declares_no_stray_verify_skill():
 
     用**字面量正则**提取（对 `verify_unauth_skill = "verify-unauth"` 这种
     「形参名与字符串不同形」的写法也成立），防拼写错误或挂了没有 handler 的 skill。
+
+    M23 披露：正则从 `verify-[a-z]+` 放宽到 `verify-[a-z-]+`——第 8 个 skill
+    `verify-error-disclosure` 的名字含**两个**连字符，旧正则只会截出
+    `verify-error`，于是把合法槽位误报成"没有 handler 的 stray"。断言意图不变
+    （仍是"init 里出现的每个 verify skill 名都必须在册"），只是提取不再截断。
     """
     source = _production_init_source()
-    declared = set(re.findall(r"verify-[a-z]+", source))
+    declared = set(re.findall(r"verify-[a-z-]+", source))
     assert declared, "生产栈 init 里没有找到任何 verify skill 名——提取失配"
     stray = sorted(declared - set(_handler_names()))
     assert not stray, (

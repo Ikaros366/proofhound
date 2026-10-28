@@ -94,6 +94,16 @@ SKILL_PROFILES: dict[str, SkillProfile] = {
             "确认靠「两个不同乘积都被算出来 + 基线干净 + 畸形对照不成立」（差分求值）"
         ),
     ),
+    "verify-error-disclosure": SkillProfile(
+        risk_level="L2",
+        mutating=False,
+        note=(
+            "只读验证：同一 host 1 次正常 GET 作基线 + ≤5 条**畸形**请求（非法"
+            "字符/编码/版本/方法/超长 URI，不带任何凭据），比对响应正文的技术"
+            "披露标记；确认靠「基线干净 ∧ 畸形请求 4xx/5xx ∧ 命中 ≥2 类标记」"
+            "（差分二值事实），版本头只记审计、不构成证据"
+        ),
+    ),
     "verify-unauth": SkillProfile(
         risk_level="L2",
         mutating=False,

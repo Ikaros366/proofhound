@@ -126,6 +126,24 @@ from proofhound.verify.coverage import (
 )
 from proofhound.verify.cvss import base_score as cvss_base_score
 from proofhound.verify.cvss import severity_for_score
+from proofhound.verify.error_disclosure import (
+    ERROR_DISCLOSURE_CONFIRMED_METHOD,
+    ERROR_TRACE_EVIDENCE_KIND,
+    PROBE_BUDGET as ERROR_DISCLOSURE_PROBE_BUDGET,
+)
+from proofhound.verify.error_disclosure import (
+    ProbeOutcome as ErrorDisclosureProbe,
+)
+from proofhound.verify.error_disclosure import (
+    ProbeSpec as ErrorDisclosureProbeSpec,
+)
+from proofhound.verify.error_disclosure import (
+    build_baseline as error_disclosure_baseline,
+    build_probes as error_disclosure_probes,
+    judge as error_disclosure_judge,
+    outcome_from_response as error_disclosure_outcome,
+    summary_for_verifier as error_disclosure_summary,
+)
 from proofhound.verify.gate import BEHAVIORAL_EVIDENCE_KIND
 from proofhound.verify.gate import check as gate_check
 from proofhound.verify.idor import fetch as idor_fetch_default
@@ -140,6 +158,8 @@ from proofhound.verify.idor_control import (
 )
 from proofhound.verify.prefilter import screen as prefilter_screen
 from proofhound.verify.prefilter import with_query_param as prefilter_with_query_param
+from proofhound.verify.raw_http import DEFAULT_TIMEOUT as RAW_HTTP_DEFAULT_TIMEOUT
+from proofhound.verify.raw_http import send_raw as raw_http_send_default
 from proofhound.verify.screenshot import ScreenshotCapturer
 from proofhound.verify.ssti import (
     KIND_BASELINE as SSTI_KIND_BASELINE,
@@ -302,6 +322,11 @@ _SSTI_PARAM_HINTS = frozenset(
 # 逐语法两个操作数 + 畸形对照），不设限会给目标与贵验证档同时灌水。
 _TRIAGE_SSTI_CAP = 10
 
+# M23：每 engagement 新建 error-disclosure Hypothesis 上限（独立计数、独立
+# triage_capped）。候选按 **host** 派生（一个 origin 一条），每条在 verify
+# 阶段最多 1 次基线 + 5 次畸形请求——不设限时会随 web-probe 信号数灌水。
+_TRIAGE_ERROR_DISCLOSURE_CAP = 10
+
 # M17-b：每 engagement 新建 unauth-exposure Hypothesis 上限（独立计数、独立
 # triage_capped 事件）。**必须**有独立上限：`web-exposure` 是全池唯一**没有**
 # 上限的类型（其余各有），而新生产者的候选量与 web-probe 信号数同阶，
@@ -344,6 +369,7 @@ _TRIAGE_CAPS: dict[str, int] = {
     "unauth-exposure": _TRIAGE_UNAUTH_CAP,
     "cmdi": _TRIAGE_CMDI_CAP,  # M18-b
     "ssti": _TRIAGE_SSTI_CAP,  # M22-a
+    "error-disclosure": _TRIAGE_ERROR_DISCLOSURE_CAP,  # M23
 }
 
 # M9c②：**贵验证档**上限。启用廉价粗筛（``verify_prefilter``）时，cap 从
@@ -391,6 +417,11 @@ class _TriageCandidate(NamedTuple):
     severity: str
     evidence_kind: str
     source: str  # M8a：web_probe / get_param / form_page（triage_completed 摘要分量）
+    #: 候选级 asset 覆盖（M23）：``None`` = 用 Signal 的 asset。
+    #: ``error-disclosure`` 按 **host 级**产出（asset=origin），与触发信号
+    #: 的 URL 粒度不同——没有这个字段就只能把 host 级候选挂到第一条 URL 上，
+    #: 去重也就退化成按 URL 而不是按 host。
+    asset: str | None = None
 
 
 def _callback_token_in(value: str) -> str:
@@ -425,6 +456,32 @@ def _origin_of(url: str) -> tuple[str, str, int] | None:
     if port is None:
         port = 443 if parsed.scheme == "https" else 80
     return parsed.scheme.lower(), parsed.hostname.lower(), port
+
+
+def _origin_url(url: str) -> str | None:
+    """URL → origin（``scheme://host[:port]``，默认端口省略；M23）。
+
+    用作 error-disclosure 候选的 asset：中间件错误页是 host 级现象，
+    按 origin 去重才能让同一 host 的多个 URL 合成一条候选。
+    非 http(s) 或不可解析返回 None（调用方 fail-closed）。
+    """
+    origin = _origin_of(url)
+    if origin is None:
+        return None
+    scheme, host, port = origin
+    if scheme not in ("http", "https"):
+        return None
+    literal = f"[{host}]" if ":" in host else host
+    default = 443 if scheme == "https" else 80
+    suffix = "" if port == default else f":{port}"
+    return f"{scheme}://{literal}{suffix}"
+
+
+def _host_header(host: str, port: int, tls: bool) -> str:
+    """构造 ``Host`` 头（IPv6 加方括号；默认端口省略）。"""
+    literal = f"[{host}]" if ":" in host else host
+    default = 443 if tls else 80
+    return literal if port == default else f"{literal}:{port}"
 
 
 def _query_param_keys(url: str) -> list[str]:
@@ -491,6 +548,23 @@ def _triage_candidates(
                     severity="medium",
                     evidence_kind=STATUS_CODE_EVIDENCE_KIND,
                     source="web_probe",
+                )
+            )
+        # M23：同一份「host 可达」信号再按 **origin** 派生一条
+        # error-disclosure 候选（与上面两类并存，不取代）。派生条件只看
+        # 可达性（本分支已在 `_EXPOSED_STATUSES` 内）——错误页与状态码
+        # 无关，401/403 的 host 同样可能有堆栈泄露；**不需要**预置会话
+        # （判据与身份无关，探针不带凭据）。
+        origin = _origin_url(signal.asset)
+        if origin is not None:
+            candidates.append(
+                _TriageCandidate(
+                    vuln_type="error-disclosure",
+                    param=None,
+                    severity="low",
+                    evidence_kind=STATUS_CODE_EVIDENCE_KIND,
+                    source="web_probe",
+                    asset=origin,
                 )
             )
         return candidates
@@ -597,6 +671,7 @@ class Orchestrator:
         unauth_judge_factory=None,
         cmdi_fetch=None,
         ssti_fetch=None,
+        raw_http_send=None,
         triage_rules: bool = True,
         triage_model: bool = False,
         verify_prefilter: bool = False,
@@ -649,6 +724,12 @@ class Orchestrator:
         # M22-b：verify-ssti 的取数注入口子（测试给罐头 fetch；None 时用
         # verify/ssti.py 的真实 stdlib fetch）。判据与身份无关，故会话可为 None。
         self._ssti_fetch = ssti_fetch if ssti_fetch is not None else ssti_fetch_default
+        # M23：verify-error-disclosure 的**裸 TCP** 发送口子（测试给罐头发送器；
+        # None 时用 verify/raw_http.py 的真实实现）。不能用 urllib/httpx——
+        # 它们在客户端就会拒绝畸形请求行，探针根本发不出去。
+        self._raw_http_send = (
+            raw_http_send if raw_http_send is not None else raw_http_send_default
+        )
         # 回调 listener 按 finding 分桶（每条候选一个独立 listener + 独立 token 空间），
         # phase 收尾统一释放（与 _close_browser 同范式）
         self._ssrf_listeners: dict[str, CallbackListener] = {}
@@ -874,8 +955,11 @@ class Orchestrator:
         created_by_source = counters["created_by_source"]
         merged_by_source = counters["merged_by_source"]
         for candidate in candidates:
+            # M23：候选可声明 host 级 asset（error-disclosure）；其余类型
+            # 缺省 None ⇒ 与改造前逐字节等价。
+            asset = candidate.asset or signal.asset
             dedup_key = compute_dedup_key(
-                signal.asset, candidate.vuln_type, candidate.param
+                asset, candidate.vuln_type, candidate.param
             )
             existing = store.get_by_dedup_key(dedup_key)
             if existing is not None:
@@ -916,7 +1000,7 @@ class Orchestrator:
                 state=FindingState.SIGNAL,
                 vuln_type=candidate.vuln_type,
                 severity=candidate.severity,
-                asset=signal.asset,
+                asset=asset,
                 param=candidate.param,
                 confidence="low",
                 evidence_kinds=[candidate.evidence_kind],
@@ -1057,6 +1141,12 @@ class Orchestrator:
             # M22：模板注入（唯一确认门径）——**同一语法下两个不同乘积都被
             # 算了出来**才算；模板语法回显/报错文本/状态码一律不是证据
             "verify-ssti": (frozenset({"ssti"}), self._verify_ssti),
+            # M23：报错信息泄露（唯一确认门径）——畸形请求触发的错误页
+            # 命中 ≥2 类技术披露标记、且基线干净才算；版本头只记审计
+            "verify-error-disclosure": (
+                frozenset({"error-disclosure"}),
+                self._verify_error_disclosure,
+            ),
         }
 
     def verify_skill_coverage(self, skill_name: str = "verify-sqli") -> frozenset[str]:
@@ -3138,6 +3228,275 @@ class Orchestrator:
             )
         )
         return path
+
+    # ---- M23：服务器报错信息泄露（按 host 的畸形请求差分） ----
+
+    def _verify_error_disclosure(
+        self, finding: Finding, skill, store: FindingStore
+    ) -> str:
+        """verify-error-disclosure SOP 的确定性执行（M23）。
+
+        确认铁律：**同一 host 的正常 GET 干净，而畸形请求的错误页命中 ≥2 类
+        技术披露标记**。只命中 1 类、基线本身带标记、探针没能发出、畸形请求
+        未被拒绝——一律 blocked（覆盖不全，绝不驳回）。
+
+        请求全部经**裸 TCP** 发出（``verify/raw_http.py``）：urllib/httpx 会在
+        客户端拒绝或规范化非法请求行，畸形请求根本到不了服务器。发出前过
+        ``check_scope``（红线 5）；**不发任何凭据**（判据与身份无关）。版本头
+        只记 ``server_header_disclosed`` 审计，**不构成** Confirmed 证据。
+
+        每 host ≤1 次基线 + ≤5 条探针（命中即停）；唯一 LLM 调用是收尾的
+        Verifier 终审。
+        """
+        scope = getattr(self.runner, "scope", None)
+        if scope is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=(
+                    "runner 未挂 scope，error-disclosure 验证缺 scope 防线"
+                    "（fail-closed）"
+                ),
+            )
+            return "blocked"
+        origin = _origin_of(finding.asset)
+        if origin is None or origin[0] not in ("http", "https"):
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=(
+                    "候选 asset 不是可解析的 http(s) origin，无法构造畸形请求"
+                    f"（fail-closed）: {finding.asset}"
+                ),
+            )
+            return "blocked"
+        scheme, host, port = origin
+        decision = check_scope(scope, [finding.asset])  # 红线 5：发请求前过 scope
+        if not decision.allowed:
+            self.audit.record(
+                "verify_scope_rejected",
+                finding_id=finding.id,
+                violations=decision.violations,
+            )
+            return "blocked"
+
+        tls = scheme == "https"
+        host_header = _host_header(host, port, tls)
+        origin_url = _origin_url(finding.asset) or finding.asset
+        secrets: list[str] = []  # 本类型**不发任何凭据**（交接单硬要求）
+        evidence_paths: list[Path] = []
+        baseline = self._error_disclosure_probe(
+            finding,
+            spec=ErrorDisclosureProbeSpec(
+                label="baseline",
+                description="正常 GET（基线对照）",
+                request=error_disclosure_baseline(host_header),
+            ),
+            host=host,
+            port=port,
+            tls=tls,
+            evidence_paths=evidence_paths,
+        )
+
+        probes: list[ErrorDisclosureProbe] = []
+        # 基线不可用（连不上 / 本身已带标记）时不再发探针：判据的反事实
+        # 已经不可能成立，多发只会白花钱（判定仍是 blocked，不是 rejected）。
+        baseline_usable = baseline.error is None and not baseline.classes
+        if baseline_usable:
+            for spec in error_disclosure_probes(host_header):
+                probes.append(
+                    self._error_disclosure_probe(
+                        finding,
+                        spec=spec,
+                        host=host,
+                        port=port,
+                        tls=tls,
+                        evidence_paths=evidence_paths,
+                    )
+                )
+                # 命中即停：一条 4xx/5xx 且 ≥2 类标记已足以确认，省下剩余探针。
+                last = probes[-1]
+                if (
+                    last.status is not None
+                    and 400 <= last.status <= 599
+                    and len(last.classes) >= 2
+                ):
+                    break
+
+        judgment = error_disclosure_judge(baseline, probes)
+        summary = error_disclosure_summary(
+            judgment, baseline, probes, origin=origin_url
+        )
+        j_path = self.evidence_dir / f"error_disclosure_{finding.id}_judgment.json"
+        j_path.write_bytes(
+            redact_bytes(
+                (
+                    json.dumps(
+                        {"finding_id": finding.id, **summary},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+                secrets,
+            )
+        )
+        self.audit.record(
+            "error_disclosure_judged",
+            finding_id=finding.id,
+            verdict=judgment.verdict,
+            matched=list(judgment.matched),
+            probe=judgment.probe,
+            probes=len(probes),
+            budget=ERROR_DISCLOSURE_PROBE_BUDGET,
+            server_header=judgment.server_header,
+        )
+        # 版本头：单独审计，**不进** evidence_kinds / verification（维护者裁定）
+        if judgment.server_header:
+            self.audit.record(
+                "server_header_disclosed",
+                finding_id=finding.id,
+                origin=origin_url,
+                header=judgment.server_header,
+                note="仅作审计/报告分类线索，不构成确认证据",
+            )
+
+        # 1a. 判不了：覆盖不全（不驳回）
+        if not judgment.confirmed and judgment.verdict != "rejected":
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=(
+                    "error-disclosure 差分未完成（覆盖不全，不驳回）: "
+                    + "；".join(judgment.reasons)
+                ),
+            )
+            return "blocked"
+
+        # 1b. 真阴性：畸形请求被拒绝但零标记 ⇒ 通用错误页（不信"看起来像报错"）
+        if judgment.verdict == "rejected":
+            finding.transition(
+                FindingState.REJECTED,
+                actor=skill.name,
+                reason=(
+                    "报错信息泄露不成立："
+                    + "；".join(judgment.reasons)
+                    + f"（判定依据见 {j_path.name}）"
+                ),
+            )
+            store.append(finding)
+            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+            return "rejected"
+
+        # 2. 成立：具名证据标签 + method + 四段式（响应正文只在证据文件里）
+        evidence_paths.append(j_path)
+        hit = next(p for p in probes if p.label == judgment.probe)
+        finding.verification = Verification(
+            method=ERROR_DISCLOSURE_CONFIRMED_METHOD,
+            evidence_refs=[str(path) for path in evidence_paths],
+            baseline_diff=(
+                f"基线 {baseline.status}（正文 {baseline.body_bytes}B，0 类标记）；"
+                f"畸形探针 {hit.label} → {hit.status}，命中 "
+                f"{len(hit.classes)} 类标记 {sorted(hit.classes)}"
+            ),
+            claim=(
+                f"{host_header} 在收到畸形 HTTP 请求时把服务器内部异常/堆栈/"
+                "源码路径回显给客户端"
+            ),
+            expected=(
+                "正常 GET 不应出现堆栈帧、框架版本或源码路径；畸形请求应只得到"
+                "不含内部信息的通用错误页"
+            ),
+            actual=(
+                f"探针 {hit.label}（{hit.description}）返回 {hit.status}，正文命中 "
+                f"{len(hit.classes)} 类标记：{', '.join(sorted(hit.classes))}"
+            ),
+            reproduction_steps=[
+                f"GET {origin_url}/ → {baseline.status}（正文零技术披露标记）",
+                (
+                    f"发送畸形请求（{hit.description}，sha256 "
+                    f"{hit.request_sha256[:12]}）→ {hit.status}"
+                ),
+                (
+                    f"响应正文命中 {len(hit.classes)} 类标记："
+                    f"{', '.join(sorted(hit.classes))}"
+                ),
+            ],
+            verified_by=f"{skill.name}@{skill.manifest.version}",
+            verified_at=_utc_now(),
+        )
+        if ERROR_TRACE_EVIDENCE_KIND not in finding.evidence_kinds:
+            finding.evidence_kinds.append(ERROR_TRACE_EVIDENCE_KIND)
+        finding.transition(
+            FindingState.REPRODUCED,
+            actor=skill.name,
+            reason=(
+                f"畸形请求 {hit.label} 的错误页命中 {len(hit.classes)} 类技术披露"
+                f"标记（{', '.join(sorted(hit.classes))}），基线干净"
+            ),
+        )
+        store.append(finding)
+
+        # 3. 证据门 → Verifier 终审 → 终态迁移（公共收尾）
+        return self._gate_and_review(finding, skill, store, summary=summary)
+
+    def _error_disclosure_probe(
+        self,
+        finding: Finding,
+        *,
+        spec: ErrorDisclosureProbeSpec,
+        host: str,
+        port: int,
+        tls: bool,
+        evidence_paths: list[Path],
+    ) -> ErrorDisclosureProbe:
+        """一次裸 HTTP 探针：发送 → 按次审计 → 证据落盘（脱敏）→ 归一化结果。
+
+        证据里**不写原始请求字节**（含控制字符）：只记转义摘要与 sha256
+        （交接单 §8 第 5 条）。
+        """
+        response = self._raw_http_send(
+            host, port, spec.request, tls=tls, timeout=RAW_HTTP_DEFAULT_TIMEOUT
+        )
+        outcome = error_disclosure_outcome(spec, response)
+        self.audit.record(
+            "error_disclosure_probe_attempt",
+            finding_id=finding.id,
+            label=spec.label,
+            description=spec.description,
+            status=response.status,
+            error=response.error is not None,
+            error_kind=response.error_kind,
+            classes=sorted(outcome.classes),
+            body_bytes=len(response.body),
+            truncated=response.truncated,
+            request_sha256=outcome.request_sha256,
+        )
+        path = self.evidence_dir / (
+            f"error_disclosure_{finding.id}_{spec.label}_response.txt"
+        )
+        text = (
+            f"request: {spec.request_repr}\n"
+            f"request_sha256: {outcome.request_sha256}\n"
+            f"origin: {host}:{port} tls={tls}\n"
+            f"status: {response.status} {response.reason}\n"
+        )
+        if response.error is not None:
+            text += f"error: [{response.error_kind}] {response.error}\n"
+        server = response.header("server")
+        if server:
+            text += f"server: {server}\n"
+        content_type = response.header("content-type")
+        if content_type:
+            text += f"content-type: {content_type}\n"
+        text += (
+            f"matched_classes: {', '.join(sorted(outcome.classes)) or 'none'}\n"
+            f"body_bytes: {len(response.body)} (truncated={response.truncated})\n"
+            f"\n{response.body_text}"
+        )
+        path.write_bytes(redact_bytes(text.encode("utf-8"), []))
+        evidence_paths.append(path)
+        return outcome
 
     def _get_unauth_judge(self):
         """懒建敏感度判定器（测试经 ``unauth_judge_factory`` 注入替身）。
