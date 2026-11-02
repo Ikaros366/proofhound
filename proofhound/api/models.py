@@ -10,9 +10,12 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
 
 from proofhound.autonomy import AutonomyMode
+from proofhound.compliance.scope import RequestBudget
 
 
 def parse_cookie(cookie: str) -> dict[str, str]:
@@ -52,6 +55,11 @@ class CreateEngagementRequest(BaseModel):
     reference_identity: str | None = None  # M11b：reference 身份的**声明式**标识（归属比对期望值）
     autonomy_mode: AutonomyMode = AutonomyMode.SEMI_AUTO  # 默认半自动（§5.9.2）
     budget: int | None = Field(default=None, ge=0)  # Run 级 token 预算；0 = 拒绝一切 LLM 调用
+    # M28：请求量授权（web-dirsearch 的 opt-in 唯一入口）。不填 = 不爆破；
+    # 填了就必须给出速率/并发/总量（模型层越界即 422，绝不静默回落）。
+    request_budget: RequestBudget | None = None
+    # M28：进程内探针的 TLS 策略。不填 = strict（校验证书）；insecure 必须显式声明。
+    tls_verify: Literal["strict", "insecure"] | None = None
     extras: dict[str, str] | None = None  # 报告元信息额外键（M4.5 extras 透传：company_name 等）
 
     @field_validator("cookie", "reference_cookie")

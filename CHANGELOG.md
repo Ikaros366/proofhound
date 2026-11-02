@@ -6,6 +6,40 @@
 
 ## [未发布]
 
+### 修复（M28：请求量授权在生产链路上被丢弃 + 进程内探针不放过自签靶）
+
+**两个"功能齐备但生产路径永不触发"**：
+
+1. `web-dirsearch` 的 opt-in 判据是 `scope.request_budget is not None`，而
+   `EngagementManager.load_scope()` 合并时只带 domains/networks/ports——**scope 文件
+   里写的 `request_budget` 在合并后被静默丢弃**，于是字典爆破永远进不了扫描阶段。
+   与已知限制 58/59 同一类缺陷：构造器、解析器、测试全在，唯独生产路径不触发。
+2. `verify/raw_http.py` 校验证书且原先没有放宽通道，自签靶的进程内探针一律 blocked；
+   而沙箱内 CLI 工具对**同一个靶**照常返回 200（实测 100.80.4.50:8443 的证书
+   issuer=`PentAGI CA`、CN=localhost），等于"扫得到、验不了"。
+
+**改动**：
+
+- **`proofhound/compliance/scope.py`**：新增 `tls_verify`（`strict` 缺省 /
+  `insecure`）与 `tls_verify_enabled()`。
+- **`proofhound/verify/raw_http.py`**：`send_raw(verify_tls=True)`，`_tls_context()`
+  是唯一放宽点。模块文档里"刻意不提供开关"的裁定改写为"**只能由编排器按 scope
+  显式声明传入**——不读环境变量、不自行判断目标性质"。
+- **`proofhound/core/orchestrator.py`**：`_tls_verify_enabled()` 读 scope 策略；
+  探针只在放宽时传 `verify_tls=False`（既有注入式 sender 签名零改动）；
+  `error_disclosure_probe_attempt` 增加 `tls_verified`，如实记录这次验没验证书。
+- **`proofhound/api/models.py`**：`CreateEngagementRequest` 增加 `request_budget` 与
+  `tls_verify`（非法值/多余键一律 422）。
+- **`proofhound/api/runner.py`**：两个字段随 `api.json` 持久化；`load_scope()` 接收
+  并在合并时**取最严**——预算逐维度 min（多写一份授权 ≠ 多要配额）；TLS 任一来源
+  显式 `strict` 即 strict，全部显式 `insecure` 才降级；`start()` 在放宽时记审计
+  `tls_verify_disabled`。
+- **`proofhound/api/static/app.js`**：创建表单增加"请求量授权"四个输入（勾选才启用）
+  与"不校验证书"复选框。
+
+**默认行为不变**：不声明 `request_budget` = 不爆破；不声明 `tls_verify` = 校验证书。
+**新增测试** `tests/test_request_budget_tls.py` 12 条。
+
 ### 修复（M27：默认路径上爬行面 100% 丢失 + 阶段失败被"全部完成"掩盖）
 
 **两个现象**：① 从控制台建的任务常在 5 秒内"跑完"，findings 多为 0；

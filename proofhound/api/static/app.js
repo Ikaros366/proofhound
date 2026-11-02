@@ -176,6 +176,53 @@ function renderList(view) {
   refCookieInput.placeholder = 'k=v; k=v（可选第二身份，IDOR 双会话验证；提交后界面不再出现）';
   grid.appendChild(field('第二身份会话 Cookie（可选）', refCookieInput, 'full'));
 
+  // M28：请求量授权——web-dirsearch 的 opt-in 唯一入口。刻意要求"先声明上限
+  // 才爆破"：不勾选就完全不进扫描阶段（不是限速，是不发）。
+  const bruteCheck = el('input');
+  bruteCheck.type = 'checkbox';
+  const bruteLabel = el('label', 'field full');
+  bruteLabel.appendChild(bruteCheck);
+  bruteLabel.appendChild(
+    document.createTextNode(
+      ' 启用目录爆破（dirsearch）——须在下方声明请求量上限；不勾选则本任务不爆破'
+    )
+  );
+  grid.appendChild(bruteLabel);
+
+  const budgetFields = [
+    ['速率上限 rps（1~200）', '50', '50'],
+    ['并发上限（1~20）', '10', '10'],
+    ['请求总量上限（1~50000）', '5000', '5000'],
+    ['时间窗分钟（可选，1~1440）', '', '留空 = 不设'],
+  ].map(([label, placeholder, value]) => {
+    const input = el('input');
+    input.type = 'number';
+    input.min = '1';
+    input.placeholder = placeholder;
+    if (value) input.value = value;
+    input.disabled = true;
+    grid.appendChild(field(label, input));
+    return input;
+  });
+  bruteCheck.addEventListener('change', () => {
+    budgetFields.forEach((input) => {
+      input.disabled = !bruteCheck.checked;
+    });
+  });
+
+  // M28：进程内探针的 TLS 策略。缺省 strict（校验证书）；勾选=逐任务显式放宽，
+  // 启动时记审计 tls_verify_disabled，绝不全局生效。
+  const tlsCheck = el('input');
+  tlsCheck.type = 'checkbox';
+  const tlsLabel = el('label', 'field full');
+  tlsLabel.appendChild(tlsCheck);
+  tlsLabel.appendChild(
+    document.createTextNode(
+      ' 不校验证书（自签/内部 CA 靶）：仅本任务生效，启动时记审计 tls_verify_disabled'
+    )
+  );
+  grid.appendChild(tlsLabel);
+
   // 报告 extras（可选，写 engagement.json 透传进模板；自定义企业模板封面三件套）
   const extrasInputs = [
     ['company_name', '单位名称（可选）', '报告 extras：company_name'],
@@ -265,6 +312,18 @@ function renderList(view) {
     });
     if (Object.keys(extras).length) body.extras = extras;
     if (budgetInput.value.trim() !== '') body.budget = Number(budgetInput.value);
+    // M28：勾了才带 request_budget（后端据此决定是否把 dirsearch 挂进扫描阶段）
+    if (bruteCheck.checked) {
+      const requestBudget = {
+        rate_rps: Number(budgetFields[0].value || 50),
+        concurrency: Number(budgetFields[1].value || 10),
+        max_requests: Number(budgetFields[2].value || 5000),
+      };
+      const windowValue = budgetFields[3].value.trim();
+      if (windowValue !== '') requestBudget.window_minutes = Number(windowValue);
+      body.request_budget = requestBudget;
+    }
+    if (tlsCheck.checked) body.tls_verify = 'insecure';
     // cookie 纪律：提交后立即清空，不缓存、不回显、不写任何存储
     cookieInput.value = '';
     refCookieInput.value = '';

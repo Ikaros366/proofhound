@@ -31,6 +31,19 @@ M16-b：``Scope`` 增加可选 ``request_budget``（**请求量授权语义**）
 缺省放行**不等于**无痕放行。这与 ``PROOFHOUND_SANDBOX_EGRESS``/``_HARDENING``
 "非法值抛错、缺省即最严"的纪律**有意不同**，理由与残余风险见 AGENTS.md 已知限制 54。
 但**非法值仍然一律显式抛错**（越界即 ``ValidationError``，绝不静默回落到放宽值）。
+
+M28：``Scope`` 增加 ``tls_verify``（**进程内探针的 TLS 校验策略**），取值
+``"strict"``（缺省）/``"insecure"``。
+
+背景是一个实测出来的**不一致**：沙箱内的 CLI 工具（如 ``httpx``）对自签名靶照常
+返回 200，而进程内探针（``verify/raw_http.py``）因校验证书直接 blocked——同一个靶，
+"扫得到、验不了"。``raw_http`` 原先的裁定是"刻意不提供不校验开关"，理由是"给测试靶
+开的口子一旦存在就会被顺手用到真靶上"。本字段保留那个担忧的**精神**：口子不是全局
+开关、不是环境变量、不能由 LLM 或工具自行决定，只能由操作员**逐 scope 显式声明**，
+生效时记审计 ``tls_verify_disabled``。
+
+**缺省仍是 strict**：不写就是校验证书，自签靶的失败表现为 ``error_kind="tls"`` 的
+blocked（可归因，不是静默失败）。
 """
 
 from __future__ import annotations
@@ -39,6 +52,7 @@ import ipaddress
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 import yaml
@@ -136,6 +150,14 @@ class Scope(BaseModel):
     # M16-b：请求量授权（可选）。``None`` = 未显式授权，构造器替换为保守缺省值并
     # 在审计里记 ``source="default"``（见模块 docstring 的"缺省值语义"与限制 54）。
     request_budget: RequestBudget | None = None
+    # M28：进程内探针（裸 TCP / urllib）的 TLS 校验策略。缺省 strict=校验证书；
+    # 只有操作员在 scope 里**显式**写 insecure 才放宽，且生效时记审计。
+    # 刻意不做全局开关/环境变量：口子必须逐 scope 授权、可归因。
+    tls_verify: Literal["strict", "insecure"] = "strict"
+
+    def tls_verify_enabled(self) -> bool:
+        """进程内探针是否校验证书（True = 校验，缺省行为）。"""
+        return self.tls_verify != "insecure"
 
     def session_identity(self) -> str | None:
         """reference 会话的身份标识（供归属比对的**期望值**）。

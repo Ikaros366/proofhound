@@ -3469,8 +3469,17 @@ class Orchestrator:
         证据里**不写原始请求字节**（含控制字符）：只记转义摘要与 sha256
         （交接单 §8 第 5 条）。
         """
+        # M28：scope 显式声明 insecure 才放宽；缺省不给 sender 传该参数
+        #（注入式 sender 的既有签名因此零改动）。
+        verify_tls = self._tls_verify_enabled()
+        send_kwargs = {} if verify_tls else {"verify_tls": False}
         response = self._raw_http_send(
-            host, port, spec.request, tls=tls, timeout=RAW_HTTP_DEFAULT_TIMEOUT
+            host,
+            port,
+            spec.request,
+            tls=tls,
+            timeout=RAW_HTTP_DEFAULT_TIMEOUT,
+            **send_kwargs,
         )
         outcome = error_disclosure_outcome(spec, response)
         self.audit.record(
@@ -3481,6 +3490,7 @@ class Orchestrator:
             status=response.status,
             error=response.error is not None,
             error_kind=response.error_kind,
+            tls_verified=verify_tls,
             classes=sorted(outcome.classes),
             body_bytes=len(response.body),
             truncated=response.truncated,
@@ -3833,6 +3843,15 @@ class Orchestrator:
         """当前 engagement 的预置会话（来自 scope 配置；无则 None）。"""
         scope = getattr(self.runner, "scope", None)
         return getattr(scope, "session", None) if scope is not None else None
+
+    def _tls_verify_enabled(self) -> bool:
+        """进程内探针是否校验证书（M28）。
+
+        只有 scope **显式**声明 ``tls_verify: insecure`` 才返回 False；runner 未挂
+        scope（单测/CLI 直连）或字段缺省一律 True——fail-closed 方向。
+        """
+        scope = getattr(self.runner, "scope", None)
+        return getattr(scope, "tls_verify", "strict") != "insecure"
 
     # ---- 子任务主循环 ----
 

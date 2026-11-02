@@ -30,7 +30,7 @@ from pathlib import Path
 
 from proofhound.autonomy import AutonomyGate, AutonomyMode, GateDecision
 from proofhound.compliance.audit import AuditLog
-from proofhound.compliance.scope import Scope, check_scope
+from proofhound.compliance.scope import RequestBudget, Scope, check_scope
 from proofhound.compliance.session import SessionConfig
 from proofhound.findings.evidence import assemble_evidence_pack
 from proofhound.findings.finding import FindingState, FindingStore
@@ -44,6 +44,21 @@ def _utc_now() -> str:
 def _status_value(status) -> str:
     """把 TaskStatus/字符串统一成审计与 JSON 里那套裸字符串（M27）。"""
     return getattr(status, "value", str(status))
+
+
+def _strictest_request_budget(budgets: list[RequestBudget]) -> RequestBudget:
+    """多来源请求量授权取**最严**（M28）：各维度取 min。
+
+    "多写一份授权"不等于"多要配额"——API 表单与 scope 文件都可能声明预算，合并时
+    取交集才是安全方向；时间窗同样取最小值，未声明（None）不参与比较。
+    """
+    windows = [b.window_minutes for b in budgets if b.window_minutes is not None]
+    return RequestBudget(
+        rate_rps=min(b.rate_rps for b in budgets),
+        concurrency=min(b.concurrency for b in budgets),
+        max_requests=min(b.max_requests for b in budgets),
+        window_minutes=min(windows) if windows else None,
+    )
 
 
 # ---- 领域错误（server.py 翻译成 HTTP 响应） ----
@@ -253,6 +268,9 @@ class Engagement:
         self.with_session: bool = bool(meta.get("with_session"))
         # M8c：第二身份会话（reference/victim）是否配置（值永不进响应体）
         self.with_reference_session: bool = bool(meta.get("with_reference_session"))
+        # M28：请求量授权（dict，缺省 None = 不爆破）与进程内探针的 TLS 策略
+        self.request_budget: dict | None = meta.get("request_budget")
+        self.tls_verify: str | None = meta.get("tls_verify")
         # M27：各阶段 skill 的终态记录。engagement.state=done 只说明主链路走完，
         # 不说明每个阶段都成功——失败要能从这里被看见，而不是只躺在 audit.jsonl。
         self._phases: list[dict] = [dict(record) for record in (meta.get("phases") or [])]
@@ -384,6 +402,10 @@ class Engagement:
             "created_at": self.created_at,
             "with_session": self.with_session,
             "with_reference_session": self.with_reference_session,
+            # M28：请求量授权/TLS 策略必须持久化——start() 重校验时从这里读回，
+            # 否则"创建时声明的"与"实际生效的"会漂移（同 M9a 对派生范围的教训）
+            "request_budget": self.request_budget,
+            "tls_verify": self.tls_verify,
             # M27：阶段终态随元数据持久化（详情/列表接口读它，控制台据此标红）
             "phases": self._phases,
         }
@@ -1268,6 +1290,8 @@ class EngagementManager:
         *,
         derived_scope: dict | None = None,
         target: str | None = None,
+        request_budget: dict | None = None,
+        tls_verify: str | None = None,
     ) -> Scope:
         """加载并合并 scope；文件缺失/非法一律 fail-closed 拒绝。
 
@@ -1278,10 +1302,23 @@ class EngagementManager:
 
         ``scope_paths`` 为空且无派生范围时返回空 Scope；此时 ``check_scope``
         的 fail-closed 语义会拒绝一切目标，调用方须自行给出清晰报错。
+
+        **M28：授权范围之外的字段不能在合并时被丢掉。** 此前 ``merged`` 只带
+        domains/networks/ports，scope 文件里写的 ``request_budget`` 静默消失，
+        于是 ``web-dirsearch`` 的 opt-in 判据（``scope.request_budget is not None``）
+        在生产链路上永远为假——功能齐备却永不触发，与已知限制 58/59 同一类缺陷。
+
+        合并规则（只收窄，不放宽）：
+
+        - ``request_budget``：各来源取**最严**（逐维度 min）；
+        - ``tls_verify``：任一来源**显式**写 ``strict`` 即 strict；全部显式来源都是
+          ``insecure`` 才降级；都没写 = 缺省 strict。
         """
         domains: list[str] = []
         networks: list[str] = []
         ports: list[int] = []
+        budgets: list[RequestBudget] = []
+        tls_declarations: list[str] = []
 
         if derived_scope:
             domains.extend(derived_scope.get("domains") or [])
@@ -1297,8 +1334,26 @@ class EngagementManager:
             domains.extend(loaded.domains)
             networks.extend(loaded.networks)
             ports.extend(loaded.ports)
+            # M28：请求量授权与 TLS 策略随范围一起合并（此前在这里被丢弃）
+            if loaded.request_budget is not None:
+                budgets.append(loaded.request_budget)
+            if "tls_verify" in loaded.model_fields_set:
+                tls_declarations.append(loaded.tls_verify)
+
+        # M28：API 请求里显式声明的与 scope 文件同权，合并时取最严
+        if request_budget is not None:
+            budgets.append(RequestBudget.model_validate(request_budget))
+        if tls_verify is not None:
+            tls_declarations.append(tls_verify)
 
         merged = Scope(domains=domains, networks=networks, ports=ports)
+        if budgets:
+            merged.request_budget = _strictest_request_budget(budgets)
+        merged.tls_verify = (
+            "insecure"
+            if tls_declarations and all(d == "insecure" for d in tls_declarations)
+            else "strict"
+        )
         if not (merged.domains or merged.networks):
             where = target or "（未提供目标）"
             raise ScopeViolationError(
@@ -1361,7 +1416,15 @@ class EngagementManager:
 
         derived_meta: dict | None = None
         if request.scope_paths:
-            scope = self.load_scope(request.scope_paths)  # 文件问题即 403
+            scope = self.load_scope(  # 文件问题即 403
+                request.scope_paths,
+                request_budget=(
+                    request.request_budget.model_dump()
+                    if request.request_budget is not None
+                    else None
+                ),
+                tls_verify=request.tls_verify,
+            )
         else:
             # 无 scope 文件：从目标派生。派生失败即 403，不建任何目录。
             try:
@@ -1414,6 +1477,13 @@ class EngagementManager:
             "created_at": created_at,
             "with_session": request.cookie is not None,
             "with_reference_session": request.reference_cookie is not None,  # M8c
+            # M28：请求量授权与 TLS 策略（创建时唯一入口；缺省 None = 不启用）
+            "request_budget": (
+                request.request_budget.model_dump()
+                if request.request_budget is not None
+                else None
+            ),
+            "tls_verify": request.tls_verify,
         }
         if derived_meta is not None:
             # 派生范围落盘为实际生效的那一份（M9a）：api.json 是 engagement
@@ -1449,6 +1519,8 @@ class EngagementManager:
             budget=request.budget,
             with_session=meta["with_session"],
             with_reference_session=meta["with_reference_session"],  # M8c
+            request_budget=meta["request_budget"],  # M28
+            tls_verify=meta["tls_verify"],  # M28
             extras=sorted(request.extras or {}),  # 只记键名
         )
         if derived_meta is not None:
@@ -1491,8 +1563,23 @@ class EngagementManager:
         # M9a 派生范围（若有）一并读回并集生效——5 层 check_scope 因此自动覆盖
         # 派生范围，无需改动任何一层。
         scope = self.load_scope(
-            eng.scope_paths, derived_scope=eng.derived_scope, target=eng.target
+            eng.scope_paths,
+            derived_scope=eng.derived_scope,
+            target=eng.target,
+            request_budget=eng.request_budget,
+            tls_verify=eng.tls_verify,
         )
+        if scope.tls_verify == "insecure":
+            # M28：放宽 TLS 校验必须留痕（缺省 strict，只有显式声明才走到这里）
+            eng.audit.record(
+                "tls_verify_disabled",
+                engagement_id=eng.id,
+                target=eng.target,
+                reason=(
+                    "scope 显式声明 tls_verify=insecure：进程内探针跳过证书校验"
+                    "（自签/内部 CA 靶）；沙箱内 CLI 工具不受此开关影响"
+                ),
+            )
         decision = check_scope(scope, [eng.target])
         eng.audit.record(
             "scope_recheck",

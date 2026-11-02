@@ -19,9 +19,12 @@
   证据没有意义；
 - 网络错误**不抛出**，一律置 ``error``/``error_kind``：编排层需要区分
   「没响应」（blocked）与「响应了但没有标记」（rejected）；
-- TLS 用系统默认信任库（``ssl.create_default_context()``）**校验证书**。本模块
-  **刻意不提供**「不校验证书」的开关：给测试靶开的口子一旦存在就会被顺手用到
-  真靶上；自签名靶的失败表现为 ``error_kind="tls"`` 的 blocked，是可归因的。
+- TLS 用系统默认信任库（``ssl.create_default_context()``）**校验证书**，且
+  **缺省绝不放宽**：给测试靶开的口子一旦全局存在就会被顺手用到真靶上，自签名靶的
+  失败表现为 ``error_kind="tls"`` 的 blocked，是可归因的。M28 起唯一的放宽通道是
+  ``verify_tls=False``，它只能由编排器按 **scope 显式声明** ``tls_verify: insecure``
+  传入（逐 scope 授权 + 审计 ``tls_verify_disabled``），本模块不读环境变量、不自行
+  判断目标性质。
 """
 
 from __future__ import annotations
@@ -212,6 +215,16 @@ def _read_body(
     return body[:max_body], truncated, bytes_read
 
 
+def _tls_context(verify: bool) -> ssl.SSLContext:
+    """构造 TLS 上下文：缺省用系统信任库校验证书（M28 的唯一放宽点）。"""
+    context = ssl.create_default_context()
+    if not verify:
+        # 只在调用方（编排器）已按 scope 显式授权后才会走到这里
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
+
+
 def send_raw(
     host: str,
     port: int,
@@ -220,11 +233,15 @@ def send_raw(
     tls: bool = False,
     timeout: float = DEFAULT_TIMEOUT,
     max_body: int = MAX_BODY_BYTES,
+    verify_tls: bool = True,
 ) -> RawResponse:
     """把 ``payload`` 字节原样发给 ``host:port``，返回解析后的响应。
 
     **不做**任何语法检查或规范化——这正是本模块存在的理由。调用方必须**先**
     过 ``check_scope``（红线 5）；本模块不持有 scope 语义。
+
+    ``verify_tls``（M28）缺省 True = 校验证书；传 False 表示调用方已按 scope 的
+    显式授权跳过校验（本模块不判断该授权是否成立，只执行）。
     """
     try:
         conn = socket.create_connection((host, port), timeout=timeout)
@@ -237,7 +254,7 @@ def send_raw(
 
     try:
         if tls:
-            context = ssl.create_default_context()
+            context = _tls_context(verify_tls)
             try:
                 conn = context.wrap_socket(conn, server_hostname=host)
             except ssl.SSLError as exc:
