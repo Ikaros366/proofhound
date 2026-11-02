@@ -170,8 +170,7 @@ class EgressProxy:
             lines = head.split("\r\n")
             method, uri, _version = (lines[0].split(" ", 2) + ["", "", ""])[:3]
             if method.upper() == "CONNECT":
-                host, _, port_s = uri.partition(":")
-                port = int(port_s) if port_s.isdigit() else 443
+                host, port = self._parse_connect_target(uri)
                 self._handle_connect(client_sock, host, port)
             else:
                 self._handle_plain(client_sock, method, uri, head, leftover)
@@ -196,6 +195,27 @@ class EgressProxy:
                 return None
         head, _, rest = data.partition(b"\r\n\r\n")
         return head.decode("latin-1"), rest
+
+    @staticmethod
+    def _parse_connect_target(uri: str) -> tuple[str, int]:
+        """解析 CONNECT 的目标（M31-d）。
+
+        标准形态是 ``host:port``；但**实测 dirsearch（httpx 客户端）发的是完整
+        URL**：``CONNECT https://host:8443/path HTTP/1.1``。早先的实现直接
+        ``partition(":")``，于是 host 被解析成 ``"https"``、端口回落 443 ⇒
+        被白名单判越界（审计里表现为 ``host="https", port=443``），客户端只看到
+        ``httpx.ProxyError: Cannot establish the proxy connection``。
+
+        这里按"去掉 scheme、砍掉路径/查询、再取 host:port"解析；缺端口时按 scheme
+        取默认值（https→443，其余→80）。CONNECT 的路径本身没有语义，忽略即可。
+        """
+        scheme = uri.split("://", 1)[0].lower() if "://" in uri else ""
+        target = uri.split("://", 1)[-1]
+        target = target.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+        host, _, port_s = target.partition(":")
+        default_port = 443 if scheme in ("", "https") else 80
+        port = int(port_s) if port_s.isdigit() else default_port
+        return host, port
 
     # ---- CONNECT 隧道 ----
 

@@ -48,6 +48,15 @@
   传 None、dirsearch manifest 守护、越界丢弃、无 scope 不过滤）；四个 fake runner
   的 `run()` 补 `image=None` 形参（与既有四个已支持的 fake 对齐）。
 
+4. **`dirsearch` 走代理必挂（`httpx.ProxyError`）**：dirsearch 发的是**非标准
+   CONNECT**——`CONNECT https://host:8443/login/<word> HTTP/1.1`（带 scheme 与
+   路径），而 `EgressProxy` 用 `uri.partition(":")` 解析，于是 host 变成 `"https"`、
+   端口回落 443 → 白名单判越界 → 403 → 客户端只看到
+   `Cannot establish the proxy connection`。审计里就是这个签名：
+   `egress_denied host="https" port=443`。修成
+   `_parse_connect_target()`：去 scheme、砍路径/查询、再取 host:port，
+   缺端口按 scheme 取默认值。**白名单判定不变**（越界端口仍然 403）。
+
 ## [0.6.0] - 2026-11-02
 
 ### 变更（许可证：Apache-2.0 → AGPL-3.0）
