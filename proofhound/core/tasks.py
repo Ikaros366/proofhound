@@ -57,6 +57,9 @@ class TaskNode:
     failure_counts: dict[str, int] = field(default_factory=dict)  # 按失败类别计数
     attempts: int = 0
     meta: dict = field(default_factory=dict)
+    # M27：最近一次迁移的原因——终态时即"为什么 done / 为什么 failed"。
+    # 此前原因只进 audit.jsonl，上层想展示"哪一步失败了"只能解析审计文本。
+    reason: str = ""
 
     def transition(self, to: TaskStatus, *, reason: str = "") -> None:
         """状态迁移；非法迁移抛 :class:`InvalidTransitionError`，迁移记审计。"""
@@ -66,6 +69,7 @@ class TaskNode:
             )
         old = self.status
         self.status = to
+        self.reason = reason
         if self.audit is not None:
             self.audit.record(
                 "task_state",

@@ -55,10 +55,13 @@ Confirmed**——Confirmed 必须经 verify-* skill 产出（职责隔离规则�
 
 参数说明：
 
-   - **本 skill 面向带预置会话的授权目标：`with_session` 固定为 true**
-     （凭据由构造器从 scope 会话注入 `-H`，LLM 只声明、永不接触原文；
-     scope 无会话时构造器 fail-closed 报错，按失败预算处理，不得改试
-     false 绕过）；
+   - **`with_session: true` 是意图声明，不是"我确认有会话"**（M27）：编排器
+     按本次 run 是否**真的**配置了 scope 会话决定注入（无会话 → 自动降级为
+     匿名爬行并记审计 `session_injection_skipped`，不再让整条 scan 子任务在
+     命令构造处 fail-closed 挂掉——M9a 起"只填 target 就建任务"是默认路径，
+     硬挂等于默认路径上根本没有爬行面）。有会话时凭据仍由构造器从 scope 会话
+     注入 `-H`，LLM 只声明、永不接触原文；规划照旧声明 true，
+     **不要为了绕过失败去声明 false**（那是绕过闸门，不是适配环境）；
    - `depth` 默认 2（1~5）、`concurrency` 默认 5（1~10）、`rate_limit`
      可选（≤150），目标出现限流迹象即降速；
    - 恒在项 `-jsonl -silent -nc -fs rdn` 与

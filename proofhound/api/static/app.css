@@ -647,6 +647,19 @@ button.warn:hover:not(:disabled) { border-color: var(--yellow); }
 .progress.paused .bar { background: var(--yellow); transition: width 0.3s ease; }
 .progress.failed .bar { background: var(--red); }
 .progress.done .bar { background: linear-gradient(90deg, var(--green), var(--teal)); }
+/* M27：主链路走完但有过失败阶段 —— 不能给"全绿"的暗示 */
+.progress.done.degraded .bar { background: linear-gradient(90deg, var(--yellow), var(--orange)); }
+.phase-warn {
+  margin: 0 0 10px;
+  padding: 6px 10px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--yellow);
+  background: var(--yellow-soft, rgba(234, 179, 8, 0.12));
+  border: 1px solid var(--yellow);
+  border-radius: 6px;
+  word-break: break-word;
+}
 
 @keyframes stripes {
   from { background-position: 0 0, 0 0; }

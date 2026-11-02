@@ -6,6 +6,32 @@
 
 ## [未发布]
 
+### 修复（M27：默认路径上爬行面 100% 丢失 + 阶段失败被"全部完成"掩盖）
+
+**两个现象**：① 从控制台建的任务常在 5 秒内"跑完"，findings 多为 0；
+② 即使审计里 `phase:scan` 已是 `failed`，控制台的阶段条仍五段全绿、进度条 100%。
+
+**根因**：① `skills/recon-crawl/SKILL.md` 把 `with_session` 写成固定 `true`，而构造器
+对"声明 true 却无会话"是 fail-closed 的；M9a 之后"只填 target 就建任务"成了默认路径
+（控制台的 cookie 是可选框），于是默认路径上 `recon-crawl` **每次都**在命令构造处
+挂掉，发现面只剩种子 URL 的一发 httpx。② `EngagementRunner.run()` 里 `_scan()` 失败
+不抛异常，照常 `triage → verify → DONE("全部阶段完成")`；详情接口只回 `state` 不回
+任务树，前端一句 `state === 'done'` 就把五个阶段全刷绿。
+
+- **`proofhound/core/orchestrator.py`**：新增 `_apply_session_policy()`——`with_session`
+  **由本次 run 的实际会话派生**。声明 true 而 scope 无会话 ⇒ 降级为匿名执行并记审计
+  `session_injection_skipped`（不静默）；有会话时原样透传。构造器侧 fail-closed 校验
+  **保留不删**——它是"不得凭一句声明凭空造凭据"的兜底。
+- **`proofhound/core/tasks.py`**：`TaskNode.reason` 记录最近一次迁移原因，失败原因不再
+  只存在于审计文本里。
+- **`proofhound/api/runner.py`**：`EngagementRunner` 逐 skill 记录阶段终态
+  （`Engagement.phases`，随 `api.json` 持久化）；有失败时终态理由改为
+  `全部阶段完成（降级：… 未成功）` 并记审计 `engagement_degraded`。
+- **`proofhound/api/server.py`**：列表项增 `degraded`，详情增 `phases`（含子任务失败原因）。
+- **`proofhound/api/static/app.js` / `app.css`**：阶段条按 `phases` 把失败阶段标红、
+  进度条转"降级"配色、并显示失败 skill 与原因——不再一律全绿。
+- **`skills/recon-crawl/SKILL.md`**：改写 `with_session` 的语义（意图声明 + 编排器注入）。
+
 ### 新增（控制台：状态化启停 + 协作式暂停/继续 + 运行进度可视化）
 
 **做了什么**：修掉「点了启动按钮还能一直按」——按钮现在跟着状态走：`created` 才显示

@@ -3941,15 +3941,49 @@ class Orchestrator:
         )
         return budget
 
+    def _apply_session_policy(self, node: TaskNode, action: PlanAction) -> dict:
+        """把 ``with_session`` 从"规划器断言"收敛为"本次 run 的实际会话派生值"（M27）。
+
+        **为什么改**：skill SOP 里 ``with_session`` 是写成 ``true`` 的模板文字，
+        而构造器对"声明 true 却没有会话"是 fail-closed 的——于是 scope 未配预置
+        会话时，整条 scan 子任务在**命令构造**阶段就判失败。M9a 之后"只填 target
+        就建任务"是默认路径（控制台的 cookie 是可选框），故默认路径上爬行面
+        100% 丢失：每次任务只剩种子 URL 的一发 httpx，几秒就"跑完"。
+
+        **判据**：声明 true ∧ 本次 run 无会话 ⇒ 降级为匿名执行，并记审计
+        ``session_injection_skipped``（**绝不静默**）。有会话时原样透传，凭据仍由
+        构造器注入，LLM 永不接触原文；构造器侧的 fail-closed 校验保留不删（它是
+        "不得凭一句声明凭空造凭据"的最后一道兜底）。
+        """
+        params = dict(action.params)
+        if not params.get("with_session"):
+            return params
+        if self._session() is not None:
+            return params
+        params["with_session"] = False
+        self.audit.record(
+            "session_injection_skipped",
+            node_id=node.id,
+            tool=action.tool,
+            skill=action.skill,
+            declared_with_session=True,
+            reason=(
+                "规划声明 with_session=true，但 scope 未配置预置会话；"
+                "降级为匿名执行（否则本阶段会在命令构造处必挂）"
+            ),
+        )
+        return params
+
     def _exec_run_tool(self, node: TaskNode, action: PlanAction, skill) -> str:
         """执行 run_tool 动作，返回 ok/retry/failed/blocked。"""
         request_budget = self._resolve_request_budget(node, action.tool)
         if action.tool in REQUEST_BUDGET_TOOLS and request_budget is None:
             return "failed"  # 迁移与审计已在 _resolve_request_budget 内完成
+        params = self._apply_session_policy(node, action)
         try:
             argv = build_command(
                 action.tool,
-                action.params,
+                params,
                 egress_proxy_url=self.runner.egress_proxy_url,
                 session=self._session(),
                 request_budget=request_budget,

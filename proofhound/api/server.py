@@ -93,6 +93,8 @@ def _engagement_summary(eng: Engagement) -> dict:
         "created_at": eng.created_at,
         "with_session": eng.with_session,
         "with_reference_session": eng.with_reference_session,  # M8c
+        # M27：降级标志（有阶段失败但主链路走完）——列表页也要能看出"这不是干净完成"
+        "degraded": eng.degraded,
         "findings": _findings_counts(eng),
     }
 
@@ -110,6 +112,8 @@ def _engagement_detail(manager: EngagementManager, eng: Engagement) -> dict:
             # 否则前端只能猜（按钮会在请求与生效之间闪回"暂停"）。
             "pause_requested": eng.pause_requested,
             "paused_from": eng.paused_from.value if eng.paused_from else None,
+            # M27：逐 skill 阶段终态 + 失败原因（控制台据此把对应阶段标红）
+            "phases": eng.phases,
         }
     )
     return detail

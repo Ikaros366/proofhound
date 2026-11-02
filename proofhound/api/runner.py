@@ -41,6 +41,11 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def _status_value(status) -> str:
+    """把 TaskStatus/字符串统一成审计与 JSON 里那套裸字符串（M27）。"""
+    return getattr(status, "value", str(status))
+
+
 # ---- 领域错误（server.py 翻译成 HTTP 响应） ----
 
 
@@ -248,6 +253,9 @@ class Engagement:
         self.with_session: bool = bool(meta.get("with_session"))
         # M8c：第二身份会话（reference/victim）是否配置（值永不进响应体）
         self.with_reference_session: bool = bool(meta.get("with_reference_session"))
+        # M27：各阶段 skill 的终态记录。engagement.state=done 只说明主链路走完，
+        # 不说明每个阶段都成功——失败要能从这里被看见，而不是只躺在 audit.jsonl。
+        self._phases: list[dict] = [dict(record) for record in (meta.get("phases") or [])]
         self._mode = AutonomyMode(meta["autonomy_mode"])
         self._state = EngagementState(meta["state"])
         self._lock = threading.RLock()
@@ -289,6 +297,32 @@ class Engagement:
     def running(self) -> bool:
         with self._lock:
             return self.thread is not None and self.thread.is_alive()
+
+    # ---- 阶段终态（M27） ----
+
+    @property
+    def phases(self) -> list[dict]:
+        """scan/triage/verify 各 skill 的终态记录（深拷贝，调用方随便改）。"""
+        with self._lock:
+            return [
+                {**record, "children": [dict(c) for c in record.get("children") or []]}
+                for record in self._phases
+            ]
+
+    @property
+    def degraded(self) -> bool:
+        """是否有阶段**失败/受阻**（有 = 这次任务是"降级完成"，不是干净完成）。"""
+        with self._lock:
+            return any(
+                record.get("status") in ("failed", "blocked")
+                for record in self._phases
+            )
+
+    def set_phases(self, records: list[dict]) -> None:
+        """登记阶段终态并落盘 api.json（终态时由执行线程调用）。"""
+        with self._lock:
+            self._phases = list(records)
+            self._persist()
 
     # ---- 协作式暂停 ----
 
@@ -350,6 +384,8 @@ class Engagement:
             "created_at": self.created_at,
             "with_session": self.with_session,
             "with_reference_session": self.with_reference_session,
+            # M27：阶段终态随元数据持久化（详情/列表接口读它，控制台据此标红）
+            "phases": self._phases,
         }
         if self.derived_scope is not None:
             # M9a：派生范围必须随之持久化——否则每次状态迁移写回都会把它抹掉，
@@ -397,6 +433,8 @@ class EngagementRunner:
         self.rt = runtime
         self.phases_factory = phases_factory
         self.confirm_timeout = confirm_timeout
+        # M27：逐 skill 的阶段终态（scan 带子任务失败原因）
+        self._phases: list[dict] = []
 
     # ---- 主流程 ----
 
@@ -418,7 +456,28 @@ class EngagementRunner:
             eng.checkpoint()
             self._verify(phases)
             eng.checkpoint()
-            eng.transition(EngagementState.DONE, reason="全部阶段完成")
+            # 先落盘阶段终态再迁移到 done——不留"state 已是 done 但 phases 还没写"
+            # 的窗口（详情接口与控制台的第一次轮询就可能撞上）。
+            eng.set_phases(self._phases)
+            degraded = [
+                str(record.get("skill"))
+                for record in self._phases
+                if record.get("status") in ("failed", "blocked")
+            ]
+            if degraded:
+                # M27：阶段失败不再被"全部阶段完成"抹掉——降级要在终态理由里
+                # 看得见，逐条原因在 phases（API/控制台各自展示）。
+                skills = list(dict.fromkeys(degraded))
+                self.rt.audit.record(
+                    "engagement_degraded",
+                    engagement_id=eng.id,
+                    skills=skills,
+                    reason="部分阶段未成功，主链路继续；engagement 以降级态完成",
+                )
+                reason = "全部阶段完成（降级：" + "、".join(skills) + " 未成功）"
+            else:
+                reason = "全部阶段完成"
+            eng.transition(EngagementState.DONE, reason=reason)
         except BudgetExceededError as exc:
             # token 预算硬闸：任何自治模式不可绕过（与 scope 同级）
             self.rt.audit.record(
@@ -461,13 +520,20 @@ class EngagementRunner:
             ]
             if approved:
                 if legacy:
-                    phases.scan(approved)
+                    node = phases.scan(approved)
                 else:
-                    phases.scan_with_skill(skill_name, approved)
+                    node = phases.scan_with_skill(skill_name, approved)
+                self._record_phase(phase="scan", skill=skill_name, node=node)
             else:
                 self.rt.audit.record(
                     "phase_skipped",
                     phase="scan" if legacy else f"scan:{skill_name}",
+                    reason="全部目标被拒绝或未授权",
+                )
+                self._record_phase(
+                    phase="scan",
+                    skill=skill_name,
+                    status="skipped",
                     reason="全部目标被拒绝或未授权",
                 )
             # 暂停检查点：每个 scan skill 之后（协作式，不冻结在途 skill）
@@ -475,7 +541,13 @@ class EngagementRunner:
 
     def _triage(self, phases) -> None:
         self.rt.engagement.transition(EngagementState.TRIAGING, reason="triage 阶段启动")
-        phases.triage()
+        findings = phases.triage() or []
+        self._record_phase(
+            phase="triage",
+            skill="triage",
+            status="done",
+            reason=f"产出/合并 {len(findings)} 条候选",
+        )
 
     def _verify(self, phases) -> None:
         eng = self.rt.engagement
@@ -533,11 +605,58 @@ class EngagementRunner:
                     assemble_evidence_pack(finding, evidence_base=eng.dir)
                 # forbidden：fail-closed 停留 Hypothesis（审计已在 _gate 内记录）
             if legacy:
-                phases.verify()
+                processed = phases.verify() or []
             else:
-                phases.verify_with_skill(skill_name)
+                processed = phases.verify_with_skill(skill_name) or []
+            self._record_phase(
+                phase="verify",
+                skill=skill_name,
+                status="done",
+                reason=f"处理 {len(processed)} 条 Hypothesis",
+            )
             # 暂停检查点：每个 verify skill 之后（协作式，不冻结在途验证）
             eng.checkpoint()
+
+    # ---- 阶段终态记录（M27） ----
+
+    def _record_phase(
+        self,
+        *,
+        phase: str,
+        skill: str,
+        status: str = "done",
+        reason: str = "",
+        node=None,
+    ) -> None:
+        """登记一个阶段 skill 的终态（带失败原因），供 API/控制台如实展示。
+
+        旧式 phases（测试替身 ``FakePhases`` 等）的 ``scan`` 返回 None：拿不到
+        节点就按 ``done`` 记，**不凭空造降级态**，行为与 M27 之前一致。
+        """
+        record = {
+            "phase": phase,
+            "skill": skill,
+            "status": status,
+            "reason": reason,
+            "children": [],
+        }
+        if node is not None:
+            record["status"] = _status_value(getattr(node, "status", status))
+            children = [
+                {
+                    "name": child.name,
+                    "status": _status_value(getattr(child, "status", "")),
+                    "reason": getattr(child, "reason", "") or "",
+                }
+                for child in (getattr(node, "children", None) or [])
+            ]
+            record["children"] = children
+            failed = [
+                child for child in children if child["status"] in ("failed", "blocked")
+            ]
+            if failed and not record["reason"]:
+                record["reason"] = failed[0]["reason"]
+        self._phases.append(record)
 
     # ---- 自主模式闸门 ----
 
@@ -667,6 +786,8 @@ class EngagementRunner:
         except (OSError, json.JSONDecodeError):
             meta = {}
         meta["finished_at"] = _utc_now()
+        # M27：阶段终态同时进 api.json——详情接口与控制台读它，而不是只看 state
+        self.rt.engagement.set_phases(self._phases)
         meta_path.write_text(
             json.dumps(meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
@@ -916,11 +1037,12 @@ class OrchestratorPhases:
                 )
             )
 
-    def scan(self, targets: list[str]) -> None:
-        self._orch.run_scan_phase(targets, skill_name=self.scan_skill)
+    def scan(self, targets: list[str]):
+        """返回阶段任务节点（M27：上层据此汇报真实成败，而非只看 state）。"""
+        return self._orch.run_scan_phase(targets, skill_name=self.scan_skill)
 
-    def scan_with_skill(self, skill_name: str, targets: list[str]) -> None:
-        self._orch.run_scan_phase(targets, skill_name=skill_name)
+    def scan_with_skill(self, skill_name: str, targets: list[str]):
+        return self._orch.run_scan_phase(targets, skill_name=skill_name)
 
     def triage(self) -> list:
         return self._orch.run_triage_phase()

@@ -38,6 +38,10 @@ const PHASES = [
   { state: 'done', label: '完成', desc: '证据与报告就绪' },
 ];
 const PHASE_INDEX = { scanning: 0, triaging: 1, verifying: 2, confirming: 3, done: 4 };
+// M27：后端 phases 记录的 phase 名 → 进度条阶段键（失败要能落到具体那一格）
+const PHASE_STATE_BY_RECORD_PHASE = {
+  scan: 'scanning', triage: 'triaging', verify: 'verifying', report: 'done',
+};
 const RUNNING_STATES = new Set(['scanning', 'triaging', 'verifying']);
 const FINDING_STATE_LABEL = {
   signal: 'Signal', hypothesis: 'Hypothesis', reproduced: 'Reproduced',
@@ -545,6 +549,19 @@ function renderDetail(view, engId) {
     const pausedIndex = paused ? (PHASE_INDEX[detail.paused_from] ?? -1) : -1;
     const activeIndex = paused ? pausedIndex : (PHASE_INDEX[detail.state] ?? -1);
 
+    // M27：阶段成败以后端 detail.phases 为准——engagement.state=done 只说明主链路
+    // 走完，不代表每个 stage 都成功。没有这个来源时，扫描 phase 失败也会被
+    // doneAll 一律刷成绿色（"5 秒全绿跑完"正是这么来的）。
+    const phaseRecords = Array.isArray(detail.phases) ? detail.phases : [];
+    const degradedSkills = phaseRecords.filter(
+      (record) => record.status === 'failed' || record.status === 'blocked',
+    );
+    const failedStates = new Set(
+      degradedSkills
+        .map((record) => PHASE_STATE_BY_RECORD_PHASE[record.phase])
+        .filter(Boolean),
+    );
+
     const list = el('ol', 'phases');
     PHASES.forEach((phase, index) => {
       let status = 'pending';
@@ -553,7 +570,9 @@ function renderDetail(view, engId) {
         status = index < pausedIndex ? 'done' : index === pausedIndex ? 'paused' : 'pending';
       } else if (activeIndex >= 0 && index < activeIndex) status = 'done';
       else if (activeIndex >= 0 && index === activeIndex) status = 'active';
-      const item = el('li', `phase ${status}` + (failed ? ' failed' : ''));
+      // 降级优先于"已完成"着色：失败阶段绝不显示成绿色
+      if (failedStates.has(phase.state)) status = 'failed';
+      const item = el('li', `phase ${status}` + (failed && status !== 'failed' ? ' failed' : ''));
       item.appendChild(el('div', 'phase-track'));
       const label = el('div', 'phase-label');
       label.appendChild(el('span', 'dot'));
@@ -566,6 +585,15 @@ function renderDetail(view, engId) {
     });
     progressPanel.appendChild(list);
 
+    if (degradedSkills.length) {
+      const names = degradedSkills.map((record) => record.skill).join('、');
+      const firstReason = degradedSkills.find((record) => record.reason);
+      const reason = firstReason ? String(firstReason.reason).slice(0, 90) : '';
+      progressPanel.appendChild(
+        el('p', 'phase-warn', `降级：${names} 未成功${reason ? `（${reason}）` : ''}`),
+      );
+    }
+
     let ratio = 0;
     if (doneAll) ratio = 1;
     else if (failed || detail.state === 'created') ratio = 0;
@@ -573,7 +601,8 @@ function renderDetail(view, engId) {
     else if (activeIndex >= 0) ratio = (activeIndex + 0.5) / PHASES.length;
     const bar = el('div', 'progress' +
       (RUNNING_STATES.has(detail.state) ? ' running' : '') +
-      (paused ? ' paused' : '') + (failed ? ' failed' : '') + (doneAll ? ' done' : ''));
+      (paused ? ' paused' : '') + (failed ? ' failed' : '') + (doneAll ? ' done' : '') +
+      (doneAll && degradedSkills.length ? ' degraded' : ''));
     const fill = el('div', 'bar');
     fill.style.width = `${Math.round(ratio * 100)}%`;
     bar.appendChild(fill);
