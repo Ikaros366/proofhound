@@ -6,6 +6,37 @@
 
 ## [未发布]
 
+### 新增（M30：XXE 与不安全反序列化接入编排主链路）
+
+M25-a / M26-a 交付了两个**手工 CLI 先验**（`xxeprobe` / `fastjsonprobe`），但发现层
+根本产不出这两类候选：httpx 解析器把 `content_type` 直接丢掉了，`Signal` 模型也没有
+这个字段。于是"验证器登记了也永远零候选"——与限制 58/59 同一类缺陷。本阶段把生产
+者补齐，并把手验逻辑原样接进 `run_verify_phase`（**没有第二套判定实现**）。
+
+- **`findings/signal.py`**：`Signal` 增加 `content_type`；`tools/parsers/httpx_json.py`
+  不再丢弃它。
+- **`core/orchestrator.py`**：规则表按响应 Content-Type 派生候选——含 `xml`/`soap`
+  ⇒ `xxe`，含 `json` ⇒ `fastjson`（各配 `_TRIAGE_XXE_CAP` / `_TRIAGE_FASTJSON_CAP`，
+  进 `_TRIAGE_CAPS`）。候选保留**完整 URL**（探针 POST 到具体端点，不能像
+  error-disclosure 那样抹成 origin）。
+- **两个 handler**：`_verify_xxe` / `_verify_fastjson` 复用 `run_xxeprobe` /
+  `run_fastjsonprobe`；三态（confirmed / rejected / blocked）与结构性失败
+  （listener 起不来、观察通道未配）都如实记账，**覆盖不全一律 blocked 不驳回**。
+- **`verify/gate.py`**：登记 `xxe`（两条 method：`xml-entity-file-confirmed` /
+  `xml-entity-callback-confirmed`，证据标签 `xml-entity-resolution`）与 `fastjson`
+  （`deserialize-callback-confirmed`，证据标签 `deserialize-gadget-callback`）。
+- **生产栈槽位**：`OrchestratorPhases` 增第九/第十 verify 槽位（限制 59 的教训：
+  加类型必须同时补槽位）；`skills/profiles.py` + 两个 `SKILL.md` 同步。
+- **`verify/http_body.py`**：`post()` 支持 `ssl_context`，新增 `tls_context_for(scope)`
+  ——两个驱动的**普通 POST** 通道也接上 M28 的 TLS 策略（此前只有裸 TCP 通道认）。
+
+**默认行为不变**：没有 xml/json 端点就不产候选；`fastjson` 的观察通道仍是 opt-in
+（未配置 DNSLog/TCP 时 blocked 并写明原因，不静默跳过）。
+
+**测试**：`tests/test_xxe_fastjson_pipeline.py` 13 条（生产者 / 三态 / 结构性失败 /
+越界零请求 / method 与证据标签）；`tests/test_vuln_registry.py` 的落点清单与合成
+输入同步扩展（content-type 维度）。
+
 ### 变更（M29：无人值守档放大**能力**配额，授权类硬闸不动）
 
 `unattended` 此前在代码里除了闸门矩阵**什么都不影响**——闸门早已全 auto，于是

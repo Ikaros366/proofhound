@@ -395,6 +395,23 @@ def test_judge_canary_unavailable_is_blocked():
     assert "内容通道零覆盖" in judgment.reasons[0]
 
 
+def test_type_is_registered_with_named_methods_and_evidence_kind():
+    """M30：xxe 已登记（M25-a 当时刻意只定义常量、不登记）。
+
+    本用例锁住"常量名 ↔ 登记值"的对应关系，防止两处各写一份字符串。
+    """
+    from proofhound.verify.gate import VULN_REGISTRY
+
+    spec = VULN_REGISTRY["xxe"]
+    assert spec.methods == frozenset(
+        {xxe.XXE_FILE_METHOD, xxe.XXE_CALLBACK_METHOD}
+    )
+    assert spec.behavioral_kinds == frozenset({xxe.XXE_EVIDENCE_KIND})
+    assert spec.verify_skill == "verify-xxe"
+    assert spec.requires_session is False
+    assert spec.in_model_whitelist is False
+
+
 def test_judge_facts_record_all_negatives():
     judgment = _judge(file_probe=_obs("file", ALIVE_BODY))
     facts = judgment.facts
@@ -543,13 +560,15 @@ def test_entity_names_are_deduped():
 
 
 def test_methods_and_evidence_kind_are_named():
+    """常量名固定（M25-a 定义，M30 登记）；且两个 method 跨类型唯一。"""
     assert xxe.XXE_FILE_METHOD == "xml-entity-file-confirmed"
     assert xxe.XXE_CALLBACK_METHOD == "xml-entity-callback-confirmed"
     assert xxe.XXE_EVIDENCE_KIND == "xml-entity-resolution"
-    # M25-a 只定义不登记：两个 method 都还不该进 VULN_REGISTRY 的任一 methods 集
+
     from proofhound.verify.gate import VULN_REGISTRY
 
-    registered = {method for spec in VULN_REGISTRY.values() for method in spec.methods}
-    assert xxe.XXE_FILE_METHOD not in registered
-    assert xxe.XXE_CALLBACK_METHOD not in registered
-    assert "xxe" not in VULN_REGISTRY
+    assert VULN_REGISTRY["xxe"].methods == frozenset(
+        {xxe.XXE_FILE_METHOD, xxe.XXE_CALLBACK_METHOD}
+    )
+    registered = [method for spec in VULN_REGISTRY.values() for method in spec.methods]
+    assert len(registered) == len(set(registered)), "method 名跨类型重用了"

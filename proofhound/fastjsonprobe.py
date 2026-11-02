@@ -69,7 +69,12 @@ from proofhound.compliance.session import redact_bytes as _session_redact_bytes
 from proofhound.compliance.session import secret_marker
 from proofhound.verify import fastjson as fj
 from proofhound.verify import observe
-from proofhound.verify.http_body import MAX_RESPONSE_BYTES, BodyResponse, post
+from proofhound.verify.http_body import (
+    MAX_RESPONSE_BYTES,
+    BodyResponse,
+    post,
+    tls_context_for,
+)
 from proofhound.verify.ssrf import resolve_callback_bind, resolve_callback_host
 
 #: 缺省证据目录的父目录（``evidence/`` 不入库）。
@@ -429,6 +434,8 @@ def _send_spec(
         session=config.scope.session,
         timeout=config.timeout,
         max_bytes=config.max_bytes,
+        # M30：scope 显式声明 insecure 才放宽（缺省严格校验）
+        ssl_context=tls_context_for(config.scope),
     )
     request_sha = sha256(body).hexdigest()
     audit.record(

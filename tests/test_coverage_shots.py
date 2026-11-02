@@ -77,9 +77,16 @@ class FakeCapturer:
 # ---- 纯函数 / 单一真相源 ----
 
 
-def test_every_registered_type_has_fixed_shots():
-    """镜头表与 VULN_REGISTRY 双向锁定：注册了类型就必须有镜头表，反之亦然。"""
-    assert set(coverage.COVERAGE_SHOTS) == set(VULN_REGISTRY)
+def test_every_registered_type_has_fixed_shots_or_an_explicit_exemption():
+    """镜头表与 VULN_REGISTRY 双向锁定（M30 起允许**显式豁免**）。
+
+    注册了类型就必须二选一：给镜头表，或进 ``NON_SHOT_VULN_TYPES`` 说明为什么
+    截图对这类不构成取证。豁免必须**显式**——漏登记仍然红。
+    """
+    assert set(coverage.COVERAGE_SHOTS) | set(coverage.NON_SHOT_VULN_TYPES) == set(
+        VULN_REGISTRY
+    )
+    assert not (set(coverage.COVERAGE_SHOTS) & set(coverage.NON_SHOT_VULN_TYPES))
 
 
 def test_shot_labels_are_unique_within_each_type():

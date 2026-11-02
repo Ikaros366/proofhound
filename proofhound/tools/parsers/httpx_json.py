@@ -48,6 +48,12 @@ def parse_httpx_jsonl(
                 source_tool=source_tool,
                 skill=skill,
                 evidence_ref=f"{evidence_path}#L{lineno}",
+                # M30：此前直接丢弃，导致 triage 无法区分 XML/JSON 端点
+                content_type=(
+                    data.get("content_type")
+                    if isinstance(data.get("content_type"), str)
+                    else None
+                ),
             )
         )
     return signals, skipped

@@ -25,3 +25,7 @@ class Signal(BaseModel):
     # M8a：仅 kind="form_page" 信号携带——页面内 POST 候选表单的字段名清单
     #（保序去重），供 triage 启发式键名匹配；其余 kind 恒为空。
     form_fields: list[str] = Field(default_factory=list)
+    # M30：响应 Content-Type（httpx ``-json`` 已给出，此前解析器直接丢弃）。
+    # triage 据此派生 XXE（xml/soap 端点）与 fastjson（json 端点）候选——
+    # 没有它，这两类漏洞在发现层**无法表达**，登记了验证器也永远零候选。
+    content_type: str | None = None

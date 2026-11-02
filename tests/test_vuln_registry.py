@@ -146,6 +146,17 @@ VULN_LANDINGS: dict[str, VulnLanding] = {
         # **不**进模型白名单。中间件错误页是 host 级现象，无需语义判断。
         "web-probe（按 origin 去重，host 级一条）",
     ),
+    "xxe": _landing(
+        "xxe",
+        # M30：由确定性规则表按**响应 Content-Type** 从 web-probe 派生
+        # （含 xml/soap），不进模型白名单——"这个端点说的是 XML"不需要语义判断。
+        "web-probe（响应 Content-Type 含 xml/soap）",
+    ),
+    "fastjson": _landing(
+        "fastjson",
+        # M30：同上，Content-Type 含 json 即派生；是否真会反序列化由验证期决定。
+        "web-probe（响应 Content-Type 含 json）",
+    ),
 }
 
 
@@ -189,6 +200,25 @@ def _synthetic_signals() -> list[Signal]:
                 source_tool="katana",
                 skill="recon-crawl",
                 evidence_ref=ref,
+            )
+        )
+
+    # M30：content-type 维度——xxe / fastjson 的规则表生产者按响应 Content-Type
+    # 派生，合成输入必须覆盖该维度，否则"有生产者"无法被这条守护证明。
+    for asset, content_type in (
+        ("http://h/ws/api", "application/xml; charset=utf-8"),
+        ("http://h/soap", "text/xml"),
+        ("http://h/api/user", "application/json"),
+    ):
+        signals.append(
+            Signal(
+                asset=asset,
+                status_code=200,
+                kind="web-probe",
+                source_tool="httpx",
+                skill="web-scan",
+                evidence_ref=ref,
+                content_type=content_type,
             )
         )
 

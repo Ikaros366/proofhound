@@ -850,6 +850,8 @@ class OrchestratorPhases:
         verify_cmdi_skill: str = "verify-cmdi",
         verify_ssti_skill: str = "verify-ssti",
         verify_error_disclosure_skill: str = "verify-error-disclosure",
+        verify_xxe_skill: str = "verify-xxe",
+        verify_fastjson_skill: str = "verify-fastjson",
     ):
         self._orch = orchestrator
         self.scan_skill = scan_skill
@@ -1055,6 +1057,41 @@ class OrchestratorPhases:
                     _builtin_risk_level(
                         verify_error_disclosure_skill,
                         error_disclosure.manifest.risk_level,
+                    ),
+                )
+            )
+        # M30：第九/第十 verify skill 槽位（XXE 与不安全反序列化）。两者此前只有
+        # 手工 CLI 先验（M25-a/M26-a），本阶段接进生产栈——**必须**同时补这两个
+        # 槽位，否则又是限制 59 那类"功能齐备但生产路径永不调用"。
+        xxe_skill = registry.get(verify_xxe_skill)
+        if xxe_skill is None or not xxe_skill.enabled:
+            reason = "skill 未注册" if xxe_skill is None else "skill 未启用"
+            orchestrator.audit.record(
+                "verify_skill_skipped",
+                skill=verify_xxe_skill,
+                reason=f"{reason}，跳过 XXE 验证",
+            )
+        else:
+            self.verify_skills.append(
+                (
+                    verify_xxe_skill,
+                    _builtin_risk_level(verify_xxe_skill, xxe_skill.manifest.risk_level),
+                )
+            )
+        fastjson_skill = registry.get(verify_fastjson_skill)
+        if fastjson_skill is None or not fastjson_skill.enabled:
+            reason = "skill 未注册" if fastjson_skill is None else "skill 未启用"
+            orchestrator.audit.record(
+                "verify_skill_skipped",
+                skill=verify_fastjson_skill,
+                reason=f"{reason}，跳过不安全反序列化验证",
+            )
+        else:
+            self.verify_skills.append(
+                (
+                    verify_fastjson_skill,
+                    _builtin_risk_level(
+                        verify_fastjson_skill, fastjson_skill.manifest.risk_level
                     ),
                 )
             )

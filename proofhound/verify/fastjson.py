@@ -130,6 +130,10 @@ CHANNEL_DNS = "dns"
 CHANNEL_TCP_LDAP = "tcp-ldap"
 CHANNEL_TCP_JDBC = "tcp-jdbc"
 
+#: M30：登记用的确认手段与证据标签（M26-a 只定义不登记，由本阶段接上编排主链路）
+FASTJSON_CONFIRMED_METHOD = "deserialize-callback-confirmed"
+FASTJSON_EVIDENCE_KIND = "deserialize-gadget-callback"
+
 #: gadget 名（顺序即**优先级**：越靠前越不会被预算挤掉）。
 GADGET_DNS_NESTED = "dns-nested"
 GADGET_CLASS_CACHE = "ldap-class-cache"

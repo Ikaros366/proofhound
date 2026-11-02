@@ -30,6 +30,7 @@ import hashlib
 import http.client
 import ssl
 import urllib.error
+import ssl
 import urllib.request
 from dataclasses import dataclass, field
 
@@ -133,6 +134,20 @@ def _read_limited(stream, max_bytes: int) -> tuple[bytes, bool]:
     return data, False
 
 
+def tls_context_for(scope) -> ssl.SSLContext | None:
+    """按 scope 的 TLS 策略造 SSLContext（M30，与 ``raw_http`` 同一裁定）。
+
+    ``strict``（缺省）返回 ``None``——调用方走系统缺省校验；只有 scope **显式**
+    声明 ``tls_verify: insecure`` 才返回跳过校验的上下文。它是本模块唯一的放宽
+    通道，与 ``raw_http._tls_context`` 共用同一段实现。
+    """
+    from proofhound.verify.raw_http import _tls_context
+
+    if getattr(scope, "tls_verify", "strict") == "insecure":
+        return _tls_context(False)
+    return None
+
+
 def post(
     url: str,
     body: bytes | str,
@@ -142,6 +157,7 @@ def post(
     timeout: float = DEFAULT_TIMEOUT,
     max_bytes: int = MAX_RESPONSE_BYTES,
     extra_headers: dict[str, str] | None = None,
+    ssl_context: ssl.SSLContext | None = None,
 ) -> BodyResponse:
     """POST ``body`` 到 ``url``（不跟随重定向），返回 :class:`BodyResponse`。
 
@@ -159,7 +175,10 @@ def post(
         ),
         method="POST",
     )
-    opener = urllib.request.build_opener(_NoRedirect())
+    handlers: list = [_NoRedirect()]
+    if ssl_context is not None:
+        handlers.append(urllib.request.HTTPSHandler(context=ssl_context))
+    opener = urllib.request.build_opener(*handlers)
     try:
         with opener.open(request, timeout=timeout) as resp:
             data, truncated = _read_limited(resp, max_bytes)
@@ -193,6 +212,7 @@ def post(
 
 __all__ = [
     "DEFAULT_CONTENT_TYPE",
+    "tls_context_for",
     "DEFAULT_TIMEOUT",
     "MAX_RESPONSE_BYTES",
     "BodyResponse",

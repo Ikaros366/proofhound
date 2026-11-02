@@ -722,12 +722,13 @@ def test_verify_handlers_cover_ssrf_and_stay_disjoint():
         SimpleNamespace(
             _verify_sqli=1, _verify_xss=1, _verify_idor=1, _verify_ssrf=1,
             _verify_unauth=1, _verify_cmdi=1, _verify_ssti=1,
-            _verify_error_disclosure=1,
+            _verify_error_disclosure=1, _verify_xxe=1, _verify_fastjson=1,
         )
     )
     assert set(handlers) == {
         "verify-sqli", "verify-xss", "verify-idor", "verify-ssrf", "verify-unauth",
         "verify-cmdi", "verify-ssti", "verify-error-disclosure",
+        "verify-xxe", "verify-fastjson",
     }
     expected = {
         "verify-sqli": frozenset({"sqli"}),
@@ -738,6 +739,8 @@ def test_verify_handlers_cover_ssrf_and_stay_disjoint():
         "verify-cmdi": frozenset({"cmdi"}),
         "verify-ssti": frozenset({"ssti"}),
         "verify-error-disclosure": frozenset({"error-disclosure"}),
+        "verify-xxe": frozenset({"xxe"}),
+        "verify-fastjson": frozenset({"fastjson"}),
     }
     for name, vuln_types in expected.items():
         assert handlers[name][0] == vuln_types, name

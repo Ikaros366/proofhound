@@ -43,6 +43,15 @@ from dataclasses import dataclass, field
 
 from proofhound.findings.finding import Finding
 from proofhound.verify.cmdi import CMDI_CONFIRMED_METHOD
+from proofhound.verify.fastjson import (
+    FASTJSON_CONFIRMED_METHOD,
+    FASTJSON_EVIDENCE_KIND,
+)
+from proofhound.verify.xxe import (
+    XXE_CALLBACK_METHOD,
+    XXE_EVIDENCE_KIND,
+    XXE_FILE_METHOD,
+)
 from proofhound.verify.error_disclosure import (
     ERROR_DISCLOSURE_CONFIRMED_METHOD,
     ERROR_TRACE_EVIDENCE_KIND,
@@ -220,6 +229,31 @@ VULN_REGISTRY: dict[str, VulnSpec] = {
         # 判据与身份无关：基线与畸形请求都不带任何凭据
         requires_session=False,
         note="M23：畸形请求错误页差分（≥2 类标记）；版本头只记审计，不算证据",
+    ),
+    "xxe": VulnSpec(
+        vuln_type="xxe",
+        # M30：两条通道各自是一种确认手段——内容通道（响应里出现 canary 文件的
+        # 签名）与回调通道（外部实体指向我们的 listener 并被访问）。名字沿用
+        # M25-a 已定义的两个常量，与其余类型互不染指。
+        methods=frozenset({XXE_FILE_METHOD, XXE_CALLBACK_METHOD}),
+        behavioral_kinds=frozenset({XXE_EVIDENCE_KIND}),
+        verify_skill="verify-xxe",
+        # 候选由**确定性规则**从 web-probe 的 content_type 派生（xml/soap 端点），
+        # 不做语义判断，故不进模型白名单。
+        in_model_whitelist=False,
+        # 判据是"解析器把外部实体解析了"，与身份无关；不带任何凭据。
+        requires_session=False,
+        note="M30：接上编排主链路（M25-a 只做了手工 CLI 先验）",
+    ),
+    "fastjson": VulnSpec(
+        vuln_type="fastjson",
+        methods=frozenset({FASTJSON_CONFIRMED_METHOD}),
+        behavioral_kinds=frozenset({FASTJSON_EVIDENCE_KIND}),
+        verify_skill="verify-fastjson",
+        in_model_whitelist=False,
+        # 判据是"反序列化把 gadget 发起的回调打到了我们这里"，与身份无关。
+        requires_session=False,
+        note="M30：接上编排主链路（M26-a 只做了手工 CLI 先验）",
     ),
 }
 

@@ -228,7 +228,7 @@ tools.d/dirsearch/
 > 改动内置 skill 即改动仓库文件（走正常代码评审）。配套的导入安全闸与上传/编辑端点
 > 因此一并移除——没有外来脚本可扫。
 
-内置 skill 十一个，各自由 `SKILL.md`（YAML frontmatter + 正文 SOP）声明：
+内置 skill 十三个，各自由 `SKILL.md`（YAML frontmatter + 正文 SOP）声明：
 
 | skill | 风险级 | 是否改变目标状态 | 作用 |
 |---|---|---|---|
@@ -242,6 +242,8 @@ tools.d/dirsearch/
 | `verify-cmdi` | L2 | **否（只读）** | 带外回调确认 + DNS 非命中防伪（M18） |
 | `verify-ssti` | L2 | **否（只读）** | 模板注入差分求值（基线 + 两个乘积 + 畸形对照，M22-b） |
 | `verify-error-disclosure` | L2 | **否（只读）** | 畸形请求错误页差分（≥2 类标记；版本头不算证据，M23） |
+| `verify-xxe` | L2 | **否（只读）** | 外部实体解析确认：canary 文件签名或我们自己的 listener 被访问（M30） |
+| `verify-fastjson` | L2 | **否（只读）** | 不安全反序列化：观察点收到带唯一 token 的带外回调才算（DNS/TCP，M30） |
 | `web-dirsearch` | L1 | 是 | dirsearch 字典爆路径（请求量受 scope 预算约束；**opt-in**，M19-c） |
 
 **风险画像以代码为准**：`proofhound/skills/profiles.py` 的 `SKILL_PROFILES` 是

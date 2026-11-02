@@ -105,6 +105,20 @@ COVERAGE_SHOTS: dict[str, tuple[CoverageShot, ...]] = {
 }
 
 
+#: 刻意**不设**覆盖镜头的类型（M30）：截图对它们不构成有意义的取证。
+#:
+#: - ``xxe``：证据是响应正文里的文件签名，或"我们自己的 listener 被访问"；
+#:   画面既证不了"解析器解析了实体"，也可能把目标文件内容拍进 PNG 里；
+#: - ``fastjson``：证据是带外回调（DNS/TCP），画面上什么都没有。
+#:
+#: 与 :func:`plan_for` 的 ``None`` 语义一致：**不截图、不猜**。显式登记而非隐式
+#: 豁免——``tests/test_coverage_shots.py`` 用它与 ``VULN_REGISTRY`` 双向锁定。
+NON_SHOT_VULN_TYPES: dict[str, str] = {
+    "xxe": "证据是响应正文签名或回调事实，截图不构成取证",
+    "fastjson": "证据是带外回调，截图不构成取证",
+}
+
+
 def plan_for(vuln_type: str) -> tuple[CoverageShot, ...] | None:
     """取某类型的固定镜头表；未登记的类型返回 None（不截图，不猜）。"""
     return COVERAGE_SHOTS.get(vuln_type)
@@ -150,6 +164,7 @@ __all__ = [
     "CAP_PER_TYPE",
     "CAP_TOTAL",
     "COVERAGE_SHOTS",
+    "NON_SHOT_VULN_TYPES",
     "SESSION_ANONYMOUS",
     "SESSION_PRIMARY",
     "SESSION_REFERENCE",

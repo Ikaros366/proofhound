@@ -392,10 +392,21 @@ def test_judgment_records_both_channels_and_negatives(target, tmp_path):
 # =====================================================================
 
 
-def test_cli_does_not_touch_vuln_registry():
+def test_cli_layer_stays_out_of_the_registry():
+    """分层意图（M30 重述）：**CLI 层**不碰登记表，登记在编排层完成。
+
+    M25-a 时的写法是"assert xxe 不在 VULN_REGISTRY"——那是对**当时状态**的断言，
+    不是对分层纪律的断言；M30 登记之后它会假阳性地失败。真正要守的是：CLI 模块
+    不 import 也不写 gate，登记表由编排层维护。
+    """
+    import inspect
+
+    from proofhound import xxeprobe
     from proofhound.verify.gate import VULN_REGISTRY
 
-    assert "xxe" not in VULN_REGISTRY
-    assert "xml-entity-resolution" not in {
-        kind for spec in VULN_REGISTRY.values() for kind in spec.behavioral_kinds
-    }
+    source = inspect.getsource(xxeprobe)
+    assert "VULN_REGISTRY" not in source
+    assert "proofhound.verify.gate" not in source
+    # 登记表本身由编排层接上（M30），CLI 只提供判定与证据
+    assert "xxe" in VULN_REGISTRY
+    assert VULN_REGISTRY["xxe"].behavioral_kinds == frozenset({"xml-entity-resolution"})

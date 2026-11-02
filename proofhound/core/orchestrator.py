@@ -162,7 +162,27 @@ from proofhound.verify.idor_control import (
 )
 from proofhound.verify.prefilter import screen as prefilter_screen
 from proofhound.verify.prefilter import with_query_param as prefilter_with_query_param
+from proofhound.fastjsonprobe import (
+    FastjsonProbeError,
+    ProbeConfig as FastjsonProbeConfig,
+    run_fastjsonprobe,
+)
+from proofhound.verify import xxe as xxe_judge
+from proofhound.verify.fastjson import (
+    FASTJSON_CONFIRMED_METHOD,
+    FASTJSON_EVIDENCE_KIND,
+)
 from proofhound.verify.raw_http import DEFAULT_TIMEOUT as RAW_HTTP_DEFAULT_TIMEOUT
+from proofhound.verify.xxe import (
+    XXE_CALLBACK_METHOD,
+    XXE_EVIDENCE_KIND,
+    XXE_FILE_METHOD,
+)
+from proofhound.xxeprobe import (
+    ProbeConfig as XxeProbeConfig,
+    XxeProbeError,
+    run_xxeprobe,
+)
 from proofhound.verify.raw_http import send_raw as raw_http_send_default
 from proofhound.verify.screenshot import ScreenshotCapturer
 from proofhound.verify.ssti import (
@@ -331,6 +351,11 @@ _TRIAGE_SSTI_CAP = 10
 # 阶段最多 1 次基线 + 5 次畸形请求——不设限时会随 web-probe 信号数灌水。
 _TRIAGE_ERROR_DISCLOSURE_CAP = 10
 
+# M30：XXE / 不安全反序列化的每 engagement 新建上限。两者都由**响应 Content-Type**
+# 从 web-probe 派生，一个站点可能有多个 xml/json 端点，故与其余类型同量级封顶。
+_TRIAGE_XXE_CAP = 10
+_TRIAGE_FASTJSON_CAP = 10
+
 # M17-b：每 engagement 新建 unauth-exposure Hypothesis 上限（独立计数、独立
 # triage_capped 事件）。**必须**有独立上限：`web-exposure` 是全池唯一**没有**
 # 上限的类型（其余各有），而新生产者的候选量与 web-probe 信号数同阶，
@@ -384,6 +409,8 @@ _TRIAGE_CAPS: dict[str, int] = {
     "cmdi": _TRIAGE_CMDI_CAP,  # M18-b
     "ssti": _TRIAGE_SSTI_CAP,  # M22-a
     "error-disclosure": _TRIAGE_ERROR_DISCLOSURE_CAP,  # M23
+    "xxe": _TRIAGE_XXE_CAP,  # M30
+    "fastjson": _TRIAGE_FASTJSON_CAP,  # M30
 }
 
 # M9c②：**贵验证档**上限。启用廉价粗筛（``verify_prefilter``）时，cap 从
@@ -579,6 +606,36 @@ def _triage_candidates(
                     evidence_kind=STATUS_CODE_EVIDENCE_KIND,
                     source="web_probe",
                     asset=origin,
+                )
+            )
+        # M30：同一份可达信号再按**响应 Content-Type** 派生 XXE / fastjson 候选。
+        # 派生条件只看内容类型（xml/soap ⇒ 解析器可能在处理外部实体；json ⇒
+        # 可能在走 Java 反序列化），**不做语义判断**，故属规则表而非模型通道。
+        # 这两类此前只有手工 CLI 先验，发现层根本表达不出候选（限制 74/75）。
+        content_type = (signal.content_type or "").lower()
+        # 用**完整 URL** 而不是 origin：XXE/fastjson 探针是 POST 到具体端点，
+        # 抹掉路径等于把探针打到站根——和 error-disclosure 的"host 级现象"不同。
+        target_asset = signal.asset
+        if "xml" in content_type or "soap" in content_type:
+            candidates.append(
+                _TriageCandidate(
+                    vuln_type="xxe",
+                    param=None,
+                    severity="medium",
+                    evidence_kind=STATUS_CODE_EVIDENCE_KIND,
+                    source="web_probe",
+                    asset=target_asset,
+                )
+            )
+        if "json" in content_type:
+            candidates.append(
+                _TriageCandidate(
+                    vuln_type="fastjson",
+                    param=None,
+                    severity="high",
+                    evidence_kind=STATUS_CODE_EVIDENCE_KIND,
+                    source="web_probe",
+                    asset=target_asset,
                 )
             )
         return candidates
@@ -1176,6 +1233,10 @@ class Orchestrator:
                 frozenset({"error-disclosure"}),
                 self._verify_error_disclosure,
             ),
+            # M30：XXE 与不安全反序列化——手工 CLI（M25-a/M26-a）的先验逻辑
+            # 原样接进编排主链路，判定仍是零 LLM 的纯函数。
+            "verify-xxe": (frozenset({"xxe"}), self._verify_xxe),
+            "verify-fastjson": (frozenset({"fastjson"}), self._verify_fastjson),
         }
 
     def verify_skill_coverage(self, skill_name: str = "verify-sqli") -> frozenset[str]:
@@ -1507,6 +1568,255 @@ class Orchestrator:
 
         # 5. 证据门 → Verifier 终审 → 终态迁移（公共收尾，M8b 抽出复用）
         return self._gate_and_review(finding, skill, store)
+
+    # ---- M30：XXE / 不安全反序列化（fastjson 系）接入编排主链路 ----
+
+    def _probe_evidence_refs(self, out_dir: Path) -> list[str]:
+        """从探针输出目录挑证据引用（稳定顺序，只取真实存在的文件）。"""
+        refs: list[str] = []
+        for name in ("summary.md", "judgment.json", "summary.json"):
+            path = Path(out_dir) / name
+            if path.is_file():
+                refs.append(f"{path}#L1")
+        for path in sorted(Path(out_dir).glob("probe_*.json")):
+            refs.append(f"{path}#L1")
+        if not refs:
+            refs.append(f"{out_dir}#L1")
+        return refs[:5]
+
+    def _verify_xxe(self, finding: Finding, skill, store: FindingStore) -> str:
+        """verify-xxe SOP 的确定性执行（M30）：复用 ``xxeprobe`` 驱动。
+
+        确认铁律（沿用 M25-a 的判定，零 LLM）：**内容通道**（响应里出现 canary
+        文件的签名，两侧不出现阴性对照）或**回调通道**（外部实体指向我们的
+        listener 并被真实访问）二者之一成立才算；探针出错/覆盖不全一律 blocked，
+        **不驳回**——"没测到"不等于"不存在"。
+
+        ``blocked`` 的三种来源都单独记审计：缺 scope、asset 非 http(s)、探针结构性
+        失败（listener 起不来 / scope 拒绝）。
+        """
+        scope = getattr(self.runner, "scope", None)
+        if scope is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="runner 未挂 scope，xxe 验证缺 scope 防线（fail-closed）",
+            )
+            return "blocked"
+        if not finding.asset.startswith(("http://", "https://")):
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="xxe 候选 asset 不是 http(s) URL（fail-closed）",
+            )
+            return "blocked"
+        decision = check_scope(scope, [finding.asset])
+        if not decision.allowed:
+            self.audit.record(
+                "verify_scope_rejected",
+                finding_id=finding.id,
+                violations=decision.violations,
+            )
+            return "blocked"
+
+        out_dir = self.evidence_dir / f"xxe_{finding.id}"
+        try:
+            report = run_xxeprobe(
+                XxeProbeConfig(
+                    url=finding.asset,
+                    scope=scope,
+                    out_dir=out_dir,
+                    content_type=xxe_judge.DEFAULT_CONTENT_TYPE,
+                    callback_wait=xxe_judge.CALLBACK_WAIT_SECONDS,
+                    timeout=xxe_judge.DEFAULT_TIMEOUT,
+                    max_bytes=xxe_judge.MAX_RESPONSE_BYTES,
+                )
+            )
+        except XxeProbeError as exc:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=f"xxe 探针结构性失败（fail-closed）: {exc}",
+            )
+            return "blocked"
+
+        judgment = report.judgment
+        self.audit.record(
+            "xxe_judged",
+            finding_id=finding.id,
+            verdict=judgment.verdict,
+            channels=list(judgment.channels),
+            reasons=list(judgment.reasons)[:5],
+            out_dir=str(report.out_dir),
+        )
+        if not judgment.confirmed and judgment.verdict != "rejected":
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=(
+                    "xxe 差分未完成（覆盖不全，不驳回）: "
+                    + "；".join(judgment.reasons)
+                ),
+            )
+            return "blocked"
+
+        if judgment.verdict == "rejected":
+            finding.transition(
+                FindingState.REJECTED,
+                actor=skill.name,
+                reason="XXE 不成立：" + "；".join(judgment.reasons),
+            )
+            store.append(finding)
+            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+            return "rejected"
+
+        probes = report.summary.get("probes") or []
+        steps = [
+            f"POST {finding.asset}（Content-Type: {xxe_judge.DEFAULT_CONTENT_TYPE}，"
+            f"探针 {item.get('probe')}）→ HTTP {item.get('status')}"
+            for item in probes
+        ] or [f"POST {finding.asset} 发送 XXE 探针，过程见证据包"]
+        finding.verification = Verification(
+            method=(
+                XXE_FILE_METHOD
+                if "file" in judgment.channels
+                else XXE_CALLBACK_METHOD
+            ),
+            evidence_refs=self._probe_evidence_refs(report.out_dir),
+            reproduction_steps=steps,
+            verified_by=skill.name,
+            verified_at=_utc_now(),
+            claim="目标的 XML 解析器会解析外部实体",
+            expected="外部实体指向的 canary 文件内容或回调地址被真实解析",
+            actual="；".join(judgment.reasons),
+        )
+        if XXE_EVIDENCE_KIND not in finding.evidence_kinds:
+            finding.evidence_kinds.append(XXE_EVIDENCE_KIND)
+        finding.transition(
+            FindingState.REPRODUCED,
+            actor=skill.name,
+            reason="XXE 确认：" + "；".join(judgment.reasons),
+        )
+        store.append(finding)
+        return self._gate_and_review(
+            finding,
+            skill,
+            store,
+            summary={"channels": list(judgment.channels)},
+        )
+
+    def _verify_fastjson(self, finding: Finding, skill, store: FindingStore) -> str:
+        """verify-fastjson SOP 的确定性执行（M30）：复用 ``fastjsonprobe`` 驱动。
+
+        确认铁律（沿用 M26-a 的判定，零 LLM）：**观察点收到带本次唯一 token 的
+        带外回调**才算（DNS / TCP-LDAP / TCP-JDBC 任一通道）。目标响应里的
+        报错文本、状态码、解析控制位一律不是证据。
+
+        前置结构：没有可用的观察通道（DNSLog provider 未配置且 TCP 监听不可用）时
+        驱动会抛 ``FastjsonProbeError`` ⇒ blocked 并写明原因——这类候选**不会**
+        被静默跳过，也不会被当成"测过且安全"。
+        """
+        scope = getattr(self.runner, "scope", None)
+        if scope is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="runner 未挂 scope，fastjson 验证缺 scope 防线（fail-closed）",
+            )
+            return "blocked"
+        if not finding.asset.startswith(("http://", "https://")):
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="fastjson 候选 asset 不是 http(s) URL（fail-closed）",
+            )
+            return "blocked"
+        decision = check_scope(scope, [finding.asset])
+        if not decision.allowed:
+            self.audit.record(
+                "verify_scope_rejected",
+                finding_id=finding.id,
+                violations=decision.violations,
+            )
+            return "blocked"
+
+        out_dir = self.evidence_dir / f"fastjson_{finding.id}"
+        try:
+            report = run_fastjsonprobe(
+                FastjsonProbeConfig(
+                    url=finding.asset,
+                    scope=scope,
+                    out_dir=out_dir,
+                )
+            )
+        except FastjsonProbeError as exc:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=f"fastjson 探针结构性失败（fail-closed）: {exc}",
+            )
+            return "blocked"
+
+        judgment = report.judgment
+        self.audit.record(
+            "fastjson_judged",
+            finding_id=finding.id,
+            verdict=judgment.verdict,
+            channels=list(judgment.channels),
+            reasons=list(judgment.reasons)[:5],
+            out_dir=str(report.out_dir),
+        )
+        if not judgment.confirmed and judgment.verdict != "rejected":
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason=(
+                    "fastjson 判定未完成（覆盖不全，不驳回）: "
+                    + "；".join(judgment.reasons)
+                ),
+            )
+            return "blocked"
+
+        if judgment.verdict == "rejected":
+            finding.transition(
+                FindingState.REJECTED,
+                actor=skill.name,
+                reason="不安全反序列化不成立：" + "；".join(judgment.reasons),
+            )
+            store.append(finding)
+            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+            return "rejected"
+
+        probes = report.summary.get("probes") or []
+        steps = [
+            f"POST {finding.asset}（fastjson gadget 变体 {item.get('probe')}）"
+            f"→ HTTP {item.get('status')}"
+            for item in probes
+        ] or [f"POST {finding.asset} 发送反序列化探针，过程见证据包"]
+        finding.verification = Verification(
+            method=FASTJSON_CONFIRMED_METHOD,
+            evidence_refs=self._probe_evidence_refs(report.out_dir),
+            reproduction_steps=steps,
+            verified_by=skill.name,
+            verified_at=_utc_now(),
+            claim="目标的 JSON 反序列化会把攻击者控制的数据当对象实例化",
+            expected="gadget 发起的带外回调带着本次唯一 token 到达观察点",
+            actual="；".join(judgment.reasons),
+        )
+        if FASTJSON_EVIDENCE_KIND not in finding.evidence_kinds:
+            finding.evidence_kinds.append(FASTJSON_EVIDENCE_KIND)
+        finding.transition(
+            FindingState.REPRODUCED,
+            actor=skill.name,
+            reason="不安全反序列化确认：" + "；".join(judgment.reasons),
+        )
+        store.append(finding)
+        return self._gate_and_review(
+            finding,
+            skill,
+            store,
+            summary={"channels": list(judgment.channels)},
+        )
 
     def _gate_and_review(
         self,

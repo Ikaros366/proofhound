@@ -104,6 +104,24 @@ SKILL_PROFILES: dict[str, SkillProfile] = {
             "（差分二值事实），版本头只记审计、不构成证据"
         ),
     ),
+    "verify-xxe": SkillProfile(
+        risk_level="L2",
+        mutating=False,
+        note=(
+            "只读验证：4 条 POST XML 探针（基线 / 外部实体读 canary / 阴性对照 / "
+            "回调），只读白名单文件、不做实体膨胀、不写目标状态、不做协议链；"
+            "确认靠内容签名或我们自己的 listener 被访问（二值事实）"
+        ),
+    ),
+    "verify-fastjson": SkillProfile(
+        risk_level="L2",
+        mutating=False,
+        note=(
+            "只读验证：POST JSON 反序列化探针（基线 + 解析控制位 + gadget 变体 + "
+            "对照），确认只靠带外回调（DNS/TCP-LDAP/TCP-JDBC）收到本次唯一 "
+            "token，响应文本与状态码一律不是证据"
+        ),
+    ),
     "verify-unauth": SkillProfile(
         risk_level="L2",
         mutating=False,

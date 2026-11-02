@@ -59,7 +59,7 @@ from proofhound.compliance.audit import AuditLog
 from proofhound.compliance.scope import Scope, check_scope
 from proofhound.compliance.session import redact_bytes, secret_marker
 from proofhound.verify import xxe
-from proofhound.verify.http_body import BodyResponse, post
+from proofhound.verify.http_body import BodyResponse, post, tls_context_for
 from proofhound.verify.ssrf import (
     CallbackListener,
     SsrfListenerError,
@@ -426,6 +426,8 @@ def run_xxeprobe(config: ProbeConfig) -> ProbeReport:
                 session=config.scope.session,
                 timeout=config.timeout,
                 max_bytes=config.max_bytes,
+                # M30：scope 显式声明 insecure 才放宽（缺省严格校验）
+                ssl_context=tls_context_for(config.scope),
             )
             observation = xxe.ProbeObservation(
                 name=spec.name,
