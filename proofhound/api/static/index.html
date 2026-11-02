@@ -18,9 +18,14 @@
     <a href="#/" data-nav="list">任务</a>
     <a href="#/scopes" data-nav="scopes">授权</a>
     <a href="#/health" data-nav="health">健康</a>
+    <!-- 换肤：按钮由 /static/theme.js 按主题表生成，容器留在这里（无 JS 时不留半截界面） -->
+    <nav class="theme-picker" id="theme-picker" aria-label="界面主题">
+      <span class="theme-title">主题</span>
+    </nav>
   </aside>
   <main id="view"><noscript>本控制台需要启用 JavaScript。</noscript></main>
 </div>
+<script type="module" src="/static/theme.js"></script>
 <script type="module" src="/static/app.js"></script>
 </body>
 </html>

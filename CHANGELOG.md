@@ -6,6 +6,30 @@
 
 ## [未发布]
 
+### 新增（控制台换肤：四套预设主题 + 零浏览器存储）
+
+**做了什么**：控制台侧栏底部加「主题」选择器，四套预设——**深色（默认）/ 浅色 / 暗夜蓝 /
+纸墨**，点击即时生效。选择**只记在 URL 查询串** `?theme=<id>`（`history.replaceState`），
+刷新与书签保持同一套皮肤；**不写 `localStorage` / `sessionStorage` / cookie**（延续 M5b
+「零 Web 存储」纪律）；未知或缺省主题回落默认深色。
+
+- **`proofhound/api/static/theme.js`**（新增，零依赖零构建）：`THEMES` 表是唯一真相源，
+  按钮按表用 `createElement` + `textContent` 生成（无 HTML 字符串注入），写入
+  `<html data-theme>` 并同步 `aria-pressed`；
+- **`proofhound/api/static/app.css`**：主题变量化——把原先散落在各规则里的硬编码语义色
+  （危险/成功/警告/严重级徽标/时间戳/锚点等）收进 `--danger-fg`、`--ok-bg`、
+  `--sev-*-fg`、`--warn-*`、`--dim`、`--line` 等变量，新增三套
+  `[data-theme="…"]` 覆盖块；深色保持原样（`:root, [data-theme="dark"]`）。侧栏改 flex
+  列布局，主题选择器 `margin-top: auto` 贴底；每个色板用"该主题底色/强调色"对角切分；
+- **`proofhound/api/static/index.html`**：侧栏加入 `#theme-picker` 容器（含
+  `aria-label="界面主题"`），`theme.js` 先于 `app.js` 加载（首屏不闪默认色）。
+
+**测试**：新增 `tests/test_console_theme.py` **11** 个静态守护——主题表与 CSS 选择器
+一一对应、每套主题都定义核心变量、默认主题即第一项、色板覆盖全部预设、按钮用
+`textContent`、**静态资产零浏览器存储**、零外域 URL、侧栏挂载点与加载顺序。
+浏览器实跑核对（Playwright，本机 8099）：四套主题逐屏截图 + 切换生效、URL 记忆、
+刷新保持、未知主题回落四项断言全过。
+
 ### 新增（M26-a 不安全反序列化：fastjson 系手工 CLI 先验 + 两种观察介质）
 
 **做了什么**：把「目标解析了我们给的 `@type`」变成可观测的二值事实——

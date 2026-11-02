@@ -110,6 +110,10 @@ printf 'networks: [127.0.0.0/8]\nports: [8080]\n' > scopes/dvwa.yaml
 .venv/bin/python -m proofhound.api --workspace . --port 8000
 ```
 
+> 控制台可换肤：侧栏底部「主题」提供 **深色（默认）/ 浅色 / 暗夜蓝 / 纸墨** 四套预设，
+> 点击即时生效。选择**只记在 URL 查询串** `?theme=light`（刷新/书签保持），
+> **不写任何浏览器存储**——与「凭据不进浏览器存储」是同一条纪律。
+
 DVWA 首次使用需初始化数据库并登录拿会话 Cookie（admin/password，security=low）。以下纯标准库脚本输出可粘贴的 Cookie 串：
 
 ```bash
