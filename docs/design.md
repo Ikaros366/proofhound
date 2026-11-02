@@ -2166,6 +2166,163 @@ callback / callback-control / alive）。合并两处：
 
 边界与代价见 AGENTS.md 限制 74。
 
+### 7.30 不安全反序列化：两种观察介质与一个转义阳性对照（M26-a，2026-11-02）
+
+**定位**：CWE-502 的**手工先验**，不是新漏洞类型。本里程碑只回答一个问题：能不能把
+"目标解析了我们给的 `@type`"变成**二值事实**？能，但归因强度取决于观察介质。
+
+```json
+{"logname":{"@type":"java.net.Inet4Address","val":"phfj<32hex>.dnslog-domain"}}
+```
+
+#### 7.30.1 四层攻击面，本单只做 A + B
+
+"fastjson 反序列化"不是"开了 autoType 才有洞"这一件事。四个层次互不相同，
+**最要命的一层恰好不需要开 autoType**：
+
+| 层 | 依赖什么 | M26-a |
+|---|---|---|
+| **A** 默认配置即可命中 | 黑名单绕过 / `java.lang.Class` 类缓存两步链 / `expectClass` 旁路 | **做**（`ldap-class-cache`） |
+| **B** 需显式 autoType | `ParserConfig.setAutoTypeSupport(true)` / `Feature.SupportAutoType` | **做**（`Inet4Address` 五变体、`JdbcRowSetImpl`、`BasicDataSource`） |
+| **C** 非 `@type` 面 | `$ref` 循环（DoS）、JSONPath、JavaBean setter 绑定、fastjson2 JSONB | 只识别不判定（`$ref` 拒发） |
+| **D** 其它库/协议 | Jackson `enableDefaultTyping`、XStream、SnakeYAML、Hessian、原生流、PHP、.NET | 不做（留给泛化） |
+
+只打 B 层等于系统性漏掉"默认配置就能打"的那一支——故 A 层排在 gadget 优先级**第二位**，
+预算再紧也不裁（§7.30.5）。
+
+#### 7.30.2 为什么 dns/tcp 只算一条 method
+
+XXE 的 file / callback 证明的是**两件不同的事**（读到文件 vs 发出请求），故两条 method。
+这里的 `dns` / `tcp` 只是**同一件事的两种观测介质**：都只证明"目标去解析了我们给的主机
+名"。拆成两条 method 会让"这条 Confirmed 靠什么"在证据层被按**观测介质**切分，而介质
+不是漏洞语义差异。故 M26-b 的登记口径是：**一条 method**
+`deserialization-callback-confirmed` + 具名证据标签 `deserialization-side-effect`，
+通道（`dns` / `tcp-ldap` / `tcp-jdbc`）记在证据字段里。
+
+#### 7.30.3 阳性对照：把"回显"从"解析"里分出来
+
+响应里出现域名、路径、`@type` 字样**都不是证据**：`/login/echo` 这类端点会把解码后的
+JSON 原样吐回——类名当然出现。若阳性对照只判"响应里出现类名"，它会**成立**，而 gadget
+全沉默，三态会误落到 `rejected`。
+
+故未知类名写成 **JSON 转义形态**：
+
+```json
+{"data":{"@type":"proofhound\u002e<8hex>"}}
+```
+
+- 真解析器解码后查类，报错文本里是**解码形态** `proofhound.<8hex>`；
+- 原样回显的端点只能回吐**转义形态** `proofhound\u002e<8hex>`。
+
+判据因此是"**解码形态出现 且 转义形态不出现**"。这与 M25-a 的
+`PROOFHOUND&#45;ALIVE` 字符引用同构：让"对照成立"本身要求一次**真实变换**，且不增加
+请求数。另加一条独立判据"整个请求 JSON 被原样出现"⇒ 回显嫌疑，仍判 `blocked`。
+
+#### 7.30.4 TCP 归因：端口为主、token 为辅（交接单附录 B 的假设被实测改写）
+
+交接单附录 B 假设"token 在首包里是 ASCII 明文，正则抽即可"。对两个主力 gadget 都
+**不成立**：
+
+- `JdbcRowSetImpl` 的 JNDI/LDAP：URL 路径是"要查的名字"，JNDI 通常先发**匿名 simple
+  bind**（DN 为空），要等**服务端回 BindResponse 之后**才发带 base DN 的 SearchRequest
+  ⇒ token 在第二个客户端包里，而观察点按设计**不回应**；
+- `BasicDataSource` 的 JDBC/MySQL：协议是**服务端先说话**，客户端在收到 greeting 前
+  一个字节都不发 ⇒ 不实现 MySQL handshake 就永远读不到 token。
+
+两条路都要观察点"会说话"（发 BindResponse / greeting），而那会把"只观察"的边界往前挪
+一步。故本里程碑把归因主判据换成 **probe-scoped 临时端口**：每个探针独占一个监听端口，
+"连接到达该端口 + 源 IP + 时间窗"就是该探针的事实；能读到 token 时另记
+`attribution="token"` 作为佐证。端口随机、生命周期只有一次探测，故"别人的流量恰好连上
+它"在实践上不可能。观察点因此**全程不发任何协议帧**（回包恒为 0 字节常量）。
+
+代价如实记录：端口归因弱于 token 归因（见限制 75），且远程靶需要防火墙放行一个端口
+区间（`--tcp-port` 是**基址**，每个探针用 base+i）。
+
+**对照与复测各自新分配一套回调落点**（独立 token / 独立端口），形态与所对照的 gadget
+一致，**唯一变量是有没有 `@type`**。共用 token 时"对照触发的迟到连接"与"实体触发的
+连接"在观察点里同形，无法区分——这是 M25-a 用两个独立 token 解决过的同一个坑。
+
+#### 7.30.5 预算：编码协商与优先级截断
+
+每入口**硬上限 12 次请求**、命中即停。坑位先占：`baseline` 1、阳性对照 1（静默时最多
+再补 2 次——服务端认哪种 base64 变体只有打了才知道）、阴性对照 1、复测 1（仅命中时）。
+剩余才给 gadget，按固定优先级：
+
+```
+dns-nested → ldap-class-cache(A 层) → ldap-jdbcrowset → dns-toplevel
+→ jdbc-basicdatasource → dns-lclass → dns-array → dns-unicode
+```
+
+被预算挤掉的**只能是最末的语法变体**，A 层两项与两个 TCP 族永不被裁。最坏情形
+（编码协商用满）为 1+3+6+1+1 = 12。
+
+#### 7.30.6 失败语义
+
+| 情形 | 结论 | 为什么 |
+|---|---|---|
+| 观察点收到本次唯一 token ∧ 阴性对照零观测 ∧ 阳性对照成立 | **confirmed** | 唯一可归因的带外二值事实 |
+| 阳性对照成立 ∧ 全部 gadget 族被明确拒绝语义驳回 ∧ 零观测 | **rejected** | 真阴性（≠"没有反序列化风险"） |
+| 阳性对照被吞（响应空白/通用错误页） | **blocked** | 无法区分"关了 autoType"与"body 没被解析" |
+| 阳性对照被原样回显（转义形态出现 / 整个请求 JSON 出现） | **blocked** | 回显不是解析证据 |
+| 阴性对照命中（非 `@type` 路径也触发回调） | **blocked** | 回调不可归因（前置代理/预取形态） |
+| 观察点不可用 / 未配置 | **blocked** | 通道零覆盖 |
+| 部分 gadget 族沉默（既无拒绝语义也无回调） | **blocked** | 沉默不可解释 |
+| 请求失败 / 网关页 / 未拿到响应 | **blocked** | 覆盖不全，绝不驳回 |
+
+> **绝大多数"没测出来"只能是 `blocked`**：版本、开关、黑名单、出站策略四者任一都能造成
+> 同样的沉默。`rejected` 只在"目标明确说了不"时出现，且只说明"该入口当前对这组 payload
+> 不成立"。
+
+#### 7.30.7 证据与确定性
+
+`evidence/fastjson/<ts>/`：`probe_<n>.json`（变体/编码/状态码/是否命中/对照结果/sha256，
+**无正文**）、`request_<n>.json`（模板名 + 编码后 sha256 + 解码后 JSON，token 只留 sha8）、
+`response_<n>.txt`（0600、截断 ≤256KB、会话秘密 + token 脱敏）、`observations.json`
+（DNS 记录 / TCP 连接：来源 IP、端口、首包 sha256、脱敏摘录）、`judgment.json`（三态 +
+通道事实 + 全部否定项）、`summary.json`（**不含时间戳、输出路径、端口与 token** ⇒ 连跑
+两次逐字节一致）、`summary.md`、`audit.jsonl`。
+
+脱敏是**按形态**做的：证据落盘前把任何 `phfj_?<32hex>` 替换成 `sha256:<hex8>`，不依赖
+调用方是否登记过这个 token——对照与复测的 token 是运行中新建的，靠"登记清单"一定会漏。
+
+#### 7.30.8 实测（2026-11-02）
+
+`scripts/demo_fastjson.py`，本机七靶（**形态仿真**）+ 真 TCP 观察点 + 真本机 stub provider，
+**40/40 断言全绿**：
+
+| 靶 | 行为 | 结论 |
+|---|---|---|
+| `/login/dns` | 处理 `@type`，`Inet4Address` 触发 DNS 查询登记 | **CONFIRMED（dns）** |
+| `/login/ldap` | 处理 `@type`，类缓存两步链连上观察点 | **CONFIRMED（tcp-ldap）**（A 层！） |
+| `/login/safe` | 处理 `@type`，明确回 `autoType is not support` | **REJECTED**（真阴性） |
+| `/login/swallow` | 处理 `@type`，异常被吞，200 空响应 | **BLOCKED**（对照被吞） |
+| `/login/echo` | 把解码后的 JSON 原样回显，不解析 | **BLOCKED**（回显陷阱被识别） |
+| `/login/prefetch` | 完整处理 `@type`，但前置代理解析 body 里任何主机名 | **BLOCKED**（对照命中） |
+| `/login/plain` | 任何 body 都 200（不认 JSON） | **BLOCKED**（全沉默） |
+
+**形态仿真如实声明**：Python 侧没有真 fastjson，故靶侧那个"会找 `@type` 并取数"的解析器
+是本脚本自己实现的（与 M23 的罐头堆栈、M25 的仿真 XML 解析器同一披露纪律）。其中两处
+要特别注意：① **DNS 通道**——真解析器由系统 resolver 发 DNS 查询，这里由靶把 qname
+`POST /register` 给本机 stub provider（tool 侧轮询 provider API 是真的 HTTP）；② **TCP
+通道**——真 JNDI 先匿名 bind，这里让靶主动发一段带 token 的 bind 字节，同时演示了 token
+归因；**端口归因**这条路径由 `tests/test_fastjsonprobe.py` 用一个**不发言**的靶单独钉住
+（模拟 MySQL）。判据代码**不依赖**靶的实现细节：只看观察点记录、响应字节与状态码。
+
+#### 7.30.9 明确不做（M26-a）
+
+- **不注册 `vuln_type`**、不改 `VULN_REGISTRY` / `GATE_MATRIX` / 任何既有 `_verify_*` /
+  `verify/ssrf.py` / `verify/http_body.py`；产物**不是 Finding**，不进报告、不进证据门
+  （登记与接生产者是 M26-b）。
+- **不做 C 层**（`$ref` 循环、JSONPath、setter 绑定）：`$ref` 直接被安全闸拒发；那是 DoS
+  与另一类问题。
+- **不做 D 层**（Jackson / XStream / SnakeYAML / Hessian / 原生流 / PHP / .NET）：留待
+  泛化——类型名建议就是 `deserialization`（交接单附录 C 的裁定），fastjson 只是第一支。
+- **不做盲打时间侧信道**、不做绕过库的完整复刻、不做任何写操作、不做反连 Shell / 内存马 /
+  第二阶段利用、不做 `javaCodebase` 远程类加载。
+- **不做编码或路径绕过变体**（只保留 `L` 前缀与一条 `\u` 转义作为语法代表）。
+
+边界与代价见 AGENTS.md 限制 75。
+
 ## 8. 开发路线图
 
 

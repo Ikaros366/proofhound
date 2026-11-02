@@ -38,9 +38,9 @@
 
 | 维度 | ProofHound | 传统扫描器 |
 |---|---|---|
-| 漏洞类型覆盖 | 少而精：**7 类可确认漏洞**（SQL 注入 / XSS / IDOR / SSRF / 未授权暴露 / 命令注入 / SSTI）+ **第 8 类服务器报错信息泄露用畸形请求差分确认**（M23）+ **2 个手工探测**（登录重放 M21-a / XML 外部实体 M25-a）；只做能行为确认的 | 数千条特征签名，广而浅 |
+| 漏洞类型覆盖 | 少而精：**7 类可确认漏洞**（SQL 注入 / XSS / IDOR / SSRF / 未授权暴露 / 命令注入 / SSTI）+ **第 8 类服务器报错信息泄露用畸形请求差分确认**（M23）+ **3 个手工探测**（登录重放 M21-a / XML 外部实体 M25-a / 不安全反序列化 M26-a）；只做能行为确认的 | 数千条特征签名，广而浅 |
 | 输出语义 | Confirmed 即铁证：行为验证 + 证据链 + Verifier 终审 + CVSS 代码算分 | Potential 待人工，误报率自担 |
-| 发现面 | Web 应用层（katana 爬行带参端点 + POST 表单页 + **JS 文件内端点**，M16-a）+ **JS 接口清单与未授权确认**（M24-a，手工 CLI，手工探测）+ **XML 端点（SOAP/SAML）的实体解析先验**（M25-a，手工 CLI） | 主机/端口/服务/全协议 |
+| 发现面 | Web 应用层（katana 爬行带参端点 + POST 表单页 + **JS 文件内端点**，M16-a）+ **JS 接口清单与未授权确认**（M24-a，手工 CLI，手工探测）+ **XML 端点（SOAP/SAML）的实体解析先验**（M25-a，手工 CLI）+ **JSON/表单反序列化入口的实体解析先验**（M26-a，手工 CLI） | 主机/端口/服务/全协议 |
 | 误报治理 | 多道闸：triage 启发式宁漏勿滥 → 行为验证 → 证据门 → Verifier 对抗校验 | 主要靠特征精度 |
 
 覆盖广度沿路线图渐进扩展，但纪律不变：**新漏洞类型必须先过"能否行为确认"这一关**——不能行为确认的宁可不做，绝不为凑覆盖率引入"疑似即确认"的降级路径。
@@ -460,6 +460,65 @@ python -m proofhound.xxeprobe \
 遗留系统，**没命中只说明"该端点当前不解析外部实体 / 不接受这段 XML"**；只做直接实体、
 不做盲 XXE；自动 canary 按工具所在平台选（跨平台目标请自带模板）；结果**不注册为
 Finding**（登记与接生产者是 M25-b）。
+
+## 不安全反序列化（fastjson 系）的手工先验（M26-a）
+
+反序列化（CWE-502）的确认事实只有一种：**目标真的去解析了我们给的主机名**——一次 DNS
+查询或一条 TCP 连接到达我们的观察点。这与 SSRF/cmdi/XXE 的回调通道同构：二值、可复现、
+不依赖响应内容。输入只要一个入口 URL 与一份 scope：
+
+```bash
+.venv/bin/python scripts/demo_fastjson.py            # 实弹：七个靶（形态仿真），40 条断言
+python -m proofhound.fastjsonprobe \
+  --url https://target/Taxi/login.htm \
+  --scope scopes/lab.yaml \
+  [--field json] [--encoding b64] [--json-template captured.json] \
+  [--tcp-port 0] [--dns-provider dnslog.cn] [--dns-wait 20]
+```
+
+**先纠正一个常见缩窄**：不安全反序列化不是"fastjson 开了 autoType"这一件事。fastjson
+有四层攻击面，**最要命的一层恰好不需要开 autoType**：
+
+| 层 | 依赖什么 | 本工具 |
+|---|---|---|
+| **A 默认配置即可命中** | 黑名单绕过 / `java.lang.Class` 类缓存两步链 | **做**（`ldap-class-cache`，排第二位、永不被预算挤掉） |
+| **B 需显式 autoType** | `SupportAutoType` 打开 | **做**（`Inet4Address` 系列 + `JdbcRowSetImpl` + `BasicDataSource`） |
+| **C 非 `@type` 面** | `$ref`、JSONPath、setter 绑定 | 只识别不判定（`$ref` 直接拒发） |
+| **D 其它库** | Jackson / XStream / SnakeYAML / Hessian / PHP / .NET | 不做（留给泛化） |
+
+判定口径（零 LLM，观察点事实优先）：
+
+| 结论 | 判据 |
+|---|---|
+| `confirmed` | 观察点收到**本次唯一 token** 的回调（DNS 全等 / TCP 端口归因），且阴性对照零观测，且阳性对照成立 |
+| `rejected` | 阳性对照成立，且**全部** gadget 族都被目标以明确拒绝语义驳回（`autoType is not support` / `safeMode not support autoType` / `ClassNotFoundException`），且观察点零观测 |
+| `blocked` | 其余一切：对照被吞、回显嫌疑、观察点不可用、部分族沉默、对照命中、请求失败 |
+
+- **阳性对照要求一次真实变换**：未知类名写成 JSON 转义形态 `proofhound\u002e<8hex>`——
+  真解析器的报错文本里是**解码形态** `proofhound.<8hex>`，原样回显的端点只能吐**转义
+  形态**。于是"响应里出现类名"不再是证据，`/login/echo` 这类回显端点判 `blocked`；
+- **A 层必须做**：只打 `Inet4Address` 会系统性漏掉"默认配置就能打"的类缓存两步链；
+- **两条观察通道**：TCP 自建（缺省，源 IP 就是目标，归因强）与 DNSLog provider
+  （opt-in：`dnslog.cn` / `ceye`）；未配置即该通道零覆盖（记 `observer_unavailable`，
+  **绝不**当成"没命中"）。地址复用 `PROOFHOUND_SSRF_CALLBACK_HOST/_BIND/_PORT`，
+  provider 用 `PROOFHOUND_DNSLOG_PROVIDER/_DOMAIN/_TOKEN/_API`；
+- **TCP 归因是端口为主、token 为辅**：`JdbcRowSetImpl` 的 JNDI 先匿名 bind、token 在
+  第二个包里，MySQL 更是服务端先说话——故每个探针**独占一个临时端口**，"连接到达该
+  端口 + 源 IP"就是事实；能读到 token 时另记作佐证；
+- **只观察、不投递**：观察点没有"发送任意字节"的 API，回包是构造期写死的常量（缺省
+  0 字节），绝不返回类字节 / `javaCodebase` / `javaFactory` / referral；
+- **对照与复测各自独立 token/端口**：形态与所对照的 gadget 一致、唯一变量是有没有
+  `@type`。共用 token 时"对照触发的迟到连接"与"实体触发的连接"在观察点里同形；
+- **预算与安全闸**：每入口 ≤12 次请求、命中即停；`$ref`、>32KB、深嵌套一律拒发；
+  每个 URL 发请求前过 `check_scope`；
+- **退出码**：0 = 至少 1 条 confirmed；1 = 无 confirmed；2 = 结构性失败（入口错误 /
+  无 scope / URL 越界 / **所有**观察通道都不可用 / 模板非法）。
+
+边界（与 AGENTS.md 限制 75 同源）：fastjson ≤1.2.68 的遗留 Java 系统是主战场，新系统多用
+fastjson2（默认关 `SupportAutoType`）或 Jackson；**没命中只说明"该入口当前对这组 payload
+不成立"**——版本、开关、黑名单、出站策略四者任一都能造成同样的沉默，**不等于不存在反序列化
+风险**；三个 DNSLog provider **未对真实服务验证**（实现环境无外网），`interactsh` 显式未
+实现（需要 RSA/AES，不新增第三方依赖）；结果**不注册为 Finding**（登记与接生产者是 M26-b）。
 
 ## 登录重放暴破探测（M21-a）
 

@@ -6,6 +6,66 @@
 
 ## [未发布]
 
+### 新增（M26-a 不安全反序列化：fastjson 系手工 CLI 先验 + 两种观察介质）
+
+**做了什么**：把「目标解析了我们给的 `@type`」变成可观测的二值事实——
+`python -m proofhound.fastjsonprobe`：**TCP 观察点**（缺省，源 IP 就是目标，归因强）与
+**DNSLog provider**（opt-in）。**M26-a 只做手工 CLI**：不注册 `vuln_type`、不动
+`VULN_REGISTRY` / `GATE_MATRIX` / 任何既有 `_verify_*` / `verify/ssrf.py` /
+`verify/http_body.py`，零新依赖、判定零 LLM；接生产是 M26-b。
+
+- **`proofhound/verify/observe.py`**：`Observation` 统一记录 + `TcpObserver`（每个探针
+  **独占临时端口**、只读首包、回包是构造期写死的常量）+ `DnsLogProvider` 协议与四个实现
+  （`dnslog.cn` / `ceye` / `interactsh` / 本机 stub）+ `LocalStubDnsServer`（demo 与单测
+  共用，零外网）；
+- **`proofhound/verify/fastjson.py`**：8 个 gadget（A 层类缓存两步链 + `Inet4Address` 的
+  五个语法变体 + `JdbcRowSetImpl` + `BasicDataSource`）、base64 三变体 + raw、转义形态
+  阳性对照、拒绝语义识别、`$ref`/超大/深嵌套安全闸、三态 `judge`；
+- **`proofhound/fastjsonprobe.py`**：CLI 与证据；退出码 0/1/2 = 有 confirmed / 无
+  confirmed / 结构性失败（入口错误·无 scope·URL 越界·**所有**观察通道不可用·模板非法）。
+
+**判定设计（三态，零 LLM）**：confirmed = 观察点收到**本次唯一 token** ∧ 阴性对照零观测
+∧ 阳性对照成立；rejected = 阳性对照成立 ∧ **全部** gadget 族被明确拒绝语义驳回 ∧ 零观测；
+其余一律 blocked（覆盖不全不驳回，沉默多为 blocked）。
+
+- **阳性对照要求一次真实变换**：未知类名写成 JSON 转义形态
+  `proofhound\u002e<8hex>`——真解析器的报错文本里是**解码形态**，原样回显的端点只能吐
+  **转义形态**；另有"整个请求 JSON 被原样出现"的第二条判据。回显端点因此只能 blocked
+  （§7.30.3），与 M25-a 的 `alive` 字符引用同构；
+- **TCP 归因以端口为主、token 为辅**：交接单附录 B 假设"token 在首包里"，实测语义下
+  对两个主力 gadget 都不成立（JNDI 先匿名 bind、要先回 BindResponse 才有带 base DN 的
+  SearchRequest；MySQL 更是服务端先说话）⇒ 每个探针独占端口，"连接到达 + 源 IP"是
+  事实，读到 token 只作佐证；
+- **对照与复测各自新分配 token/端口**：共用 token 无法区分"对照触发的迟到连接"与"实体
+  触发的连接"（M25-a 同款教训）；
+- **编码协商**：主编码的阳性对照静默时才补试另两种 base64 变体（≤2 次）；总请求数
+  **硬上限 12**、命中即停、A 层两项永不被预算挤掉。
+
+**安全边界（写死）**：观察点**没有**发送任意字节的 API，回包恒为 0 字节常量，绝不返回
+类字节 / `javaCodebase` / `javaFactory` / referral；`$ref`、>32KB body、深嵌套一律拒发；
+不做反连 Shell、不写文件、不做内存马、不做第二阶段利用；每个 URL 发请求前过
+`check_scope`；DNS label 用无下划线形态（`phfj<hex>`），比较**全等**（`startswith` 会把
+别人的记录算成自己的）。
+
+**证据**：`probe_<n>.json`（无正文）/ `request_<n>.json`（解码后 JSON，token 只留 sha8）/
+`response_<n>.txt`（0600、截断 ≤256KB、会话秘密 + token 脱敏）/ `observations.json` /
+`judgment.json` / `summary.json`（**不含时间戳·输出路径·端口·token** ⇒ 连跑两次逐字节
+一致）/ `summary.md` / `audit.jsonl`。
+
+**测试**：新增 `tests/test_observe.py` **33** + `tests/test_fastjson.py` **78** +
+`tests/test_fastjsonprobe.py` **33** = **144**；全量 **1820 passed / 2 skipped /
+1 xfailed**（基线 1676 → +144），**旧测试零改动**（`test_static_hygiene` 抓到两处
+只存不读的局部变量，已修）。
+
+**实弹** `scripts/demo_fastjson.py` 七靶 **40/40 断言全绿**：`/login/dns` 与
+`/login/ldap` confirmed（后者由 **A 层类缓存两步链**命中，不是只打 `Inet4Address`）、
+`/login/safe` rejected、`/login/swallow` `/login/echo` `/login/prefetch` `/login/plain`
+blocked；阴性对照零动作、prefetch 对照命中即 blocked、echo 响应里确实有域名与 `@type`
+但不得 confirmed、token 全等（同前缀不命中）、base64 三变体、TCP 回包 0 字节、每入口
+≤12 次且命中即停、证据 grep 不到 Cookie / 无 token 原文 / 0600、两次 `summary.json`
+逐字节一致、越界零请求。**靶侧是形态仿真**（DNS 登记由靶侧发起、LDAP bind 字节由靶
+发送），与 M23 罐头堆栈、M25 仿真解析器同一披露纪律；边界见 AGENTS.md 限制 75。
+
 ### 新增（M25-a XML 外部实体：手工 CLI 先验 + 两条确定性通道）
 
 **做了什么**：把「解析一段 XML」的两种可观测后果做成一条**手工先验**链——
