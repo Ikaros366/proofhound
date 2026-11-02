@@ -932,4 +932,8 @@ skill 画像）仍靠守护测试而非结构保证。
 
 ## 许可证
 
-[Apache-2.0](LICENSE)，Copyright 2026 Ikaros366。
+[GNU Affero General Public License v3.0](LICENSE)（`AGPL-3.0-only`），
+Copyright 2026 Ikaros366。
+
+以 AGPL-3.0 发布：**分发本软件（含修改版），或把它作为网络服务提供给他人使用**时，
+须按该协议第 13 条提供完整对应源代码。若需要不受该条款约束的商用授权，请与作者联系。

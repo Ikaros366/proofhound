@@ -6,6 +6,21 @@
 
 ## [未发布]
 
+### 变更（许可证：Apache-2.0 → AGPL-3.0）
+
+**为什么改**：Apache-2.0 只约束"分发"，把本项目包成 SaaS 对外提供并不触发任何源码
+义务；AGPL-3.0 第 13 条（Remote Network Interaction）把"通过网络提供服务"也纳入
+披露范围，符合"安全工具不该被白嫖成闭源商业服务"的意图。
+
+- **`LICENSE`**：全文替换为 GNU AGPL v3.0 官方正文（来源 SPDX
+  `license-list-data`，34020 字节，sha256 `d8a6cc31abc16b6748c7a21f21611f5a1ec33f67d22ca23d7da1c19b95496bee`）。
+- **`pyproject.toml`**：`license = "AGPL-3.0-only"`（SPDX 表达式，非 "or-later"，
+  即不授予"以后续版本"选择权）。
+- **`README.md`**：许可证章节同步，并写明第 13 条对网络服务的要求。
+
+**不追溯**：历史提交与既有 tag（`v0.1.0` / `v0.2.0`）仍按当时的 Apache-2.0 授权；
+本次变更只约束此后的版本。
+
 ### 新增（M30：XXE 与不安全反序列化接入编排主链路）
 
 M25-a / M26-a 交付了两个**手工 CLI 先验**（`xxeprobe` / `fastjsonprobe`），但发现层

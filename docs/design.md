@@ -2388,10 +2388,20 @@ GitHub 对双用途安全工具有成熟生态（Metasploit、sqlmap、nuclei、
 
 ### 11.3 发布清单（M3 完成后执行）
 
-- **协议**：Apache-2.0（含专利授权条款，企业采用友好）。
+- **协议**：GNU AGPL-3.0（强 copyleft：分发或以网络服务形式提供都需提供对应源码；如需不受该条款约束的商用授权，与作者联系）。
 - **仓库卫生**：README（用途定位 + 授权测试法律声明 + 靶场演示 GIF）、LICENSE、SECURITY.md（漏洞上报渠道）、CONTRIBUTING；gitleaks 全量扫密钥；清理内部 skill、客户报告模板、误报库真实数据。
 - **API 安全**（M5a）：确认队列持久化（confirmations.jsonl 追加、重启可恢复）+ operator 审计（action_approved/action_rejected/autonomy_mode_changed）已落地；API 默认只绑 localhost，发布前复查暴露面与认证缺口。
 - **社区飞轮**：引擎与 skill 库分仓（`proofhound` + `proofhound-skills`），参照 nuclei-templates 模式接受社区贡献 verify skill——skill 生态是项目的长期护城河。
 - **发布节奏**：M3 验证层跑通 + DVWA/XBEN 靶场 demo 后再公开发布；渠道 GitHub + 安全社区。
 
 > **M7 落地注记**（2026-08-09，开源准备）：① 协议定 Apache-2.0（LICENSE 全文入库，pyproject `license = "Apache-2.0"` SPDX 对齐）；② 仓库卫生——README（定位 + 法律免责声明前置 + 十分钟复现 + 工具/skill/模板/安全模型指南）、SECURITY.md（GitHub Security Advisories 渠道 + 信任模型 + 无认证部署警告）、CONTRIBUTING.md 简版、.env.example；③ 客户报告模板清除——git filter-repo 将模板二进制从全部历史抹除、全历史文本引用改写为中性表述（"自定义企业模板"），提交信息同步清洗，模板本机保留于 `templates/custom_enterprise_template.docx`（.gitignore 排除，相关测试/演示缺失自动 skip，公开/本机两态各自全绿）；④ gitleaks 全历史扫描 + 人工密钥复核（结论：零泄漏，.env/evidence/engagements 从未入库）；⑤ 演示 GIF（docs/demo.gif）嵌入 README；⑥ **分仓决策：proofhound-skills 本里程碑不拆**——skill 随主仓库发布，社区成形后再行拆分（§11.3 社区飞轮条目目标不变，仅节奏后移）；⑦ 打 v0.1.0 标签后公开。
+
+> **协议变更注记**（2026-11-02，M31）：① 协议由 **Apache-2.0 改为 GNU AGPL-3.0**——
+> 选型的理由是 Apache-2.0 只约束"分发"，把本项目包成 SaaS 对外提供不触发任何源码
+> 义务，与"安全工具不该被白嫖成闭源商业服务"的意图相悖；AGPL-3.0 第 13 条
+> （Remote Network Interaction）补上了这个缺口。② 落地：`LICENSE` 全文替换为
+> FSF 官方正文（经 SPDX `license-list-data` 取得，34020 字节，sha256
+> `d8a6cc31abc16b6748c7a21f21611f5a1ec33f67d22ca23d7da1c19b95496bee`）、
+> `pyproject.toml` `license = "AGPL-3.0-only"`（非 or-later，不授予"以后续版本"
+> 选择权）、README 许可证章节同步并写明第 13 条要求。③ **不追溯**：历史提交与
+> 既有 tag（`v0.1.0` / `v0.2.0`）仍按当时的 Apache-2.0 授权。

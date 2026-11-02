@@ -7,7 +7,7 @@ name = "proofhound"
 version = "0.5.0"
 description = "证据驱动、验证优先的自动化渗透测试 Agent 系统（证据门控反误报 / Docker 沙箱工具链 / LLM 三档路由与预算硬闸 / 模板化报告）"
 readme = "README.md"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 authors = [{ name = "Ikaros366" }]
 keywords = ["pentest", "security", "agent", "llm", "verification", "sqlmap", "dvwa"]
