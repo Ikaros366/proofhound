@@ -1135,6 +1135,23 @@ def sandbox_hardening(environ: Mapping[str, str] | None = None) -> bool:
     return mode == "strict"
 
 
+def capability_scale_for(engagement) -> int:
+    """该 engagement 的**能力**放大系数（M29）。
+
+    只有 ``unattended`` 放大：没人盯着时，配额卡住只会让任务停在那里等一个
+    不存在的人工升级，不如把候选上限/贵验证配额/失败重试给足。
+
+    **授权类硬闸不在此列**（scope 范围、``request_budget``、``tls_verify``、
+    token 预算）——它们必须由操作员显式声明，与自治模式无关。无人值守意味着
+    "没人盯着"，不意味着"可以少声明一次授权"。
+    """
+    from proofhound.core.orchestrator import UNATTENDED_CAP_SCALE
+
+    if engagement.current_mode() is AutonomyMode.UNATTENDED:
+        return UNATTENDED_CAP_SCALE
+    return 1
+
+
 def default_phases_factory(rt: EngagementRuntime) -> OrchestratorPhases:
     """构建真实执行栈：Docker 沙箱 + skill registry + 模型路由 + 编排器。
 
@@ -1198,12 +1215,15 @@ def default_phases_factory(rt: EngagementRuntime) -> OrchestratorPhases:
     router = ModelRouter.from_env(
         rt.env_file, audit=rt.audit, tracker=UsageTracker(), budget=budget
     )
+    # M29：能力系数（授权类硬闸不看这个值）
+    cap_scale = capability_scale_for(rt.engagement)
     orch = Orchestrator(
         registry,
         runner,
         router,
         rt.audit,
         evidence_dir=rt.engagement.dir,
+        cap_scale=cap_scale,
         # M9c：发现侧去锁。两者缺省关闭，保持与 M9c 之前逐字节等价；
         # 显式开启后：模型 triage 补关键词盲区，廉价粗筛只出建议、不丢候选。
         triage_model=_env_flag("PROOFHOUND_TRIAGE_MODEL"),
@@ -1211,6 +1231,20 @@ def default_phases_factory(rt: EngagementRuntime) -> OrchestratorPhases:
         # M20：证据截图（opt-in；未设即关闭，默认行为与 M20 之前逐字节等价）
         screenshots=_env_flag("PROOFHOUND_SCREENSHOT"),
     )
+    if cap_scale != 1:
+        # 放大过就要留痕：审计里能回答"这次为什么能做这么多"
+        rt.audit.record(
+            "capability_scaled",
+            mode=rt.engagement.current_mode().value,
+            scale=cap_scale,
+            triage_caps=orch.triage_caps,
+            expensive_cap=orch.expensive_cap,
+            failure_limit_per_category=orch.budget.limit_per_category,
+            reason=(
+                "无人值守档放大能力配额（候选上限/贵验证配额/失败重试）；"
+                "授权类硬闸（scope/request_budget/tls_verify/token 预算）不变"
+            ),
+        )
     return OrchestratorPhases(orch, registry)
 
 

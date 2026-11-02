@@ -93,12 +93,17 @@ def classify(output: str) -> FailureCategory:
     return FailureCategory.UNKNOWN
 
 
+#: 每类失败的重试上限缺省值。M29 起提成常量：无人值守档按能力系数放大它
+#: （见 ``orchestrator.UNATTENDED_CAP_SCALE``），不再在两处各写一个 2。
+DEFAULT_LIMIT_PER_CATEGORY = 2
+
+
 class FailureBudget:
     """子任务失败预算：同类失败计满 ``limit_per_category`` 次即耗尽。"""
 
     def __init__(
         self,
-        limit_per_category: int = 2,
+        limit_per_category: int = DEFAULT_LIMIT_PER_CATEGORY,
         hard_block: frozenset[FailureCategory] = HARD_BLOCK_CATEGORIES,
     ):
         if limit_per_category < 1:

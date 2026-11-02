@@ -62,7 +62,11 @@ from proofhound.findings.finding import (
 )
 from proofhound.findings.signal import Signal
 from proofhound.core.context import ContextOverflowError, ContextPolicy
-from proofhound.core.failures import FailureBudget, classify
+from proofhound.core.failures import (
+    DEFAULT_LIMIT_PER_CATEGORY,
+    FailureBudget,
+    classify,
+)
 from proofhound.core.plan import PlanAction, PlanValidationError
 from proofhound.core.planner import Planner
 from proofhound.core.tasks import (
@@ -357,6 +361,16 @@ _VERIFY_PRECONDITIONS: frozenset[str] = frozenset(
     for vuln_type, spec in VULN_REGISTRY.items()
     if spec.requires_session
 )
+
+#: M29：**无人值守档的能力放大系数**。只放大"做多少"，不放大"能碰哪里"：
+#:
+#: - **放大**（能力）：每类候选上限、贵验证配额、同类失败重试次数；
+#: - **不放大**（授权）：scope 范围、``request_budget``、``tls_verify``、
+#:   token 预算——这些必须由操作员**显式声明**，与自治模式无关。
+#:
+#: 这条界限是刻意的：无人值守意味着"没人盯着"，不意味着"可以少声明一次授权"。
+#: 想让它打更多目标/发更多请求/放宽 TLS，仍然要在 scope 里写清楚。
+UNATTENDED_CAP_SCALE = 2
 
 #: vuln_type → 每 engagement 新建 Hypothesis 上限（未登记的类型不限）。
 #: M17-b：由 `_ingest_candidates` 里的三个并列 if 收成一张查表——加类型时
@@ -676,7 +690,8 @@ class Orchestrator:
         triage_model: bool = False,
         verify_prefilter: bool = False,
         prefilter_fetch=None,
-        expensive_cap: int = _TRIAGE_EXPENSIVE_CAP,
+        expensive_cap: int | None = None,
+        cap_scale: int = 1,
     ):
         # llm 接受 ModelRouter（M2c 推荐：选路/计量/预算硬闸在路由层）；
         # 旧式单模型客户端由 Planner 自动包装适配（不计量）。
@@ -684,7 +699,11 @@ class Orchestrator:
         self.runner = runner
         self.audit = audit
         self.evidence_dir = Path(evidence_dir)
-        self.budget = budget or FailureBudget()
+        # M29：能力系数（无人值守档放大；授权类硬闸不看这个值）
+        self.cap_scale = max(1, int(cap_scale))
+        self.budget = budget or FailureBudget(
+            limit_per_category=DEFAULT_LIMIT_PER_CATEGORY * self.cap_scale
+        )
         self.tools = set(tools) if tools is not None else set(known_tools())
         self.parsers = parsers if parsers is not None else _default_tool_parsers()
         self.max_workers = max_workers
@@ -744,7 +763,17 @@ class Orchestrator:
         # 逐字节等价）。开启后 cap 卡在贵验证档而非候选生成侧。
         self.verify_prefilter = verify_prefilter
         self._prefilter_fetch = prefilter_fetch
-        self.expensive_cap = expensive_cap
+        # 显式传入的原样使用（调用方自己说了算）；缺省才按能力系数放大
+        self.expensive_cap = (
+            expensive_cap
+            if expensive_cap is not None
+            else _TRIAGE_EXPENSIVE_CAP * self.cap_scale
+        )
+        # 每类候选上限同理：按系数放大后快照一份，判定与审计读同一份
+        self.triage_caps = {
+            vuln_type: limit * self.cap_scale
+            for vuln_type, limit in _TRIAGE_CAPS.items()
+        }
         self._expensive_spent = 0  # 本 phase 已花的贵验证次数
         self._prefilter_advisory = 0  # 粗筛给出「不值得优先」建议的条数
 
@@ -901,7 +930,7 @@ class Orchestrator:
         # M18-b：**从 `_TRIAGE_CAPS` 派生**，不再手写列表——原先查表判上限、
         # 手写列表上报，两处不同源；加 `cmdi` 时只登记了查表，导致候选被正确
         # 丢弃却**没有任何审计事件**（静默丢弃）。
-        for vuln_type, limit in sorted(_TRIAGE_CAPS.items()):
+        for vuln_type, limit in sorted(self.triage_caps.items()):
             dropped = capped_by_type.get(vuln_type, 0)
             if dropped:
                 self.audit.record(
@@ -989,7 +1018,7 @@ class Orchestrator:
                 continue
             # 按类型上限查表（M17-b 由三个并列 if 收成一张表；语义零改动，
             # 各类型仍是**独立计数、独立 triage_capped**，互不挤占）。
-            cap = _TRIAGE_CAPS.get(candidate.vuln_type)
+            cap = self.triage_caps.get(candidate.vuln_type)
             if cap is not None and existing_by_type.get(candidate.vuln_type, 0) >= cap:
                 capped_by_type[candidate.vuln_type] = (
                     capped_by_type.get(candidate.vuln_type, 0) + 1

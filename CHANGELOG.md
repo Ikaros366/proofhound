@@ -6,6 +6,33 @@
 
 ## [未发布]
 
+### 变更（M29：无人值守档放大**能力**配额，授权类硬闸不动）
+
+`unattended` 此前在代码里除了闸门矩阵**什么都不影响**——闸门早已全 auto，于是
+"无人值守"与"半自动"在真正决定"能做多少"的地方没有区别。本阶段把这条补上，
+同时把界限写死：
+
+- **放大（能力）**：每类候选上限 ×2、贵验证配额 ×2、同类失败重试 ×2；
+- **不放大（授权）**：scope 范围、`request_budget`、`tls_verify`、token 预算——
+  必须由操作员**显式声明**，与自治模式无关。
+
+理由：无人值守意味着"没人盯着"，配额卡住只会让任务停在那里等一个不存在的人工
+升级；但"没人盯着"**不**意味着"可以少声明一次授权"——想把面铺大，仍然要在
+scope 里写清楚打哪里、发多少请求、验不验证书。
+
+- **`proofhound/core/failures.py`**：`DEFAULT_LIMIT_PER_CATEGORY = 2` 提成模块常量
+  （此前同一个 2 写在两处）。
+- **`proofhound/core/orchestrator.py`**：新增 `UNATTENDED_CAP_SCALE = 2` 与
+  `cap_scale` 构造参数；`triage_caps` / `expensive_cap` / 缺省 `FailureBudget`
+  按系数放大（**显式传入的配额不放大**，由调用方自己说了算）；`_ingest_candidates`
+  与 `triage_capped` 审计改读同一份 `self.triage_caps` 快照。
+- **`proofhound/api/runner.py`**：新增可测的 `capability_scale_for(engagement)`；
+  真实执行栈按模式传 `cap_scale`，放大时记审计 `capability_scaled`（含生效的
+  候选上限/贵验证配额/失败重试，便于事后回答"这次为什么能做这么多"）。
+- **测试** `tests/test_autonomy_caps.py` 7 条：三档系数、放大生效、缺省不变、
+  显式配额不被放大，以及三条**界限守卫**（无人值守仍不自动开 dirsearch、
+  TLS 缺省仍 strict、放大不改动 scope 任何授权字段）。
+
 ### 修复（M28：请求量授权在生产链路上被丢弃 + 进程内探针不放过自签靶）
 
 **两个"功能齐备但生产路径永不触发"**：
