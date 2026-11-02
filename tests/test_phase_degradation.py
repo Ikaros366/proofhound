@@ -51,7 +51,7 @@ class FakeRunner:
         self.scope = scope
         self.calls: list[list[str]] = []
 
-    def run(self, tool, args, timeout=300):
+    def run(self, tool, args, timeout=300, image=None):
         self.calls.append([tool, *args])
         uid = uuid.uuid4().hex[:12]
         stdout_path = self.evidence_dir / f"{uid}.stdout.log"

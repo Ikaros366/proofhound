@@ -41,7 +41,7 @@ class FakeRunner:
         self.handler = handler  # (tool, args) -> (exit_code, stdout, stderr) | "reject"
         self.calls = []
 
-    def run(self, tool, args, timeout=300):
+    def run(self, tool, args, timeout=300, image=None):
         self.calls.append([tool, *args])
         outcome = self.handler(tool, args)
         if outcome == "reject":

@@ -192,7 +192,7 @@ class _ForbiddenRunner:
 
     egress_proxy_url = None
 
-    def run(self, tool, args, timeout=300):
+    def run(self, tool, args, timeout=300, image=None):
         raise AssertionError("上下文超限不应执行工具")
 
 

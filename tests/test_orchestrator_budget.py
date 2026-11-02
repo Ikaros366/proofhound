@@ -34,7 +34,7 @@ class FakeRunner:
         self.handler = handler
         self.calls = []
 
-    def run(self, tool, args, timeout=300):
+    def run(self, tool, args, timeout=300, image=None):
         self.calls.append([tool, *args])
         exit_code, stdout, stderr = self.handler(tool, args)
         uid = uuid.uuid4().hex[:12]

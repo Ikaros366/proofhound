@@ -4351,7 +4351,15 @@ class Orchestrator:
             return "failed"
 
         node.attempts += 1
-        result = self.runner.run(argv[0], argv[1:])
+        # M31：按工具 manifest 的 ``image`` 覆盖沙箱镜像——与 verify 链路
+        # （``_verify_sqli`` 传 ``image=tool_images["sqlmap"]``）同一纪律。
+        # 此前 scan 链路**从不传 image**，一律用 runner 缺省镜像（alpine:3.20）：
+        # httpx/katana 是静态 Go 二进制，看不出问题；dirsearch 是 Python 工具，
+        # 在 alpine 里没有 python3 ⇒ 启动即 ``exit 127``，被失败预算判 blocked
+        # （实测：eng-20261102T085135Z-885d7d33 连挂两次）。
+        result = self.runner.run(
+            argv[0], argv[1:], image=self.tool_images.get(action.tool)
+        )
 
         if result.rejected:
             node.transition(
@@ -4407,6 +4415,21 @@ class Orchestrator:
         signals, skipped = parser(
             text, evidence_path=str(result.stdout_path), skill=skill.name
         )
+        # M31：越界信号在**记录处**就丢掉（红线 5 同纪律）。
+        # 此前只有 triage 在建候选前才 check_scope，越界信号仍会写进
+        # signals.jsonl 与 node.meta：katana 的 ``-jc`` 会从 JS 文本里提出跨源
+        # 绝对 URL（实测把 ``redux.js.org`` 的报错文档链接当成了 param-endpoint），
+        # 这类信号永远不可行动，只会污染证据与配额。
+        scope = getattr(self.runner, "scope", None)
+        dropped: list[str] = []
+        if scope is not None:
+            kept = []
+            for signal in signals:
+                if check_scope(scope, [signal.asset]).allowed:
+                    kept.append(signal)
+                else:
+                    dropped.append(str(signal.asset)[:120])
+            signals = kept
         signals_path = self.evidence_dir / f"{result.stdout_path.stem}.signals.jsonl"
         with signals_path.open("w", encoding="utf-8") as fh:
             for signal in signals:
@@ -4426,8 +4449,19 @@ class Orchestrator:
             tool=action.tool,
             count=len(signals),
             skipped_lines=skipped,
+            dropped_out_of_scope=len(dropped),
             signals_path=str(signals_path),
         )
+        if dropped:
+            # 越界资产**不落 signals.jsonl**，但审计要知道"看见过、丢了几条"
+            self.audit.record(
+                "signal_out_of_scope",
+                node_id=node.id,
+                tool=action.tool,
+                count=len(dropped),
+                assets=dropped[:5],
+                reason="信号 asset 不在 scope 授权范围内，未落盘（红线 5）",
+            )
 
     @staticmethod
     def _sample_output(result: RunResult) -> str:

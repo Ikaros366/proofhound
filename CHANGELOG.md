@@ -6,6 +6,31 @@
 
 ## [未发布]
 
+### 修复（M31：dirsearch 在扫描链路里必然 exit 127 + 越界信号污染证据）
+
+两条都是 0.6.0 发布后第一个真实任务（`eng-20261102T085135Z-885d7d33`）暴露的：
+
+1. **`dirsearch` 一启动就 `exit 127`**：`_exec_run_tool` 调 `runner.run()` 时**从不
+   传 `image`**，一律用 runner 缺省镜像（`alpine:3.20`）。httpx / katana 是静态 Go
+   二进制，看不出问题；dirsearch 是 Python 工具，在 alpine 里没有 `python3`——
+   `/opt/tools/dirsearch/dirsearch: exec: line 3: python3: not found`。连续两次后被
+   失败预算判 `blocked`，整个 scan 阶段降级。verify 链路（`_verify_sqli` 传
+   `image=tool_images["sqlmap"]`）一直是对的，只有 scan 链路漏了。
+2. **越界信号落进了证据**：katana `-jc` 会从 JS 文本里提出跨源绝对 URL，实测把
+   `https://redux.js.org/Errors?code=${e}` 这类**报错文档链接**当成了
+   `param-endpoint`（5 条 signal 里 5 条不可行动）。此前只有 triage 在建候选前
+   `check_scope`，这些信号仍会写进 `signals.jsonl` 与 `node.meta`。
+
+改动：
+
+- **`proofhound/core/orchestrator.py`**：`_exec_run_tool` 按 manifest 的 `image`
+  覆盖沙箱镜像；`_record_signals` 在**写入前**过 `check_scope`，越界信号不落盘，
+  记审计 `signal_out_of_scope` 与 `signals_recorded.dropped_out_of_scope`（"看见过
+  几条、丢了几条"可查）；runner 未挂 scope 时不过滤（单测/CLI 直连行为不变）。
+- **测试**：新增 `tests/test_scan_image_and_signal_scope.py` 5 条（镜像传参、无镜像
+  传 None、dirsearch manifest 守护、越界丢弃、无 scope 不过滤）；四个 fake runner
+  的 `run()` 补 `image=None` 形参（与既有四个已支持的 fake 对齐）。
+
 ## [0.6.0] - 2026-11-02
 
 ### 变更（许可证：Apache-2.0 → AGPL-3.0）
