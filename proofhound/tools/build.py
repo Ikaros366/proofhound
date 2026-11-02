@@ -12,9 +12,11 @@ argv 由本模块按工具名分派到确定性构造函数拼装，参数经 Py
   ``with_session=True`` 而无 session 即校验失败（fail-closed）。
 - **M16-b 请求量授权**：按字典**主动发请求**的工具（dirsearch）不自己定速率/并发/总量
   ——这些来自 ``Scope.request_budget``（未声明则用保守缺省值，审计记
-  ``source="default"``）。构造器负责把预算翻成工具旗标，并据 ``max_requests``
-  **截词表**（确定性硬闸）；同时提供 :func:`dirsearch_timeout_for` 把时间窗折算成
-  沙箱超时，供调用方与硬上限 300s 取小。
+  ``source="default"``）。构造器负责把预算翻成工具旗标：``--max-rate`` /
+  ``-t`` 来自速率与并发，**``max_requests`` 折算成 ``--max-time``**
+  （``max_requests / rate_rps`` 秒，与时间窗取小，见 :func:`_request_cap_seconds`）
+  ——dirsearch 没有 ``--max-requests``，wall-clock 是唯一能强制总量上限的旗标。
+  :func:`dirsearch_timeout_for` 另把时间窗折算成沙箱超时（第二道，≤300s）。
 """
 
 from __future__ import annotations
@@ -250,6 +252,20 @@ _EXTENSIONS_RE = re.compile(r"^[A-Za-z0-9]+(?:,[A-Za-z0-9]+)*$")
 SANDBOX_TIMEOUT_CAP = 300
 
 
+#: dirsearch 自带词表在容器内的绝对路径（M31）。
+#:
+#: 路径不是猜的：沙箱把宿主 ``tools.d`` **整体**只读挂到容器 ``/opt/tools``
+#: （``sandbox.CONTAINER_TOOLS_DIR``），而 dirsearch 用 pip ``--target`` 装进
+#: ``tools.d/dirsearch/lib``，launcher 也只有一句
+#: ``PYTHONPATH="$HERE/lib" exec python3 "$HERE/lib/bin/dirsearch"`` ——
+#: 故包内自带的 ``dirsearch/db/dicc.txt`` 在容器里就是下面这个路径。
+#:
+#: 此前默认值是 ``/opt/tools/dicc.txt``：那个文件**从来没有被安装过**
+#: （宿主 ``tools.d/`` 下不存在 dicc.txt），于是 dirsearch 每次都以
+#: ``/opt/tools/dicc.txt does not exist`` 退出 1，被失败预算判 blocked。
+DIRSEARCH_BUILTIN_WORDLIST = "/opt/tools/dirsearch/lib/dirsearch/db/dicc.txt"
+
+
 class DirsearchParams(BaseModel):
     """dirsearch 字典爆路径参数（M16-b，L1 主动发现类）。
 
@@ -265,11 +281,14 @@ class DirsearchParams(BaseModel):
       wrapper 负责 ``cat`` 回 stdout（**rootfs 只读 + tmpfs 随容器销毁，不 cat 则
       报告蒸发**，红线 3 的证据就拿不到）；
     - ``-t <concurrency>`` / ``--max-rate <rate_rps>``——**授权语义的落点**；
-    - ``--max-time <秒>``——仅在 scope 声明了时间窗时产（授权时间窗的落点）。
+    - ``--max-time <秒>``——**恒产**：取 ``max_requests / rate_rps`` 与时间窗
+      （×0.7）的较小者。它是请求总量上限的落点（dirsearch 没有
+      ``--max-requests``，只能靠 wall-clock 逼近）。
 
     **永不产** ``-r``/``--recursive``（递归爆破会成倍放大请求量，且越出面随重定向
     扩大）与 ``-F``/``--follow-redirects``（默认即不跟随，明确不放开）。
-    ``--wordlists`` 恒指向容器内的内置字典（``/opt/tools/dicc.txt``）或显式挂载路径。
+    ``--wordlists`` 恒指向**包内自带**的词表（:data:`DIRSEARCH_BUILTIN_WORDLIST`）
+    或显式挂载路径。
     """
 
     target: str = Field(min_length=1)  # 单目标 URL
@@ -278,7 +297,7 @@ class DirsearchParams(BaseModel):
     max_requests: int = Field(ge=1, le=50000)  # 来自 scope.request_budget
     window_seconds: int | None = Field(default=None, ge=1, le=1440 * 60)
     extensions: str = "php,asp,aspx,jsp,html,htm"
-    wordlist: str = "/opt/tools/dicc.txt"
+    wordlist: str = DIRSEARCH_BUILTIN_WORDLIST
     with_session: bool = False  # 注入预置会话（-H Cookie）
 
     @field_validator("target")
@@ -306,7 +325,7 @@ class DirsearchParams(BaseModel):
 
 
 def dirsearch_wordlist_head(params: "DirsearchParams") -> int:
-    """按请求总量上限算出**允许读入的词条数**（确定性硬闸）。
+    """按请求总量上限算出**允许读入的词条数**（**估算**，不是强制点）。
 
     dirsearch 会把每个词条与 ``-e`` 的每个扩展名各拼一个路径，故按
     ``max_requests // (1 + len(extensions))`` 反推允许的词条数。
@@ -317,6 +336,10 @@ def dirsearch_wordlist_head(params: "DirsearchParams") -> int:
     只会**截得更狠**，方向是 fail-closed（宁可少发请求），符合授权语义。
     反之，工具在重定向/校准等场景下仍可能发出词表之外的少量请求，故
     ``max_requests`` 是**词表侧硬闸**，不是逐请求的精确配额。
+
+    M31 更正：本函数**只是估算**——构造器并没有真的截词表（dirsearch 也没有
+    ``--max-requests``）。真正的强制点是 :func:`_request_cap_seconds` 算出的
+    ``--max-time``；否则 9681 词条 × 7 扩展在 300s 沙箱超时内会发出远超授权量的请求。
     """
     n_ext = len([e for e in params.extensions.split(",") if e]) if params.extensions else 0
     per_word = 1 + n_ext
@@ -327,7 +350,7 @@ def build_dirsearch_params(
     target: str,
     budget: RequestBudget,
     *,
-    wordlist: str = "/opt/tools/dicc.txt",
+    wordlist: str = DIRSEARCH_BUILTIN_WORDLIST,
     extensions: str = "php,asp,aspx,jsp,html,htm",
     with_session: bool = False,
 ) -> dict:
@@ -353,6 +376,25 @@ def build_dirsearch_params(
 #: 而 `--max-time 8` 是能触发的。故留 30% 余量让 dirsearch 自己收尾并落报告，
 #: 避免"第一道没赶上、报告也没写出来"的双输形态。
 _TOOL_SELF_LIMIT_RATIO = 0.7
+
+
+def _request_cap_seconds(
+    max_requests: int, rate_rps: int, window_seconds: int | None
+) -> int:
+    """把「请求总量上限」折算成工具自限时（秒），并与时间窗取小（M31）。
+
+    dirsearch 只有 ``--max-time`` 而没有 ``--max-requests``，故总量只能靠
+    wall-clock 逼近：以授权速率跑满 ``max_requests`` 所需的时间就是上界。
+    方向是 **fail-closed**——真实吞吐通常低于 ``--max-rate``（顺序抓取、目标慢），
+    所以实际请求数只会更少，不会更多。
+
+    不加这一层时：默认预算 5000 请求 / 50 rps，但词表 9681 词条 × 7 扩展，
+    在 300s 沙箱超时内可发出远超授权量的请求（≈15000）。
+    """
+    by_requests = max(1, (max_requests + rate_rps - 1) // rate_rps)
+    if window_seconds is None:
+        return by_requests
+    return max(1, min(by_requests, _tool_self_limit_seconds(window_seconds)))
 
 
 def _tool_self_limit_seconds(window_seconds: int) -> int:
@@ -389,11 +431,12 @@ def _build_dirsearch(
         "-t", str(p.concurrency),
         "--max-rate", str(p.rate_rps),
     ]
-    # 授权时间窗 → 工具自限时（第一道；沙箱超时是第二道，见 dirsearch_timeout_for）。
-    # 取窗口的 70%（见 _tool_self_limit_seconds 的实测理由）：让工具**先于**沙箱超时
-    # 自己收尾并落报告；沙箱超时仍用完整窗口秒数兜底硬杀。
-    if p.window_seconds is not None:
-        argv += ["--max-time", str(_tool_self_limit_seconds(p.window_seconds))]
+    # 请求总量硬闸（第一道）：--max-time = min(max_requests/rate, 时间窗×0.7)。
+    # 沙箱超时是第二道（dirsearch_timeout_for，≤300s）。
+    argv += [
+        "--max-time",
+        str(_request_cap_seconds(p.max_requests, p.rate_rps, p.window_seconds)),
+    ]
     argv += [
         "--wordlists", p.wordlist,
         "-e", p.extensions,

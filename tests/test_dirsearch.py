@@ -28,6 +28,7 @@ from proofhound.tools.build import (
     DirsearchParams,
     build_command,
     dirsearch_timeout_for,
+    DIRSEARCH_BUILTIN_WORDLIST,
     dirsearch_wordlist_head,
     known_tools,
 )
@@ -129,7 +130,9 @@ def test_dirsearch_argv_golden_conservative_default():
     assert argv == [
         "dirsearch", "-u", TARGET,
         "-t", "5", "--max-rate", "50",
-        "--wordlists", "/opt/tools/dicc.txt",
+        # M31：请求总量 5000 / 50 rps = 100s ⇒ 恒产的 --max-time
+        "--max-time", "100",
+        "--wordlists", DIRSEARCH_BUILTIN_WORDLIST,
         "-e", EXT_DEFAULT,
         "-q", "--no-color", "-O", "json", "-o", "/tmp/ds_report.json",
     ]
@@ -155,16 +158,19 @@ def test_dirsearch_explicit_budget_wins_over_default():
                          request_budget=s.resolved_request_budget())
     assert argv[argv.index("--max-rate") + 1] == "2"
     assert argv[argv.index("-t") + 1] == "1"
-    # 工具自限时 = 窗口 * 0.7（留 30% 余量给工具自己收尾，见 build.py 说明）
-    assert argv[argv.index("--max-time") + 1] == "336"
+    # M31：--max-time 取 min(max_requests/rate, 窗口×0.7)
+    #   请求侧 100/2 = 50s；窗口侧 8min×0.7 = 336s ⇒ 取 50（更严的那个）
+    assert argv[argv.index("--max-time") + 1] == "50"
 
 
-def test_dirsearch_window_absent_means_no_max_time():
+def test_dirsearch_without_window_still_caps_total_requests():
+    """M31：没有时间窗也必须封顶请求总量（100 / 5 = 20s），否则 `max_requests`
+    形同虚设——词表 9681 词条 × 7 扩展在沙箱超时内能发出远超授权量的请求。"""
     s = _scope(request_budget={"rate_rps": 5, "concurrency": 2,
                                "max_requests": 100})
     argv = build_command("dirsearch", {"target": TARGET},
                          request_budget=s.resolved_request_budget())
-    assert "--max-time" not in argv
+    assert argv[argv.index("--max-time") + 1] == "20"
 
 
 def test_dirsearch_requires_explicit_request_budget():

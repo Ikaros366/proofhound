@@ -23,10 +23,27 @@
 
 改动：
 
+3. **`dirsearch` 换镜像后仍 `exit 1`**：`--wordlists` 的默认值是
+   `/opt/tools/dicc.txt`，而宿主 `tools.d/` 下**从来没有**这个文件——沙箱把整个
+   `tools.d` 挂到 `/opt/tools`，dirsearch 的词表其实在包内
+   （`tools.d/dirsearch/lib/dirsearch/db/dicc.txt`）。启动即
+   `/opt/tools/dicc.txt does not exist`。词表路径改指包内自带那份，并在容器里
+   实测过 launcher 可正常加载。
+
+改动：
+
 - **`proofhound/core/orchestrator.py`**：`_exec_run_tool` 按 manifest 的 `image`
   覆盖沙箱镜像；`_record_signals` 在**写入前**过 `check_scope`，越界信号不落盘，
   记审计 `signal_out_of_scope` 与 `signals_recorded.dropped_out_of_scope`（"看见过
   几条、丢了几条"可查）；runner 未挂 scope 时不过滤（单测/CLI 直连行为不变）。
+- **`proofhound/tools/build.py`**：新增 `DIRSEARCH_BUILTIN_WORDLIST`
+  （`/opt/tools/dirsearch/lib/dirsearch/db/dicc.txt`）作为 `--wordlists` 默认值，
+  并在注释里写死推导过程（挂载点 + pip `--target` 布局），避免下一个人再猜。
+  另新增 `_request_cap_seconds()`：dirsearch 没有 `--max-requests`，`max_requests`
+  此前**只体现在 `--max-rate` 的速率上、没有总量闸**（默认 5000 请求 / 50 rps，但
+  词表 9681 词条 × 7 扩展在 300s 沙箱超时内可发出 ≈15000 请求）。
+  现在**恒产** `--max-time = min(max_requests/rate_rps, 时间窗×0.7)`，
+  方向 fail-closed（真实吞吐低于 `--max-rate`，实际只会更少）。
 - **测试**：新增 `tests/test_scan_image_and_signal_scope.py` 5 条（镜像传参、无镜像
   传 None、dirsearch manifest 守护、越界丢弃、无 scope 不过滤）；四个 fake runner
   的 `run()` 补 `image=None` 形参（与既有四个已支持的 fake 对齐）。
