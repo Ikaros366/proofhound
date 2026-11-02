@@ -26,6 +26,7 @@
   --accent-strong: #1f6feb;
   --accent-soft: rgba(31, 111, 235, 0.12);
   --accent-soft-2: rgba(31, 111, 235, 0.15);
+  --accent-glow: rgba(88, 166, 255, 0.45);
   --green-strong: #238636;
   --red-strong: #da3633;
   --danger-bg: rgba(248, 81, 73, 0.12);
@@ -63,6 +64,7 @@
   --accent-strong: #0969da;
   --accent-soft: rgba(9, 105, 218, 0.10);
   --accent-soft-2: rgba(9, 105, 218, 0.12);
+  --accent-glow: rgba(9, 105, 218, 0.35);
   --green-strong: #1f883d;
   --red-strong: #cf222e;
   --danger-bg: rgba(207, 34, 46, 0.08);
@@ -100,6 +102,7 @@
   --accent-strong: #0e7490;
   --accent-soft: rgba(76, 201, 240, 0.14);
   --accent-soft-2: rgba(76, 201, 240, 0.18);
+  --accent-glow: rgba(76, 201, 240, 0.45);
   --green-strong: #047857;
   --red-strong: #be123c;
   --danger-bg: rgba(251, 113, 133, 0.14);
@@ -137,6 +140,7 @@
   --accent-strong: #2f6b5f;
   --accent-soft: rgba(47, 107, 95, 0.12);
   --accent-soft-2: rgba(47, 107, 95, 0.16);
+  --accent-glow: rgba(47, 107, 95, 0.35);
   --green-strong: #2f7d4f;
   --red-strong: #a33a2c;
   --danger-bg: rgba(163, 58, 44, 0.10);
@@ -571,6 +575,136 @@ textarea.md-editor {
   font-family: var(--mono);
 }
 tr.invalid-row td { color: var(--danger-fg); }
+
+/* ---- 运行进度（UI 增量）：阶段条 + 进度条 + Findings 环形图 ---- */
+
+button.warn { background: var(--warn-bg); border-color: var(--yellow); color: var(--warn-fg); }
+button.warn:hover:not(:disabled) { border-color: var(--yellow); }
+.badge.state-paused { color: var(--yellow); border-color: var(--yellow); animation: pulse 1.6s infinite; }
+
+.phases { display: flex; gap: 0; margin: 0 0 4px; padding: 0; list-style: none; }
+.phase { flex: 1; min-width: 0; padding-right: 12px; }
+.phase:last-child { padding-right: 0; }
+.phase-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+.phase.done .phase-track { background: var(--green); border-color: var(--green); }
+.phase.active .phase-track { background: linear-gradient(90deg, var(--accent-soft-2), var(--accent)); border-color: var(--accent); }
+.phase.paused .phase-track { background: var(--yellow); border-color: var(--yellow); }
+.phase.failed .phase-track { background: var(--red); border-color: var(--red); }
+.phase-label { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+.phase.done .phase-label { color: var(--text); }
+.phase.active .phase-label { color: var(--accent); font-weight: 600; }
+.phase.paused .phase-label { color: var(--yellow); font-weight: 600; }
+.phase.failed .phase-label { color: var(--red); }
+.phase-label .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); flex: none; }
+.phase.done .dot { background: var(--green); }
+.phase.active .dot { background: var(--accent); animation: phasePulse 1.4s ease-out infinite; }
+.phase.paused .dot { background: var(--yellow); animation: pulse 1.6s infinite; }
+.phase.failed .dot { background: var(--red); }
+.phase-live { font-size: 11px; font-weight: 500; opacity: 0.85; }
+.phase-desc {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@keyframes phasePulse {
+  0% { box-shadow: 0 0 0 0 var(--accent-glow); }
+  70% { box-shadow: 0 0 0 7px transparent; }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
+.progress {
+  height: 7px;
+  border-radius: 4px;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+  overflow: hidden;
+  margin: 8px 0 16px;
+}
+.progress .bar {
+  height: 100%;
+  width: 0;
+  background: linear-gradient(90deg, var(--accent), var(--teal));
+  transition: width 0.6s ease;
+}
+.progress.running .bar {
+  background-image:
+    repeating-linear-gradient(45deg, rgba(255, 255, 255, 0.16) 0 6px, transparent 6px 12px),
+    linear-gradient(90deg, var(--accent), var(--teal));
+  background-size: 24px 100%, 100% 100%;
+  animation: stripes 0.9s linear infinite;
+}
+.progress.paused .bar { background: var(--yellow); transition: width 0.3s ease; }
+.progress.failed .bar { background: var(--red); }
+.progress.done .bar { background: linear-gradient(90deg, var(--green), var(--teal)); }
+
+@keyframes stripes {
+  from { background-position: 0 0, 0 0; }
+  to { background-position: 24px 0, 0 0; }
+}
+
+.run-grid { display: flex; gap: 22px; align-items: center; flex-wrap: wrap; }
+.donut {
+  width: 108px;
+  height: 108px;
+  border-radius: 50%;
+  position: relative;
+  flex: none;
+  background: var(--panel-alt);
+  border: 1px solid var(--border);
+}
+.donut::after {
+  content: '';
+  position: absolute;
+  inset: 16px;
+  border-radius: 50%;
+  background: var(--panel);
+}
+.donut.empty { opacity: 0.7; }
+.donut-center {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  z-index: 1;
+}
+.donut-center b { font-size: 22px; line-height: 1; color: var(--text); }
+.donut-center span { font-size: 10px; letter-spacing: 0.5px; text-transform: uppercase; color: var(--muted); }
+.run-metrics { flex: 1; min-width: 220px; }
+.run-headline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.run-elapsed { font-family: var(--mono); font-weight: 600; color: var(--text); }
+.run-sep { color: var(--dim); }
+.run-state { font-weight: 600; color: var(--accent); }
+.run-pending { font-weight: 600; color: var(--yellow); }
+.run-legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 8px 0 6px; font-size: 12px; color: var(--muted); }
+.legend-chip { display: inline-flex; align-items: center; gap: 5px; }
+.legend-dot { width: 8px; height: 8px; border-radius: 2px; }
+.progress-note { font-size: 12px; color: var(--muted); }
+.run-controls { display: inline-flex; align-items: center; gap: 8px; }
+.run-live { font-size: 12px; font-weight: 600; color: var(--green); animation: livePulse 1.6s ease-in-out infinite; }
+
+@keyframes livePulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@media (max-width: 720px) {
+  .phases { flex-direction: column; gap: 8px; }
+  .phase-desc { display: none; }
+}
 
 /* ---- 健康页 ---- */
 

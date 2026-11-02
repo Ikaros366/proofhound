@@ -6,6 +6,41 @@
 
 ## [未发布]
 
+### 新增（控制台：状态化启停 + 协作式暂停/继续 + 运行进度可视化）
+
+**做了什么**：修掉「点了启动按钮还能一直按」——按钮现在跟着状态走：`created` 才显示
+**启动**；运行中（scanning / triaging / verifying）显示 **暂停**，受理后变「暂停中…」；
+`paused` 显示 **继续**；待确认 / 完成 / 失败各自显示说明，**不再出现启动按钮**。
+同时新增一张**运行进度**面板：五段阶段条（扫描 / 分级 / 验证 / 确认 / 完成，当前段
+脉冲 + "进行中"）、带条纹流动动画的进度条、Findings 环形图（纯 CSS `conic-gradient`）、
+耗时 / 当前状态 / 待确认与图例。
+
+**顺手修掉一个毫秒级竞态**：`POST /run` 返回 202 后执行线程可能还没把状态切到
+`scanning`，旧 UI 若恰好在这窗口刷新会重新渲染出可点的「启动」（这正是"点了还能按"
+的另一种成因）。现在 `running` 为真时一律显示「启动中…」并禁用。
+
+**暂停是真暂停，但语义是"阶段边界生效"**：`POST /pause` 只登记请求，执行线程在下一个
+检查点（scan 的每个 skill 之后 / triage 之后 / verify 的每个 skill 之后）转 `paused`
+并阻塞；`POST /resume` 放行并**回到暂停前的阶段**（不重跑已完成阶段）。不硬中断在途
+阶段是有意取舍：强行杀线程会让沙箱子进程、确认队列与状态机同时停在半截——比不能暂停
+更糟。待人工确认（confirming）时拒绝暂停（裁定本身就会推进，暂停无意义）。
+
+- **`proofhound/api/runner.py`**：`EngagementState.PAUSED` + 协作式暂停字段
+  （`pause_requested` / `paused_from` / 检查点 `checkpoint()`）；
+  `EngagementManager.pause()/resume()`——未运行 / 终态 / 待确认 / 重复请求一律 409；
+  进程重启时 paused 与其余运行态一样回退 `created`（沿用既有粗粒度恢复，限制 25）；
+- **`proofhound/api/server.py`**：`POST /api/engagements/{id}/pause|resume`（202）；
+  详情响应增加 `pause_requested` / `paused_from`——UI 据此在"请求已受理但尚未生效"时
+  显示「暂停中…」，而不是让按钮在请求与生效之间闪回；
+- **`proofhound/api/static/app.js|app.css`**：状态化按钮 + 运行进度面板（零依赖、
+  零 Web 存储，未引入任何图表库；文案仍全部 `textContent` 落地）。
+
+**测试**：新增 `tests/test_pause.py` **6**（阶段边界生效、`paused_from`、继续不重跑、
+409 边界、审计四条、paused 落盘）+ `tests/test_console_pause_ui.py` **7**（静态守护：
+按钮状态化、paused 文案、纯 CSS 可视化、阶段边界文案）。浏览器实跑 Playwright
+（启动 → 运行 → 暂停 → 继续 → 完成）**无 console 错误**，截图
+`shots/proofhound_ui/pause/`（不进仓库）。
+
 ### 新增（控制台换肤：四套预设主题 + 零浏览器存储）
 
 **做了什么**：控制台侧栏底部加「主题」选择器，四套预设——**深色（默认）/ 浅色 / 暗夜蓝 /

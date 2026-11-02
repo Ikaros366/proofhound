@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -79,13 +80,19 @@ class BudgetBlockedError(ApiError):
 
 
 class EngagementState(str, Enum):
-    """created → scanning → triaging → verifying → confirming（可往返）→ done/failed。"""
+    """created → scanning → triaging → verifying → confirming（可往返）→ done/failed。
+
+    ``paused`` 是**协作式暂停**态：暂停请求不冻结在途阶段，执行线程在下一个
+    **阶段边界**（scan 的每个 skill 之后、triage 之后、verify 的每个 skill 之后）
+    转入 paused 并阻塞，直到 ``resume``；继续后回到暂停前的阶段态。
+    """
 
     CREATED = "created"
     SCANNING = "scanning"
     TRIAGING = "triaging"
     VERIFYING = "verifying"
     CONFIRMING = "confirming"  # 等待人工确认中（可往返：裁定后回到原阶段态）
+    PAUSED = "paused"  # 协作式暂停：阶段边界生效
     DONE = "done"
     FAILED = "failed"
 
@@ -246,6 +253,12 @@ class Engagement:
         self._lock = threading.RLock()
         self.thread: threading.Thread | None = None
         self.audit = AuditLog(self.dir / "audit.jsonl")
+        # 协作式暂停（UI 增量）：暂停请求由执行线程在阶段边界消费。
+        # _resume_event 置位 = 放行；清除 = 停在 paused 等继续。
+        self._pause_requested = False
+        self._resume_event = threading.Event()
+        self._resume_event.set()
+        self._paused_from: EngagementState | None = None
 
     @property
     def state(self) -> EngagementState:
@@ -276,6 +289,54 @@ class Engagement:
     def running(self) -> bool:
         with self._lock:
             return self.thread is not None and self.thread.is_alive()
+
+    # ---- 协作式暂停 ----
+
+    @property
+    def paused_from(self) -> EngagementState | None:
+        """暂停前所处的阶段（未暂停时为 None；UI 用它把进度条停在正确一格）。"""
+        with self._lock:
+            return self._paused_from
+
+    @property
+    def pause_requested(self) -> bool:
+        with self._lock:
+            return self._pause_requested
+
+    def request_pause(self) -> None:
+        """登记暂停请求；**不阻塞**，由执行线程在下一个检查点消费。"""
+        with self._lock:
+            if self._state is EngagementState.PAUSED:
+                raise InvalidStateError("engagement 已处于暂停状态")
+            self._pause_requested = True
+
+    def resume(self) -> None:
+        """放行暂停中的执行线程；只有 paused 态可继续。"""
+        with self._lock:
+            if self._state is not EngagementState.PAUSED:
+                raise InvalidStateError(
+                    f"当前状态 {self._state.value} 不可继续（仅 paused 可继续）"
+                )
+            self._resume_event.set()
+
+    def checkpoint(self) -> None:
+        """执行线程的阶段边界检查点：有暂停请求则转 paused 并阻塞到继续。
+
+        只由执行线程调用一次（每次检查点）。``paused_from`` 记下暂停前的阶段态，
+        继续时据此恢复——这样 UI 的进度条不会「暂停一恢复就从头开始」。
+        """
+        with self._lock:
+            if not self._pause_requested:
+                return
+            self._pause_requested = False
+            self._paused_from = self._state
+            self._resume_event.clear()
+        self.transition(EngagementState.PAUSED, reason="暂停请求：在阶段边界生效")
+        self._resume_event.wait()
+        with self._lock:
+            previous = self._paused_from or EngagementState.SCANNING
+            self._paused_from = None
+        self.transition(previous, reason="继续执行")
 
     def _persist(self) -> None:
         """把当前元数据重写进 api.json（元数据文件，非审计；审计在 audit.jsonl）。"""
@@ -352,8 +413,11 @@ class EngagementRunner:
             return
         try:
             self._scan(phases)
+            eng.checkpoint()
             self._triage(phases)
+            eng.checkpoint()
             self._verify(phases)
+            eng.checkpoint()
             eng.transition(EngagementState.DONE, reason="全部阶段完成")
         except BudgetExceededError as exc:
             # token 预算硬闸：任何自治模式不可绕过（与 scope 同级）
@@ -406,6 +470,8 @@ class EngagementRunner:
                     phase="scan" if legacy else f"scan:{skill_name}",
                     reason="全部目标被拒绝或未授权",
                 )
+            # 暂停检查点：每个 scan skill 之后（协作式，不冻结在途 skill）
+            self.rt.engagement.checkpoint()
 
     def _triage(self, phases) -> None:
         self.rt.engagement.transition(EngagementState.TRIAGING, reason="triage 阶段启动")
@@ -470,6 +536,8 @@ class EngagementRunner:
                 phases.verify()
             else:
                 phases.verify_with_skill(skill_name)
+            # 暂停检查点：每个 verify skill 之后（协作式，不冻结在途验证）
+            eng.checkpoint()
 
     # ---- 自主模式闸门 ----
 
@@ -1336,6 +1404,41 @@ class EngagementManager:
         with eng._lock:
             eng.thread = thread
         thread.start()
+        return eng
+
+    # ---- 暂停 / 继续（协作式：阶段边界生效） ----
+
+    def pause(self, eng_id: str) -> Engagement:
+        """受理暂停请求（**异步**）：执行线程在下一个阶段边界转 paused 并阻塞。"""
+        eng = self.get(eng_id)
+        if not eng.running:
+            raise InvalidStateError("engagement 未在运行，无法暂停")
+        state = eng.state
+        if state in _TERMINAL:
+            raise InvalidStateError(f"当前状态 {state.value} 不可暂停")
+        if state is EngagementState.CONFIRMING:
+            raise InvalidStateError(
+                "正在等待人工确认，无需暂停（裁定后会自动推进或退回原阶段）"
+            )
+        if eng.pause_requested:
+            raise InvalidStateError("暂停请求已受理，正在等待阶段边界生效")
+        eng.request_pause()
+        eng.audit.record(
+            "engagement_pause_requested",
+            engagement_id=eng.id,
+            state=state.value,
+            note="协作式暂停：在阶段边界生效",
+        )
+        return eng
+
+    def resume(self, eng_id: str) -> Engagement:
+        """放行已暂停的执行线程；短暂等待它回到暂停前的阶段态（最多 2s）。"""
+        eng = self.get(eng_id)
+        eng.resume()  # 非 paused 态抛 InvalidStateError
+        eng.audit.record("engagement_resumed", engagement_id=eng.id)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and eng.state is EngagementState.PAUSED:
+            time.sleep(0.02)
         return eng
 
     # ---- 确认队列 ----

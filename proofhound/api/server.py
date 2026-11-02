@@ -106,6 +106,10 @@ def _engagement_detail(manager: EngagementManager, eng: Engagement) -> dict:
             "tokens_used": _tokens_used(eng),
             "pending_confirmations": len(manager.list_confirmations(eng.id)),
             "running": eng.running,
+            # UI 增量：暂停的"请求已受理但尚未到检查点"与"暂停前所处阶段"都要如实给出，
+            # 否则前端只能猜（按钮会在请求与生效之间闪回"暂停"）。
+            "pause_requested": eng.pause_requested,
+            "paused_from": eng.paused_from.value if eng.paused_from else None,
         }
     )
     return detail
@@ -201,6 +205,25 @@ def create_app(
         eng = manager.start(eng_id)  # 目标重新过 check_scope；预算 0 直接 402
         return {
             "detail": "engagement 已启动（异步）",
+            "id": eng.id,
+            "state": eng.state.value,
+        }
+
+    @app.post("/api/engagements/{eng_id}/pause", status_code=202)
+    def pause_engagement(eng_id: str) -> dict:
+        eng = manager.pause(eng_id)  # 协作式：阶段边界生效（非立即冻结）
+        return {
+            "detail": "暂停请求已受理（在当前阶段/技能边界生效）",
+            "id": eng.id,
+            "state": eng.state.value,
+            "pause_requested": eng.pause_requested,
+        }
+
+    @app.post("/api/engagements/{eng_id}/resume", status_code=202)
+    def resume_engagement(eng_id: str) -> dict:
+        eng = manager.resume(eng_id)
+        return {
+            "detail": "已继续（回到暂停前的阶段）",
             "id": eng.id,
             "state": eng.state.value,
         }

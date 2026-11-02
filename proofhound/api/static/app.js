@@ -25,8 +25,20 @@ const MODE_LABEL = Object.fromEntries(MODES.map((m) => [m.value, m.label]));
 
 const STATE_LABEL = {
   created: '已创建', scanning: '扫描中', triaging: '分诊中', verifying: '验证中',
-  confirming: '待确认', done: '完成', failed: '失败',
+  confirming: '待确认', paused: '已暂停', done: '完成', failed: '失败',
 };
+
+// 运行进度可视化（UI 增量）：阶段顺序与后端 EngagementState 的推进顺序一致。
+// paused 不是独立阶段——用 detail.paused_from 回到"暂停在哪个阶段"。
+const PHASES = [
+  { state: 'scanning', label: '扫描', desc: 'httpx / katana / dirsearch' },
+  { state: 'triaging', label: '分级', desc: '规则表 + 模型假设' },
+  { state: 'verifying', label: '验证', desc: '逐 skill 行为复现' },
+  { state: 'confirming', label: '确认', desc: '等待人工裁定' },
+  { state: 'done', label: '完成', desc: '证据与报告就绪' },
+];
+const PHASE_INDEX = { scanning: 0, triaging: 1, verifying: 2, confirming: 3, done: 4 };
+const RUNNING_STATES = new Set(['scanning', 'triaging', 'verifying']);
 const FINDING_STATE_LABEL = {
   signal: 'Signal', hypothesis: 'Hypothesis', reproduced: 'Reproduced',
   confirmed: 'Confirmed', rejected: 'Rejected',
@@ -342,6 +354,8 @@ function renderDetail(view, engId) {
   const st = {
     lastDetail: null,
     statusSig: null,
+    progressSig: null,
+    progressEls: null,
     confsSig: null,
     findingsSig: null,
     auditTotal: -1,
@@ -369,11 +383,12 @@ function renderDetail(view, engId) {
   statusPanel.append(statusBar, loosenSlot);
   const confPanel = el('div', 'panel');
   confPanel.id = 'conf-panel';
+  const progressPanel = el('div', 'panel progress-panel');
   const findingsPanel = el('div', 'panel');
   const reportPanel = el('div', 'panel');
   const costPanel = el('div', 'panel');
   const auditPanel = el('div', 'panel');
-  view.append(backLink, title, errSlot, statusPanel, confPanel, findingsPanel, reportPanel, costPanel, auditPanel);
+  view.append(backLink, title, errSlot, statusPanel, progressPanel, confPanel, findingsPanel, reportPanel, costPanel, auditPanel);
 
   setupReportPanel(reportPanel, engId, st);
 
@@ -391,6 +406,7 @@ function renderDetail(view, engId) {
     updateStatusBar(detail);
     updateConfirmations(confs.confirmations || []);
     updateFindings(findings.findings || []);
+    updateProgress(detail);
     updateCost(cost);
     updateAudit(audit);
   }
@@ -400,6 +416,7 @@ function renderDetail(view, engId) {
     const sig = JSON.stringify([
       detail.state, detail.autonomy_mode, detail.tokens_used,
       detail.budget, detail.running, detail.pending_confirmations,
+      detail.pause_requested, detail.paused_from,
     ]);
     if (sig !== st.statusSig) {
       st.statusSig = sig;
@@ -412,7 +429,12 @@ function renderDetail(view, engId) {
       if (detail.pending_confirmations > 0) {
         statusBar.appendChild(statusItem('待确认', `${detail.pending_confirmations} 项`));
       }
-      if (detail.running) statusBar.appendChild(el('span', 'hint', '执行线程运行中'));
+      if (detail.running) {
+        statusBar.appendChild(el(
+          'span', 'hint',
+          detail.state === 'paused' ? '执行线程挂起中' : '执行线程运行中'
+        ));
+      }
 
       const switcher = el('span', 'mode-switch');
       switcher.appendChild(el('span', 'hint', '自主模式:'));
@@ -422,18 +444,70 @@ function renderDetail(view, engId) {
         switcher.appendChild(btn);
       });
       statusBar.appendChild(switcher);
-
-      if (detail.state === 'created') {
-        const runBtn = el('button', 'primary', '启动');
-        runBtn.addEventListener('click', async () => {
-          runBtn.disabled = true;
-          try { await api(`/api/engagements/${engId}/run`, { method: 'POST' }); await refresh(); }
-          catch (err) { errSlot.replaceChildren(errorBox(err)); runBtn.disabled = false; }
-        });
-        statusBar.appendChild(runBtn);
-      }
+      statusBar.appendChild(runControls(detail));
     }
     if (st.updateReportBtn) st.updateReportBtn();
+  }
+
+  // -- 启动 / 暂停 / 继续：按钮随状态变化，不再"启动后还能一直按" --
+  function runControls(detail) {
+    const slot = el('span', 'run-controls');
+    const post = async (path, button) => {
+      button.disabled = true;
+      try {
+        await api(`/api/engagements/${engId}/${path}`, { method: 'POST' });
+        await refresh();
+      } catch (err) {
+        errSlot.replaceChildren(errorBox(err));
+        button.disabled = false;
+      }
+    };
+    if (detail.state === 'created') {
+      // 竞态护栏：POST /run 返回 202 后，执行线程可能还没把状态切到 scanning
+      // （毫秒级窗口）。此时 running 已为真，若仍渲染「启动」就会出现"点了还能按"。
+      if (detail.running) {
+        const starting = el('button', 'primary', '启动中…');
+        starting.disabled = true;
+        slot.appendChild(starting);
+        return slot;
+      }
+      const runBtn = el('button', 'primary', '启动');
+      runBtn.addEventListener('click', () => post('run', runBtn));
+      slot.appendChild(runBtn);
+      return slot;
+    }
+    if (RUNNING_STATES.has(detail.state)) {
+      slot.appendChild(el('span', 'run-live', '● 运行中'));
+      if (detail.pause_requested) {
+        const pending = el('button', 'warn', '暂停中…');
+        pending.disabled = true;
+        slot.appendChild(pending);
+      } else {
+        const pauseBtn = el('button', 'warn', '暂停');
+        pauseBtn.title = '协作式暂停：在当前阶段/技能边界生效（不会硬中断在途阶段）';
+        pauseBtn.addEventListener('click', () => post('pause', pauseBtn));
+        slot.appendChild(pauseBtn);
+      }
+      return slot;
+    }
+    if (detail.state === 'paused') {
+      slot.appendChild(el('span', 'hint',
+        `已暂停在「${STATE_LABEL[detail.paused_from] || '当前阶段'}」`));
+      const resumeBtn = el('button', 'primary', '继续');
+      resumeBtn.addEventListener('click', () => post('resume', resumeBtn));
+      slot.appendChild(resumeBtn);
+      return slot;
+    }
+    if (detail.state === 'confirming') {
+      slot.appendChild(el('span', 'hint', '等待人工确认，裁定后自动推进'));
+      return slot;
+    }
+    if (detail.state === 'done') {
+      slot.appendChild(el('span', 'hint', '已完成'));
+      return slot;
+    }
+    slot.appendChild(el('span', 'hint', '运行失败：原因见审计流；重跑请新建任务'));
+    return slot;
   }
 
   function statusItem(k, v) {
@@ -441,6 +515,148 @@ function renderDetail(view, engId) {
     span.appendChild(document.createTextNode(`${k} `));
     span.appendChild(el('b', null, v));
     return span;
+  }
+
+  // -- 运行进度：阶段条 + 进度条 + Findings 环形图（纯 CSS，零依赖） --
+  function updateProgress(detail) {
+    const findings = st.lastFindings || [];
+    const counts = { confirmed: 0, reproduced: 0, hypothesis: 0, rejected: 0 };
+    findings.forEach((f) => { if (f.state in counts) counts[f.state] += 1; });
+    const sig = JSON.stringify([
+      detail.state, detail.pause_requested, detail.paused_from, counts,
+      detail.tokens_used, detail.budget, detail.pending_confirmations,
+    ]);
+    if (sig !== st.progressSig) {
+      st.progressSig = sig;
+      renderProgress(detail, counts);
+    }
+    if (st.progressEls && st.progressEls.elapsed) {
+      st.progressEls.elapsed.textContent = `已耗时 ${fmtElapsed(detail.created_at)}`;
+    }
+  }
+
+  function renderProgress(detail, counts) {
+    progressPanel.replaceChildren();
+    progressPanel.appendChild(el('h3', null, '运行进度'));
+
+    const doneAll = detail.state === 'done';
+    const failed = detail.state === 'failed';
+    const paused = detail.state === 'paused';
+    const pausedIndex = paused ? (PHASE_INDEX[detail.paused_from] ?? -1) : -1;
+    const activeIndex = paused ? pausedIndex : (PHASE_INDEX[detail.state] ?? -1);
+
+    const list = el('ol', 'phases');
+    PHASES.forEach((phase, index) => {
+      let status = 'pending';
+      if (doneAll) status = 'done';
+      else if (paused) {
+        status = index < pausedIndex ? 'done' : index === pausedIndex ? 'paused' : 'pending';
+      } else if (activeIndex >= 0 && index < activeIndex) status = 'done';
+      else if (activeIndex >= 0 && index === activeIndex) status = 'active';
+      const item = el('li', `phase ${status}` + (failed ? ' failed' : ''));
+      item.appendChild(el('div', 'phase-track'));
+      const label = el('div', 'phase-label');
+      label.appendChild(el('span', 'dot'));
+      label.appendChild(el('span', null, phase.label));
+      if (status === 'active') label.appendChild(el('span', 'phase-live', '进行中'));
+      if (status === 'paused') label.appendChild(el('span', 'phase-live', '已暂停'));
+      item.appendChild(label);
+      item.appendChild(el('div', 'phase-desc', phase.desc));
+      list.appendChild(item);
+    });
+    progressPanel.appendChild(list);
+
+    let ratio = 0;
+    if (doneAll) ratio = 1;
+    else if (failed || detail.state === 'created') ratio = 0;
+    else if (paused) ratio = pausedIndex >= 0 ? (pausedIndex + 0.5) / PHASES.length : 0;
+    else if (activeIndex >= 0) ratio = (activeIndex + 0.5) / PHASES.length;
+    const bar = el('div', 'progress' +
+      (RUNNING_STATES.has(detail.state) ? ' running' : '') +
+      (paused ? ' paused' : '') + (failed ? ' failed' : '') + (doneAll ? ' done' : ''));
+    const fill = el('div', 'bar');
+    fill.style.width = `${Math.round(ratio * 100)}%`;
+    bar.appendChild(fill);
+    progressPanel.appendChild(bar);
+
+    const grid = el('div', 'run-grid');
+    const parts = [
+      ['confirmed', 'var(--green)', '确认'],
+      ['reproduced', 'var(--orange)', '复现'],
+      ['hypothesis', 'var(--yellow)', '假设'],
+      ['rejected', 'var(--muted)', '驳回'],
+    ];
+    const total = parts.reduce((sum, [key]) => sum + counts[key], 0);
+    const donut = el('div', 'donut' + (total ? '' : ' empty'));
+    if (total) {
+      let cursor = 0;
+      const stops = [];
+      parts.forEach(([key, color]) => {
+        const n = counts[key];
+        if (!n) return;
+        const from = (cursor / total) * 100;
+        cursor += n;
+        stops.push(`${color} ${from.toFixed(2)}% ${((cursor / total) * 100).toFixed(2)}%`);
+      });
+      donut.style.background = `conic-gradient(${stops.join(', ')})`;
+    }
+    const center = el('div', 'donut-center');
+    center.appendChild(el('b', null, String(total)));
+    center.appendChild(el('span', null, 'Findings'));
+    donut.appendChild(center);
+    grid.appendChild(donut);
+
+    const metrics = el('div', 'run-metrics');
+    const headline = el('div', 'run-headline');
+    const elapsed = el('span', 'run-elapsed', `已耗时 ${fmtElapsed(detail.created_at)}`);
+    headline.appendChild(elapsed);
+    headline.appendChild(el('span', 'run-sep', '·'));
+    headline.appendChild(el('span', 'run-state', STATE_LABEL[detail.state] || detail.state));
+    if (detail.pending_confirmations > 0) {
+      headline.appendChild(el('span', 'run-sep', '·'));
+      headline.appendChild(el('span', 'run-pending', `待确认 ${detail.pending_confirmations}`));
+    }
+    metrics.appendChild(headline);
+
+    const legend = el('div', 'run-legend');
+    parts.forEach(([key, color, label]) => {
+      const chip = el('span', 'legend-chip');
+      const dot = el('span', 'legend-dot');
+      dot.style.background = color;
+      chip.append(dot, document.createTextNode(`${label} ${counts[key]}`));
+      legend.appendChild(chip);
+    });
+    metrics.appendChild(legend);
+
+    metrics.appendChild(el('div', 'progress-note', progressNote(detail)));
+    grid.appendChild(metrics);
+    progressPanel.appendChild(grid);
+    st.progressEls = { elapsed };
+  }
+
+  function progressNote(detail) {
+    if (detail.state === 'created') return '尚未启动 —— 点「启动」开始扫描。';
+    if (detail.state === 'paused') {
+      return `已暂停在「${STATE_LABEL[detail.paused_from] || '当前阶段'}」：点「继续」从该阶段接着跑（不重跑已完成阶段）。`;
+    }
+    if (detail.state === 'confirming') {
+      return '等待人工确认：在「确认队列」批准或驳回；超时按默认拒绝处理。';
+    }
+    if (detail.state === 'failed') return '运行失败：原因见审计流；重跑请新建任务。';
+    if (detail.state === 'done') return '全部阶段完成 —— 可在下方报告区构建报告。';
+    if (detail.pause_requested) return '暂停请求已受理：当前阶段/技能结束后停下。';
+    return '运行中 —— 暂停在阶段边界生效（不硬中断在途阶段）。';
+  }
+
+  function fmtElapsed(iso) {
+    const start = new Date(iso).getTime();
+    if (Number.isNaN(start)) return '—';
+    const seconds = Math.max(0, Math.floor((Date.now() - start) / 1000));
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = seconds % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    return h ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
   }
 
   // 放宽切换弹确认框（收紧直接切换）；裁定与审计在后端
