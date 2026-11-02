@@ -2040,6 +2040,132 @@ stdlib SPA，**12/12 条断言全绿**：1 confirmed（`/api/orders/1001`，匿�
 
 边界与代价见 AGENTS.md 限制 73。
 
+### 7.29 XML 外部实体：两条通道与一个阳性对照（M25-a，2026-11-02）
+
+**定位**：`XXE` 的**手工先验**，不是新漏洞类型。本里程碑只回答一个问题：能不能把
+"目标解析了外部实体"变成**二值事实**？能，而且是两条互相独立的通道。
+
+```xml
+<!DOCTYPE r [ <!ENTITY x SYSTEM "file:///etc/passwd"> ]>
+<r>&x;</r>
+```
+
+| 通道 | 观测 | 结论 |
+|---|---|---|
+| 内容事实 | 响应里出现指定 canary 文件的签名 | confirmed(file) |
+| 回调事实 | 我们的 listener 收到带唯一 token 的请求 | confirmed(callback) |
+
+#### 7.29.1 为什么先做 XXE 而不是 LFI
+
+LFI 只有"内容事实"一条通道，且强依赖"目标上恰好存在一个内容可判定的文件"——路径
+知识、OS 差异、通配路由自带的 `root:x:0:0` 字样都会污染它；XXE 的**回调通道不依赖
+任何目标文件**，与 §7.12 的 SSRF 完全同构（同一套 `CallbackListener` + 唯一 token +
+常量时间比对）。确认强度更高，故先 XXE。
+
+#### 7.29.2 一个没有它就塌成两态的对照
+
+响应里没读到文件内容，有两种完全不同的原因：
+
+- **解析器在工作**，只是关掉了外部实体（现代栈默认）⇒ `rejected`；
+- **body 根本没被当 XML 解析**（WAF 拦掉 / 端点不认这个 schema）⇒ `blocked`。
+
+不区分这两者的判定器只有两态。故每个文件探针里同时放一个**内部实体**
+`&alive;`，展开后得到 `PROOFHOUND-ALIVE`——它出现，才证明这段 XML 被解析了。
+
+**alive 的字面量在请求体里写成字符引用** `PROOFHOUND&#45;ALIVE`：XML 规定实体值在
+**声明时**展开字符引用，所以真解析器展开 `&alive;` 得到 `PROOFHOUND-ALIVE`；而把请求
+体**原样回显**的端点只能回显带 `&#45;` 的字面量，**命中不了**这个标记。这不是洁癖：
+它让"回显端点"从"看起来被解析过"变成"可被识别为没解析"，见 §7.29.4。
+
+#### 7.29.3 一次请求兼两职，以及为什么两个 token
+
+交接单的预算是每端点 ≤4 次请求，而模板有 6 个（baseline / file / file-negative /
+callback / callback-control / alive）。合并两处：
+
+1. `alive` 并入 `file`（外部实体 1 条 + 内部常量实体 1 条）；
+2. `callback-control` 并入 `baseline`：无 DOCTYPE 的基线体里**携带一个回调 URL 字面量**，
+   监听器在整个探测期间活着 ⇒ 这一次请求同时证明"响应基线干净"与"非实体路径不会触发
+   回调"。
+
+两个回调 URL 用**各自独立**的 token（control / probe）。若共用同一个 token，就无法区分
+"基线请求触发的迟到回调"与"实体展开触发的回调"——而"每探针唯一 token"本来就是这个
+仓库的既有纪律（§7.12）。
+
+#### 7.29.4 回显陷阱：路径字样不是证据
+
+一个把请求体原样回显的端点，响应里会出现 `<!DOCTYPE`、`file:///etc/passwd`，甚至
+`PROOFHOUND&#45;ALIVE`。判定器只认两样东西：
+
+- **文件内容签名**（`root:x:0:0`）是否出现，且基线体与阴性对照都不含它；
+- **listener 是否收到**带本次唯一 token 的请求。
+
+前者在回显端点里不可能出现（签名不在请求体里），后者更不会。故 `/soap/echo` 判
+`rejected`，理由写明"请求体被原样回显、解析器根本没介入"——它是**可识别的回显**，
+不是"被解析过但关了外部实体"。这比让裸 alive 字面量冒充阳性对照更诚实。
+
+#### 7.29.5 失败语义
+
+| 情形 | 结论 | 为什么 |
+|---|---|---|
+| 文件签名命中 ∧ 基线干净 ∧ 阴性对照干净 ∧ alive 成立 | **confirmed(file)** | 唯一产内容证据的态 |
+| listener 收到唯一 token ∧ callback-control 未触发 | **confirmed(callback)** | 带外二值事实 |
+| 解析器工作、外部实体不解析、listener 静默、两道对照正常 | **rejected** | 真阴性（≠"没有 XXE 风险"） |
+| 响应是请求体原样回显（未展开的 alive 字面量出现） | **rejected** | 端点没解析 XML |
+| 请求失败 / 网关 502-504 无 SOAP Fault / 阳性对照没被替换 | **blocked** | 覆盖不全，绝不驳回 |
+| 基线或阴性对照里也出现签名 | **blocked** | 内容不可归因 |
+| callback-control 命中（非实体路径也触发回调） | **blocked** | 回调不可归因 |
+| listener 不可用 / 模板只读白名单外路径（无已知签名） | **blocked** | 通道零覆盖 |
+
+> **SOAP Fault 不等于 blocked**：很多真实端点的文件内容出现在 `500 + <faultstring>`
+> 里，只要签名命中就是 confirmed（`/soap/fault` 靶钉住这条）。
+
+#### 7.29.6 证据与确定性
+
+证据目录：`probe_<n>.json`（模板名 / 状态码 / 是否命中签名 / sha256，**无正文**）、
+`response_<n>.txt`（0600、截断 ≤256KB、会话秘密 + 回调 token 脱敏）、
+`judgment.json`（三态 + 两条通道的事实 + 全部否定项）、`summary.json`、`summary.md`、
+`audit.jsonl`。
+
+两条刻意设计：① **canary 签名只写入 0600 文件**——`summary.md` 与 stdout 里没有它，
+因为它是 `/etc/passwd` 的真实片段（handoff §5.4 的"证据里可能含目标文件内容"）；
+② **`summary.json` 不含时间戳、输出路径与 listener 端口**——时间戳只进 `summary.md`
+与审计，因此连跑两次**逐字节一致**，可作为回归断言。
+
+#### 7.29.7 实测（2026-11-02）
+
+`scripts/demo_xxe.py`，本机六靶（**形态仿真**，见下）+ 真 `CallbackListener` +
+真 `http_body` 客户端，**35/35 断言全绿**：
+
+| 靶 | 行为 | 结论 |
+|---|---|---|
+| `/soap/file` | 只解析 file:// 实体 | **CONFIRMED（file）** |
+| `/soap/fault` | 同上，内容进 `500 + <faultstring>` | **CONFIRMED（file）**（500 ≠ blocked） |
+| `/soap/oob` | 只解析 http:// 实体，真连 listener | **CONFIRMED（callback）** |
+| `/soap/safe` | 只展开内部实体 | **REJECTED**（阳性对照成立） |
+| `/soap/echo` | 原样回显请求体 | **REJECTED**（回显陷阱被识别） |
+| `/soap/error` | 500 通用错误页 | **BLOCKED**（阳性对照没被替换） |
+
+**形态仿真如实声明**：Python 标准库不解析外部实体，故靶侧那个"会取 file:// 的解析器"
+是本脚本自己实现的（正则抽 `<!ENTITY … SYSTEM "…">` → 读文件 / 发请求 → 回填），
+与 M23 的罐头堆栈同一披露纪律（限制 72/74）。判据代码**不依赖**靶的实现细节：它只看
+响应字节、listener 与状态码。`/soap/file` 与 `/soap/fault` 读的是**真实的** `/etc/passwd`
+（靶与工具同机）——"读文件"这一段是真的，"解析器"这一段是仿真的。
+
+#### 7.29.8 明确不做（M25-a）
+
+- **不注册 `vuln_type`**、不改 `VULN_REGISTRY` / `GATE_MATRIX` / 任何既有 `_verify_*` /
+  `verify/ssrf.py`；产物**不是 Finding**，不进报告、不进证据门（登记与接生产者是 M25-b）。
+- **不做盲 XXE**（外部 DTD + 参数实体把内容拼进回调 URL）：要托管一份可控 DTD，且各
+  解析器对外部 DTD 的加载策略差异更大，判定面更脆。
+- **不做协议链**（`expect://` / `data://` / `phar://` / `gopher://`）、不做编码绕过变体
+  （`....//`、`php://filter`）、不做任何写操作。
+- **不是任意文件读取器**：`file://` 目标写死两个 canary；自带模板里的白名单外路径默认
+  拒绝，只有显式 `--allow-file` 才放行且留审计。
+- **不发实体膨胀**：外部实体 ≤1、实体值不含 `&`、同一实体只引用一次，发送前统一核，
+  任一条不合格则整批不发。
+
+边界与代价见 AGENTS.md 限制 74。
+
 ## 8. 开发路线图
 
 

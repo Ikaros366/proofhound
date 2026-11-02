@@ -38,9 +38,9 @@
 
 | 维度 | ProofHound | 传统扫描器 |
 |---|---|---|
-| 漏洞类型覆盖 | 少而精：**7 类可确认漏洞**（SQL 注入 / XSS / IDOR / SSRF / 未授权暴露 / 命令注入 / SSTI）+ **第 8 类服务器报错信息泄露用畸形请求差分确认**（M23）+ **1 个手工探测**（登录重放，M21-a）；只做能行为确认的 | 数千条特征签名，广而浅 |
+| 漏洞类型覆盖 | 少而精：**7 类可确认漏洞**（SQL 注入 / XSS / IDOR / SSRF / 未授权暴露 / 命令注入 / SSTI）+ **第 8 类服务器报错信息泄露用畸形请求差分确认**（M23）+ **2 个手工探测**（登录重放 M21-a / XML 外部实体 M25-a）；只做能行为确认的 | 数千条特征签名，广而浅 |
 | 输出语义 | Confirmed 即铁证：行为验证 + 证据链 + Verifier 终审 + CVSS 代码算分 | Potential 待人工，误报率自担 |
-| 发现面 | Web 应用层（katana 爬行带参端点 + POST 表单页 + **JS 文件内端点**，M16-a）+ **JS 接口清单与未授权确认**（M24-a，手工 CLI，手工探测） | 主机/端口/服务/全协议 |
+| 发现面 | Web 应用层（katana 爬行带参端点 + POST 表单页 + **JS 文件内端点**，M16-a）+ **JS 接口清单与未授权确认**（M24-a，手工 CLI，手工探测）+ **XML 端点（SOAP/SAML）的实体解析先验**（M25-a，手工 CLI） | 主机/端口/服务/全协议 |
 | 误报治理 | 多道闸：triage 启发式宁漏勿滥 → 行为验证 → 证据门 → Verifier 对抗校验 | 主要靠特征精度 |
 
 覆盖广度沿路线图渐进扩展，但纪律不变：**新漏洞类型必须先过"能否行为确认"这一关**——不能行为确认的宁可不做，绝不为凑覆盖率引入"疑似即确认"的降级路径。
@@ -416,6 +416,50 @@ python -m proofhound.jsimport \
 边界（与 AGENTS.md 限制 73 同源）：只覆盖 **GET + 同源**的接口；跨域 API（SPA 调
 `api.example.com`）一律丢；正则抽取不懂运行时拼接与 webpack chunk map；POST/JSON body
 型接口不在本单范围；结果**不注册为 Finding**（报告侧接入是 M24-b）。
+
+## XML 外部实体（XXE）的手工先验（M25-a）
+
+XML 的 `DOCTYPE` 允许声明**外部实体**；解析器若开着外部实体，就会去加载它指向的
+资源。于是"解析一段 XML"变成两种可观测后果——**读到了文件内容**，或者**我们收到了
+一次请求**。这条链路把两者都做成确定性判定，输入只要一个 URL 与一份 scope：
+
+```bash
+.venv/bin/python scripts/demo_xxe.py        # 实弹：六个靶（形态仿真），十项断言
+python -m proofhound.xxeprobe \
+  --url https://target/soap/endpoint \
+  --scope scopes/lab.yaml \
+  [--content-type application/xml] [--body-template envelope.xml] \
+  [--allow-file /path] [--callback-host 10.0.0.5]
+```
+
+判定口径（零 LLM，两条通道互相独立）：
+
+| 结论 | 判据 |
+|---|---|
+| `confirmed`（file 通道） | 响应出现指定 canary 文件的签名，且基线体、阴性对照都不含该签名，且阳性对照成立 |
+| `confirmed`（callback 通道） | 我们的 listener 收到带本次唯一 token 的请求，且 callback-control 未触发 |
+| `rejected` | 解析器在工作（内部实体被展开），但外部实体未被解析、listener 静默、两道阴性对照正常 |
+| `blocked` | 判不了：请求失败/网关代答、阳性对照没被替换、对照污染、listener 不可用、canary 不可判 |
+
+- **阳性对照**：每个文件探针里同时放一个内部实体 `&alive;`，展开得到
+  `PROOFHOUND-ALIVE`——只有它出现，才能把"没读到文件"分成 `rejected`（解析器工作但
+  关了外部实体）与 `blocked`（body 根本没被当 XML 解析）；
+- **回显陷阱**：`/soap/echo` 这类端点会把请求体原样回显（里面有 `file:///etc/passwd`
+  字样）。判据从不看"路径字样"，只看**文件内容签名**是否出现；而且 alive 用字符引用
+  写法（`PROOFHOUND&#45;ALIVE`），原样回显命中不了标记 ⇒ 该形态被判 `rejected`
+  并写明"解析器根本没介入"；
+- **500 不等于 blocked**：文件内容出现在 `500 + <faultstring>` 里照样 confirmed；
+- **安全边界（写死）**：只读两个 canary（Linux `/etc/passwd` / Windows
+  `C:\Windows\win.ini`），自动通道构造其它路径直接拒绝；自带模板里的 `file://` 目标
+  白名单外默认拒绝，只有显式 `--allow-file` 才放行并留审计；不发实体膨胀、不做协议链、
+  不做盲 XXE（外部 DTD）、不做任何写操作；证据文件 0600 且脱敏；
+- **退出码**：0 = 至少 1 条 confirmed；1 = 无 confirmed；2 = 结构性失败（入口错误 /
+  无 scope / URL 越界 / listener 不可用 / 模板目标越白名单）——**不是"测过且安全"**。
+
+边界（与 AGENTS.md 限制 74 同源）：现代栈默认关闭外部实体，命中集中在 SAML/SOAP
+遗留系统，**没命中只说明"该端点当前不解析外部实体 / 不接受这段 XML"**；只做直接实体、
+不做盲 XXE；自动 canary 按工具所在平台选（跨平台目标请自带模板）；结果**不注册为
+Finding**（登记与接生产者是 M25-b）。
 
 ## 登录重放暴破探测（M21-a）
 

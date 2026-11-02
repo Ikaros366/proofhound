@@ -6,6 +6,72 @@
 
 ## [未发布]
 
+### 新增（M25-a XML 外部实体：手工 CLI 先验 + 两条确定性通道）
+
+**做了什么**：把「解析一段 XML」的两种可观测后果做成一条**手工先验**链——
+`python -m proofhound.xxeprobe`：**内容通道**（响应里出现指定 canary 文件的签名）与
+**回调通道**（我们的 listener 收到带唯一 token 的请求）。**M25-a 只做手工 CLI**：
+不注册 `vuln_type`、不动 `VULN_REGISTRY` / `GATE_MATRIX` / 任何既有 `_verify_*` /
+`verify/ssrf.py`，零新依赖、判定零 LLM；接生产是 M25-b。
+
+- **`proofhound/verify/http_body.py`**：POST 发送器。仓库此前**没有**"给任意端点
+  POST 一段 body"的能力（8 个 verifier 里只有 `login_probe` 的表单 POST 与
+  `raw_http` 的裸 TCP 能带 body）。`post(url, body, content_type, session, timeout,
+  max_bytes)` 返回 `BodyResponse{status, headers, body, error, truncated}`；
+  **不跟随重定向**（3xx 原样作为状态码）、响应只留前 256KB、网络/TLS/超时异常不抛
+  （落 `error`，判定层转 blocked）、凭据由 `SessionConfig` 注入且显式 `content_type`
+  覆盖会话同名头；
+- **`proofhound/verify/xxe.py`**：canary 白名单（Linux `/etc/passwd` 签名
+  `root:x:0:0` / Windows `C:\Windows\win.ini` 签名 `[fonts]`，**由同一张表派生**）、
+  6 个无害模板、`file://` 目标的白名单裁决（默认拒绝）、实体膨胀的结构性检查、
+  4 步探针计划、三态 `judge`、操作员模板派生；
+- **`proofhound/xxeprobe.py`**：CLI。退出码 0/1/2 = 有 confirmed / 无 confirmed /
+  结构性失败（入口错误·无 scope·URL 越界·listener 不可用·模板白名单外目标）。
+
+**判定设计（三态，零 LLM）**：confirmed(file) = 响应出现 canary 签名 ∧ 基线体不含
+∧ 阴性对照不含 ∧ 阳性对照成立；confirmed(callback) = listener 收到唯一 token ∧
+callback-control 未触发；rejected = 解析器在工作（alive 被展开）、外部实体不解析、
+listener 静默、两道阴性对照正常；其余一律 blocked（覆盖不全，不驳回）。
+
+- **阳性对照（没有它三态会塌成两态）**：同一 body 里放内部实体
+  `<!ENTITY alive "PROOFHOUND&#45;ALIVE">` + `&alive;`。**字符引用形态**是刻意的：
+  实体值在**声明时**就展开，真解析器得到 `PROOFHOUND-ALIVE`，而**原样回显**的端点
+  只回显带 `&#45;` 的字面量——于是"回显陷阱"多了一道结构性防线：`/soap/echo`
+  这类端点被判 rejected（理由写明"请求体被原样回显、解析器根本没介入"），
+  **绝不会**因为响应里出现 `file:///etc/passwd` 字样而 confirmed；
+- **callback-control 与 baseline 合并**：无 DOCTYPE 的基线体携带一个**独立 token**
+  的回调 URL 字面量——一次请求同时证明"响应基线干净"与"非实体路径不会触发回调"。
+  两个 token 互不相同：同一 token 无法区分"基线触发的迟到回调"与"实体触发的回调"；
+  4 步探针因此稳定在交接单的 ≤4 次预算内；
+- **SOAP Fault 不等于 blocked**：`500 + <faultstring>` 里出现签名照样 confirmed。
+
+**安全边界（写死，不可配置）**：自动通道只读两个 canary 文件（构造其它路径直接抛
+`XxeFileTargetError`，**不是任意文件读取器**）；操作员模板里的每个 `file://` 目标都
+进审计，白名单外**默认拒绝**，只有显式 `--allow-file` 才放行并记
+`xxe_file_override`；不发实体膨胀（外部实体 ≤1、实体值不含 `&`、同一实体只引用一次，
+**发送前统一核**——任一条不合格则整批不发）；不做协议链、不做盲 XXE（外部 DTD）、
+不做写操作、不做绕过变体；每个 URL 发请求前过 `check_scope`。
+
+**证据**：`probe_<n>.json`（无正文）/ `response_<n>.txt`（0600、截断 ≤256KB、
+会话秘密 + 回调 token 脱敏）/ `judgment.json` / `summary.json`（**不含时间戳、
+输出路径与端口** ⇒ 连跑两次逐字节一致）/ `summary.md` / `audit.jsonl`。
+canary 签名只写入 0600 文件——`summary.md` 与 stdout 里刻意没有它。
+
+**测试**：新增 `tests/test_http_body.py` **15** + `tests/test_xxe.py` **77** +
+`tests/test_xxeprobe.py` **24** = **116**；全量 **1676 passed / 2 skipped /
+1 xfailed**（基线 1560 → +116），**旧测试零改动**。**实弹** `scripts/demo_xxe.py`
+六靶 **35/35 断言全绿**（3 confirmed / 2 rejected / 1 blocked）：`/soap/file` 与
+`/soap/fault`（500+faultstring）走内容通道、`/soap/oob` 走回调通道、`/soap/safe`
+与 `/soap/echo` rejected、`/soap/error` blocked；阴性对照、回显陷阱、
+callback-control 零回调、canary 白名单不可绕过、实体膨胀、证据卫生、
+`summary.json` 两次逐字节一致、越界零请求、每端点 ≤4 次请求全部断言到位。
+**靶侧是形态仿真**：Python 标准库不解析外部实体，故"解析器"由 demo 自己实现
+（正则抽声明 → 读文件/发请求 → 回填），与 M23 的罐头堆栈同一披露纪律（限制 74）。
+
+**未做**：注册 `VULN_REGISTRY` / 接生产者 / API 槽位 / 覆盖镜头（M25-b）；盲 XXE
+（外部 DTD）；`Signal` 加 `content_type`（M25-b 走"路径后缀 + 参数名 + 模型"退化）。
+边界见 AGENTS.md 限制 74。
+
 ### 新增（M24-a 从爬行产出的 JS 找接口 → 未授权确认，手工 CLI）
 
 **做了什么**：把维护者的手工手法（找 JS → 摘路径 → 拼 URL → 逐个试匿名能不能拿到
