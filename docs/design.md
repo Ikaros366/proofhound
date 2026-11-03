@@ -2323,6 +2323,128 @@ dns-nested → ldap-class-cache(A 层) → ldap-jdbcrowset → dns-toplevel
 
 边界与代价见 AGENTS.md 限制 75。
 
+## 7.17 M31 落地注记（2026-11-03：dirsearch 链路逐层打通 + 控制台两处修正）
+
+**这一轮不是新功能。** M16-b 把 dirsearch 接进 `web-dirsearch` skill 之后，真实 unattended
+任务连试数次，每一次都在审计里显示"跑完了"（`state=done`、`degraded=False`），但**一次目录
+爆破请求都没发出去**——每修好一层，下一层才浮出来。v0.6.1 把它逐层收干净，顺带修掉控制台
+两处同类问题（"看起来在跑，其实没跑"）。
+
+> **给下一个人的一句话**：§7.17.2（框架速查）与 §7.17.3（踩坑）比 §7.17.1 的修法更值得
+> 读——修法只对 dirsearch 成立，踩坑是**这一类**接线的共同边界。
+
+### 7.17.1 八处缺陷与修法
+
+| # | 症状（审计/证据里的样子） | 根因 | 修法 | 提交 |
+|---|---|---|---|---|
+| 1 | `dirsearch ... exit 127`，`python3: not found` | `_exec_run_tool` 从不传 `image`，一律用缺省 `alpine:3.20` | 按 manifest 的 `image` 覆盖沙箱镜像（verify 链路早就在做） | `37508a5` |
+| 2 | `/opt/tools/dicc.txt does not exist` → `exit 1` | 词表默认值指向从未安装过的路径；真词表在 pip `--target` 包内 | 默认改 `DIRSEARCH_BUILTIN_WORDLIST`（包内 `db/dicc.txt`） | `33cac9f` |
+| 3 | 300s 沙箱超时内可发 ≈15000 请求（授权量 3 倍） | dirsearch 没有 `--max-requests`，`max_requests` 只落在 `--max-rate` 上 | 恒产 `--max-time = min(max_requests/rate_rps, 窗口×0.7)` | `33cac9f` |
+| 4 | `egress_denied host="https" port=443` | `CONNECT https://host:8443/path` 被 `partition(":")` 解析成 host=`"https"` | `_parse_connect_target()`：去 scheme、砍路径/查询、再取 host:port | `f5afd51` |
+| 5 | `egress_denied host='' port=443`（两次）+ `Cannot establish the proxy connection` + **exit 0** | CONNECT 请求行是 **origin-form**（没有主机名）；且 dirsearch 打了致命错误仍 exit 0 | `Host:` 头回落（**仍过白名单**）+ 假成功签名表 + `tool_missing`/`tool_broken` + 恒产 `--sync` | `910eb70` |
+| 6 | `signals_recorded: dirsearch count=0, skipped_lines=1` | 报告写进 tmpfs 随容器销毁；**pip 配方** wrapper 没把报告 cat 回 stdout（离线预置 wrapper 有） | `WRAPPER_ECHO_ARTIFACT` 三处同源；wrapper 先取退出码再 cat | `ccce686` |
+| 7 | 控制台「已耗时」在 `done` 之后还在涨 | 前端 `fmtElapsed(created_at)` 恒用 `Date.now()` 当终点；详情接口没暴露终态时刻 | `finished_at` 进 api.json + 详情接口；有值即停表（老数据回落 `engagement.json`） | `ccf4231` |
+| 8 | 审计流看起来只有最近 150 条 | 前端轮询固定 `tail=150`，界面没有全量入口（后端本就不限条数） | 加「查看全部 / 只看最近」开关；轮询仍只拉 150 条 | `1df30fd` |
+
+**验收**（`eng-20261103T030841Z-b013d083`，unattended，50 rps / 10 并发 / 5000 请求）：
+`web-dirsearch=done`、stdout **14 条真结果行**、dirsearch 实跑 101 秒
+（`--max-time 100` 封顶生效）、`signals_recorded: dirsearch count=14, skipped_lines=0`
+→ `triage created=13, merged=1`（`web-exposure: 12`）、`egress_denied` 只剩 4 条无害的
+（pdtm 遥测 + katana 的 `GET http://burpsuite/`）、`degraded=False`；越界仍被拒
+（端口改 8444 ⇒ `端口 8443 不在授权范围`）。
+
+### 7.17.2 框架速查：接一个新工具要动的 8 处
+
+| # | 位置 | 要做的事 | 漏了会怎样 |
+|---|---|---|---|
+| 1 | `proofhound/tools/manifests/<name>.yaml` | `version`/`check`/`install`/`image`/`parser`；pip 工具要 `closure`（逐条 `==` + sha256，按沙箱的 **musllinux** 解析） | 漏 `image` ⇒ Python 工具在 `alpine` 里 `exit 127`（M31 第 1 层） |
+| 2 | `proofhound/tools/build.py` | `XxxParams`（pydantic，挡旗标注入）+ `_build_xxx()` + 注册进 `_BUILDERS`/`_PARAMS_MODELS`；主动发请求的登记进 `REQUEST_BUDGET_TOOLS` | argv 不由构造器出 ⇒ 违反红线 1；预算语义无处落地 |
+| 3 | `proofhound/tools/parsers/__init__.py` | 产 Signal 的解析器登记进 `PARSER_REGISTRY`；`orchestrator._default_tool_parsers()` 是 tool→parser 的桥 | `signals_recorded count=0`，工具"扫到了"但一条发现都进不了 triage |
+| 4 | `proofhound/tools/installer.py` | 安装配方 + **pip wrapper 契约**：产出回显（`WRAPPER_ECHO_ARTIFACT`），`-o` 的落点必须与它同源 | 报告随 tmpfs 蒸发（M31 第 6 层） |
+| 5 | `proofhound/core/orchestrator.py` | `_exec_run_tool` 传 `image`；**退出码不可信的工具**登记 `failures.FALSE_SUCCESS_SIGNATURES` | 假成功：`done` + `degraded=False`，实际什么都没做（M31 第 5 层） |
+| 6 | `skills/<name>/SKILL.md` + `proofhound/skills/profiles.py` | 风险档与 L1/L2 闸门；skill 库**不开放用户自写**（M9d） | 闸门与画像不一致；且用户自写面已撤 |
+| 7 | `proofhound/tools/egress.py` | 客户端 CONNECT 形态非标准时，扩 `_parse_connect_target()` / `Host:` 回落 | 403 `目标为空`，客户端只看到一句代理错误（M31 第 4/5 层） |
+| 8 | `tests/` | 四个必测面：构造器 argv 黄金、解析器（含坏输入）与 signal 落盘、沙箱 hardening 参数、失败分类（含"exit 0 但报错"与 exit 127） | 上面任何一条回归都无人拦 |
+
+**不可放宽的一条**：第 7 处无论怎么扩解析，**白名单判定一个字都不能放宽**——回落 `Host:`
+头不是放行理由，"来自头部"照样要过同一个 `_check()`。
+
+### 7.17.3 实现期踩坑（诚实记录，省后来者时间）
+
+**P1 复现环境必须与生产同构，差一个变量就复现不出来。**
+最初用裸 `docker run` + 真实 `EgressProxy` 复现，CONNECT 形态是标准的 `host:port`，怎么都
+不出问题。真实差异有两处：① 硬化档（`user=nobody` / `read_only` / `tmpfs=/tmp` /
+`cap_drop=ALL` / `no-new-privileges` / `pids` / `nofile`）；② `SandboxRunner` 给容器设的
+**六个 proxy 环境变量**。是 ② 改变了客户端的代码路径（见 P2）。**结论：任何"只在生产出现"
+的客户端行为，先把容器参数与环境变量逐项对齐再谈复现。**
+
+**P2 依赖的被动升级会静默改语义——"配置生效了"和"配置被静默丢弃"长得一模一样。**
+dirsearch 0.5.0 的异步后端把 transport 挂在 `httpx.AsyncClient(mounts={"all://": ...})`。
+httpx 0.28.1 的 `_transport_for_url` 是"最具体优先"，而 `trust_env` 会为 `HTTPS_PROXY`
+注入 `URLPattern("https://")` / `URLPattern("http://")` 两组 mount ⇒ 我们的 `all://`
+**从来没被选中**。后果：`--proxy` 形同虚设（去掉环境变量后 dirsearch 直接直连失败，代理
+收到 0 条连接）、`verify=False` 一并失效（自签靶一律
+`SSL certificate verification failed`，一个请求都发不出去）。修法是构造器恒产 `--sync`
+（同步后端把两者都落实在 `requests.Session` 上）。
+**判据不是"命令里有 `--proxy`"，而是"代理侧真的收到了连接"。** 换工具版本或升级带
+`mounts`/`proxy` 语义的依赖时，必须重跑这条验证。
+
+**P3 客户端的请求行不可信，权威值在别处。**
+本仓库给 httpcore 打过 `extensions["target"]` 补丁：`Request.__init__` 会用
+`extensions["target"]` 覆盖 URL 的 target；`TunnelHTTPConnection` 构造 CONNECT 时又把原
+请求的 `extensions` 传下去 ⇒ CONNECT 请求行变成 **origin-form**：
+`CONNECT /login/<word> HTTP/1.1`。**隧道目标只出现在 `Host:` 头里**（httpcore 恒写
+`Host: host:port`）。代理因此要同时吃 authority-form / absolute-URI / origin-form / 空目标
+四种形态。顺带把请求行原文钉进 `egress_denied.request_line`（脱 userinfo、截断 200 字符）
+——上次定位这层只能靠"临时改代码 + 重启服务 + 等用户再跑一次"。
+
+**P4 退出码不可信：假成功比失败更危险。**
+dirsearch 打印 `Cannot establish the proxy connection`（stdout 全文 39 字节）后**仍以 0
+退出**。旧逻辑只看退出码 ⇒ 记 `count=0` + `done` + `degraded=False`，任务 26 秒"跑完"。
+**只信退出码 = 把"什么都没做"标成"做完了"。** 修法：`failures.FALSE_SUCCESS_SIGNATURES`
+登记"命中即代表整轮没跑起来"的**精确**签名（dirsearch 的代理/TLS 错误 + 通用
+`Traceback`/`ModuleNotFoundError`），命中即记 `false_success_detected`、**不记信号**、走
+失败预算。刻意**不**登记 `Cannot connect to:` / `Request timeout:`——单条路径的偶发失败在
+正常扫描里也会出现。同理失败分类补了 `tool_missing`（exit 126/127，shell 的固定回答，优先
+于任何文案）与 `tool_broken`（exit≠0 且文案无命中）：此前一律 `unknown`，`task_blocked` 的
+理由文案会甩锅给"规划器无权自行给出 rate_rps"，与真实原因无关。
+
+**P5 容器里的"写文件再读"天然会丢，而且两条安装配方会各说各话。**
+沙箱 rootfs 只读、`/tmp` 是 tmpfs、只取容器 stdout/stderr ⇒ 任何产出必须由 wrapper cat 回
+stdout。dirsearch 的报告正是这样蒸发的：**离线预置** wrapper
+（`scripts/make_dirsearch_preset.py`）一直带 `cat`，**pip 配方** wrapper
+（`installer._write_pip_wrapper`）只有一句 `exec python3 ...`；本机走的是 pip 配方。
+修法：`WRAPPER_ECHO_ARTIFACT` 作为唯一落点常量，被 pip wrapper / 预置 wrapper /
+`build.py` 的 `-o` 三处引用，并由测试钉住同源；wrapper 改为"先取退出码 → cat 产出 →
+`exit $rc`"（**不能用 `exec`**——exec 会把 shell 换掉，没机会回显）。
+**教训：同一件事有两条实现路径时，必须有一条断言把两条路径钉在一起。**
+
+**P6 测试里的监听 socket，收尾顺序错了会跨用例污染，还会死锁。**
+`tests/test_egress_connect_parse.py` 的假上游原本在 `yield` 之后直接 `srv.close()`，而它的
+accept 线程正阻塞在 `accept()` 里。实测这个残留线程会去 `accept()` **后面用例**
+（`test_installer.py` 的 `http_server`）的新连接，并用上游的固定应答
+`200 + Content-Length: 0` 把人家答掉 ⇒ installer 下载到 0 字节（sha256 变成空串摘要
+`e3b0c442…`）、紧接着那个用例的 `server.shutdown()` 永久挂死（它要等一个已经不再 serve 的
+循环）。表现就是全量跑在 48% 处"失败一个然后卡死"。修法：`settimeout` + 停止标志 +
+`join` 之后再 `close`。**这类问题只在"多跑几个 socket 用例"之后才暴露**，所以别删
+`tests/test_egress_connect_parse.py`。
+
+**P7 前端不要拿 `now()` 造事实，也不要把窗口当上限。**
+「已耗时」恒用 `Date.now()` 当终点 ⇒ 任务 `done` 之后计时还在涨；「审计流只有 150 条」
+其实是前端只请求了 `tail=150`（后端不带 `tail` 就返回全部）。两条是同一类错误：**前端把
+"我现在能拿到的"当成"事实"**。修法：终态时刻由后端给（`finished_at`）；窗口类限制在 UI 里
+显式可展开（`查看全部`）。
+
+### 7.17.4 三条方法论（比上面任何一条具体修法都值得记）
+
+1. **先对齐运行时，再谈复现**：容器参数、环境变量、镜像、依赖版本逐项对齐；没对齐时
+   "复现不出来"不构成"没问题"的证据。
+2. **同一症状出现两次不同形态，先找共同机理**：`host="https"`（M31-d）与 `host=""`
+   （M31-e）是同一个"CONNECT 请求行不可信"的两张脸；只修形态会再来第三张。
+3. **把原文钉进证据，别等下次重启**：`egress_denied.request_line`、
+   `false_success_detected`、`signals_recorded.skipped_lines` 这些字段都是"下次一次运行
+   就能判读"的投入。
+
 ## 8. 开发路线图
 
 

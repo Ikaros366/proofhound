@@ -659,3 +659,32 @@ origin，畸形路径都在根路径上构造——这符合"中间件错误页�
     ② 进程重启后 `paused` 与其余运行态一样回退 `created`（限制 25 的粗粒度恢复），需重新
     启动，且不回放断点；③ 暂停不释放已占用的预算/凭据，恢复后按原机继续；④ 该状态纯属
     运行期控制，**不参与报告 / 证据门 / 状态机铁律**（Confirmed 仍只由行为证据决定）。
+
+**dirsearch 链路与工具接入（77~80，2026-11-03，详见 docs/design.md §7.17）**：
+
+77. **工具声明的 `--proxy` / `verify=False` 可能被依赖静默丢弃，判据是"代理侧收到了连接"**：
+    dirsearch 0.5.0 的异步后端把 transport 挂在 `mounts={"all://": ...}`，而 httpx 0.28.1
+    的 `_transport_for_url` 是"最具体优先"、`trust_env` 又会为 `HTTPS_PROXY` 注入
+    `https://`/`http://` mount ⇒ 我们的 mount 从未被选中：`--proxy` 形同虚设（去掉环境变量
+    后直接直连失败）、`verify=False` 一并失效（自签靶一个请求都发不出）。构造器因此**恒产
+    `--sync`**（`build.py::_build_dirsearch`）。**换工具版本或升级带 mounts/proxy 语义的依赖
+    时必须重跑这条复核**——别只看命令里有没有 `--proxy`。**残余**：同步后端吞吐低于异步
+    （安全方向，由授权预算兜底）；dirsearch 0.5.0 的 `mounts` 行为不在本项目控制范围内，
+    上游修好后这条可以再评估。
+78. **工具退出码不可信时，必须登记假成功签名**：dirsearch 打印
+    `Cannot establish the proxy connection` 后**仍以 exit 0 退出**，只信退出码就会把
+    "什么都没做"记成 `done` + `degraded=False`（实测任务 26 秒"跑完"、零请求）。新工具若
+    退出码不可靠，登记 `core/failures.py::FALSE_SUCCESS_SIGNATURES`（只收"命中即代表整轮
+    没跑起来"的精确签名；`Cannot connect to:` / `Request timeout:` 这类单条路径偶发失败
+    刻意不收）。同时 `tool_missing`（exit 126/127）与 `tool_broken`（exit≠0 且文案无命中）
+    两个类别已覆盖"工具没跑起来"的两种常见形态。
+79. **容器内产出必须由 wrapper 回显，且两条安装配方共用同一个落点常量**：沙箱 rootfs 只读、
+    `/tmp` 是 tmpfs、只取容器 stdout/stderr ⇒ 任何"写文件再读"的产出都会随容器销毁。落点
+    常量 `installer.WRAPPER_ECHO_ARTIFACT`（`/tmp/ds_report.json`）被 pip wrapper、离线预置
+    wrapper（`scripts/make_dirsearch_preset.py`）与 `build.py` 的 `-o` 三处引用，由
+    `tests/test_dirsearch.py` 钉住同源。**新工具要回读产出就挂到这条约定上，别再各写一份。**
+80. **控制台的"最近 N 条"是前端窗口，不是后端上限**：审计流默认只轮询
+    `audit?tail=150`（省流量），`GET /audit` **不带 `tail` 返回全部**、`total` 始终是全量
+    计数（`tail=0` 由 `Query(ge=1)` 挡成 422）；界面另有「查看全部」入口。同理，前端任何
+    "现在/经过了多少"的数值都必须由后端给事实（如终态时间 `finished_at`），不得用
+    `Date.now()` 现算——否则任务 `done` 之后「已耗时」会一直涨。
