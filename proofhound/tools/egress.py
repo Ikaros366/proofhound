@@ -36,6 +36,43 @@ EGRESS_NETWORK_NAME = "proofhound-egress"
 
 _BUF = 65536
 
+#: 审计里请求行原文的截断上限（留证据，但不让客户端塞爆审计文件）。
+_RAW_LINE_LIMIT = 200
+
+
+def _split_host_port(raw: str, default_port: int) -> tuple[str, int]:
+    """把 ``host[:port]`` / ``[v6]:port`` 拆成 ``(host, port)``。
+
+    ``host`` 为空表示"这段文本里没有主机名"，调用方据此判"目标为空"。
+    端口缺省或非数字时回落到 ``default_port``——**不猜**：猜错端口要么误放行、
+    要么误拒绝，两种都比"证据不足就拒绝"更坏。
+    """
+    raw = raw.strip()
+    if not raw:
+        return "", default_port
+    if raw.startswith("["):  # IPv6 字面量：[::1]:8443
+        end = raw.find("]")
+        if end < 0:
+            return "", default_port
+        rest = raw[end + 1 :]
+        port_s = rest[1:] if rest.startswith(":") else ""
+        return raw[1:end], int(port_s) if port_s.isdigit() else default_port
+    colons = raw.count(":")
+    if colons == 0:
+        return raw, default_port
+    if colons > 1:  # 无方括号的 IPv6：整体当主机名，不切端口
+        return raw, default_port
+    host, _, port_s = raw.partition(":")
+    return host, int(port_s) if port_s.isdigit() else default_port
+
+
+def _redact_userinfo(uri: str) -> str:
+    """抹掉 ``scheme://user:pass@host`` 里的凭据（审计留证据，不留口令）。"""
+    scheme, sep, rest = uri.partition("://")
+    if not sep or "@" not in rest:
+        return uri
+    return f"{scheme}://{rest.rpartition('@')[2]}"
+
 
 class EgressPolicy(BaseModel):
     """沙箱出口策略：restricted（默认，白名单代理）/ open / none。"""
@@ -168,12 +205,24 @@ class EgressProxy:
                 return
             head, leftover = request
             lines = head.split("\r\n")
-            method, uri, _version = (lines[0].split(" ", 2) + ["", "", ""])[:3]
+            request_line = lines[0]
+            method, uri, _version = (request_line.split(" ", 2) + ["", "", ""])[:3]
             if method.upper() == "CONNECT":
                 host, port = self._parse_connect_target(uri)
-                self._handle_connect(client_sock, host, port)
+                if not host:
+                    # M31-e：请求行里确实没有主机名（实测 origin-form 的
+                    # ``CONNECT /login/<word> HTTP/1.1``）。隧道目标仍在 ``Host:``
+                    # 头里——httpcore 的 TunnelHTTPConnection 恒写
+                    # ``Host: host:port``，且它是**权威值**（请求行的 target 会被
+                    # 客户端的 extensions["target"] 覆盖而失真）。
+                    # 回落取 Host 头；**仍然走同一个 _check**，不因"来自头部"而
+                    # 跳过白名单判定（红线：不得为跑通而放宽白名单）。
+                    host, port = _split_host_port(self._host_header(head), port)
+                self._handle_connect(client_sock, host, port, request_line)
             else:
-                self._handle_plain(client_sock, method, uri, head, leftover)
+                self._handle_plain(
+                    client_sock, method, uri, head, leftover, request_line
+                )
         except (OSError, ValueError):
             pass
         finally:
@@ -198,31 +247,49 @@ class EgressProxy:
 
     @staticmethod
     def _parse_connect_target(uri: str) -> tuple[str, int]:
-        """解析 CONNECT 的目标（M31-d）。
+        """解析 CONNECT 的目标，返回 ``(host, port)``；解析不出主机名时 host 为空。
 
-        标准形态是 ``host:port``；但**实测 dirsearch（httpx 客户端）发的是完整
-        URL**：``CONNECT https://host:8443/path HTTP/1.1``。早先的实现直接
-        ``partition(":")``，于是 host 被解析成 ``"https"``、端口回落 443 ⇒
-        被白名单判越界（审计里表现为 ``host="https", port=443``），客户端只看到
-        ``httpx.ProxyError: Cannot establish the proxy connection``。
+        标准形态是 authority-form ``host:port``（RFC 7231 §4.3.6），但实测客户端
+        会发另外两种形态，这里一并吃掉：
 
-        这里按"去掉 scheme、砍掉路径/查询、再取 host:port"解析；缺端口时按 scheme
-        取默认值（https→443，其余→80）。CONNECT 的路径本身没有语义，忽略即可。
+        - **完整 URL**：``CONNECT https://host:8443/path HTTP/1.1``
+          （M31-d：早先 ``partition(":")`` 把 host 解析成 ``"https"`` ⇒ 403）；
+        - **origin-form**：``CONNECT /login/<word> HTTP/1.1``
+          （M31-e 抓包实证：httpx 的 ``TunnelHTTPConnection`` 会把请求的
+          ``target`` 塞进 CONNECT 的请求行，于是路径代替了 authority）。
+          这种形态**请求行里没有主机名**，一律返回空 host，由 caller 回落
+          ``Host:`` 头（见 :meth:`_handle`）；
+        - **空目标**：``CONNECT  HTTP/1.1`` ⇒ 同样返回空 host。
+
+        CONNECT 的路径本身没有语义，忽略即可；缺端口时按 scheme 取默认值
+        （https→443，其余→80）。
         """
         scheme = uri.split("://", 1)[0].lower() if "://" in uri else ""
-        target = uri.split("://", 1)[-1]
-        target = target.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
-        host, _, port_s = target.partition(":")
         default_port = 443 if scheme in ("", "https") else 80
-        port = int(port_s) if port_s.isdigit() else default_port
-        return host, port
+        target = uri.split("://", 1)[-1].rpartition("@")[2]  # 别把 userinfo 当主机名
+        if target.startswith(("/", "?", "#")):
+            return "", default_port
+        target = target.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+        return _split_host_port(target, default_port)
+
+    @staticmethod
+    def _host_header(head: str) -> str:
+        """取请求头里的 ``Host:`` 值（多条取最后一条；没有则空串）。"""
+        value = ""
+        for line in head.split("\r\n")[1:]:
+            name, sep, val = line.partition(":")
+            if sep and name.strip().lower() == "host":
+                value = val.strip()
+        return value
 
     # ---- CONNECT 隧道 ----
 
-    def _handle_connect(self, client_sock: socket.socket, host: str, port: int) -> None:
+    def _handle_connect(
+        self, client_sock: socket.socket, host: str, port: int, request_line: str = ""
+    ) -> None:
         reason = self._check(host, port)
         if reason is not None:
-            self._deny(client_sock, host, port, reason)
+            self._deny(client_sock, host, port, reason, request_line=request_line)
             return
         try:
             upstream = socket.create_connection((host, port), timeout=15)
@@ -241,6 +308,7 @@ class EgressProxy:
         uri: str,
         head: str,
         leftover: bytes,
+        request_line: str = "",
     ) -> None:
         from urllib.parse import urlparse
 
@@ -250,9 +318,13 @@ class EgressProxy:
             port = parsed.port or (443 if parsed.scheme == "https" else 80)
         except ValueError:
             port = 80
+        if not host:
+            # origin-form 的普通请求（``GET /path``）同样只能在 Host 头里找目标；
+            # 与 CONNECT 一样**仍然走 _check**（白名单判定不因来源而放宽）。
+            host, port = _split_host_port(self._host_header(head), port)
         reason = self._check(host, port)
         if reason is not None:
-            self._deny(client_sock, host, port, reason)
+            self._deny(client_sock, host, port, reason, request_line=request_line)
             return
         try:
             upstream = socket.create_connection((host, port), timeout=15)
@@ -260,7 +332,10 @@ class EgressProxy:
             client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             return
         # 转为 origin-form 转发，剥掉 Proxy-* 头
-        path = uri[len(parsed.scheme) + 3 + len(parsed.netloc):] or "/"
+        if not parsed.scheme and not parsed.netloc:
+            path = uri or "/"  # 本来就是 origin-form，原样转发
+        else:
+            path = uri[len(parsed.scheme) + 3 + len(parsed.netloc):] or "/"
         lines = [line for line in head.split("\r\n")[1:] if not line.lower().startswith("proxy-")]
         upstream.sendall(
             f"{method} {path} HTTP/1.1\r\n".encode("latin-1")
@@ -290,10 +365,24 @@ class EgressProxy:
         return self.scope.check_target(target)
 
     def _deny(
-        self, client_sock: socket.socket, host: str, port: int, reason: str
+        self,
+        client_sock: socket.socket,
+        host: str,
+        port: int,
+        reason: str,
+        request_line: str = "",
     ) -> None:
         self.audit.record(
-            "egress_denied", host=host, port=port, reason=reason
+            "egress_denied",
+            host=host,
+            port=port,
+            reason=reason,
+            # 取证（M31-e）：留请求行原文，脱掉 userinfo 并截断。上次定位这层
+            # 缺陷时只能靠"临时改代码 + 重启服务 + 等用户再跑一次"才看到客户端
+            # 到底发了什么；把原文钉进审计后，同类新形态一次运行即可判读。
+            request_line=(
+                _redact_userinfo(request_line)[:_RAW_LINE_LIMIT] if request_line else ""
+            ),
         )
         body = f"egress denied: {reason}".encode("utf-8")
         client_sock.sendall(

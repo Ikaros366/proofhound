@@ -66,6 +66,7 @@ from proofhound.core.failures import (
     DEFAULT_LIMIT_PER_CATEGORY,
     FailureBudget,
     classify,
+    false_success_signature,
 )
 from proofhound.core.plan import PlanAction, PlanValidationError
 from proofhound.core.planner import Planner
@@ -4367,11 +4368,35 @@ class Orchestrator:
                 reason=f"scope 拒绝（规划缺陷）: {'; '.join(result.violations)}",
             )
             return "failed"
-        if result.exit_code == 0:
+
+        sample = self._sample_output(result)
+        # M31-e：退出码 0 ≠ 成功。实测 dirsearch 打印
+        # ``Cannot establish the proxy connection`` 后仍以 0 退出，旧逻辑据此记
+        # ``count=0`` + ``done`` + ``degraded=False``——假成功，比失败更危险。
+        false_hit = (
+            false_success_signature(action.tool, sample)
+            if result.exit_code == 0
+            else None
+        )
+        if result.exit_code == 0 and false_hit is None:
             self._record_signals(node, action, skill, result)
             return "ok"
+        if false_hit is not None:
+            self.audit.record(
+                "false_success_detected",
+                node_id=node.id,
+                tool=action.tool,
+                exit_code=result.exit_code,
+                signature=false_hit,
+                reason=(
+                    "退出码为 0 但输出命中致命错误签名，按失败处理"
+                    "（不记成功、不记信号）"
+                ),
+            )
 
-        category = classify(self._sample_output(result))
+        category = classify(
+            sample, exit_code=result.exit_code, assume_failed=false_hit is not None
+        )
         exhausted = self.budget.record(node, category)
         self.audit.record(
             "attempt_failed",
@@ -4468,10 +4493,16 @@ class Orchestrator:
         """取 stdout/stderr 尾部采样用于失败分类（有界，不进 LLM 上下文）。"""
         chunks = []
         for path in (result.stderr_path, result.stdout_path):
-            if path and Path(path).is_file():
-                chunks.append(
-                    Path(path)
-                    .read_bytes()[-_OUTPUT_SAMPLE_LIMIT:]
-                    .decode("utf-8", errors="replace")
-                )
+            if not path:
+                continue
+            file = Path(path)
+            if not file.is_file():
+                continue
+            try:
+                with file.open("rb") as fh:  # 只读尾部，别把整份证据读进内存
+                    fh.seek(0, 2)
+                    fh.seek(max(0, fh.tell() - _OUTPUT_SAMPLE_LIMIT))
+                    chunks.append(fh.read().decode("utf-8", errors="replace"))
+            except OSError:
+                continue
         return "\n".join(chunks)

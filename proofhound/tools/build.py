@@ -276,6 +276,9 @@ class DirsearchParams(BaseModel):
 
     恒在项（构造器写死，不接受参数覆盖）：
 
+    - ``--sync``——**恒产**同步后端（见 :func:`_build_dirsearch` 里的长注释：
+      异步后端在本项目固定的 httpx 0.28.1 下会静默丢掉 ``--proxy`` 与
+      ``verify=False``，自签靶一个请求都发不出去）；
     - ``-q``（安静：进度条不进证据）、``--no-color``（证据里不留 ANSI 转义）；
     - ``-O json`` + ``-o /tmp/ds_report.json``——报告写进容器唯一可写处（tmpfs），
       wrapper 负责 ``cat`` 回 stdout（**rootfs 只读 + tmpfs 随容器销毁，不 cat 则
@@ -437,6 +440,23 @@ def _build_dirsearch(
         "--max-time",
         str(_request_cap_seconds(p.max_requests, p.rate_rps, p.window_seconds)),
     ]
+    # M31-e：强制**同步**后端。dirsearch 0.5.0 的缺省后端是异步的，而它把
+    # transport 挂在 ``httpx.AsyncClient(mounts={"all://": ...})`` 上；本项目固定
+    # 的 httpx 0.28.1 会按 ``HTTPS_PROXY``/``HTTP_PROXY`` 环境变量**注入更具体的
+    # ``https://`` / ``http://`` mount**，而 ``_transport_for_url`` 是"最具体优先"
+    # ⇒ 我们那个 ``all://`` mount 从来没被选中。实测后果（同一镜像、同一 argv、
+    # 硬化档下逐条复现）：
+    #
+    #   1. ``--proxy`` 形同虚设：去掉代理环境变量后 dirsearch 直接直连失败
+    #      （``Cannot connect to: 100.80.4.50:8443``），代理一条连接都没收到；
+    #   2. ``verify=False`` 同样失效（它在被丢弃的那个 transport 上）⇒ 自签/
+    #      内部 CA 的靶一律 ``SSL certificate verification failed``，
+    #      **一个请求都发不出去**。
+    #
+    # 同步后端把 ``--proxy`` 与 ``verify=False`` 都落实在 ``requests.Session`` 上，
+    # 两条都真实生效（实测 CONNECT 回到标准 authority-form、TLS 不校验、结果行
+    # 照常产出）；``-t``/``--max-rate`` 的授权语义不变（同一套 rate 计数器）。
+    argv += ["--sync"]
     argv += [
         "--wordlists", p.wordlist,
         "-e", p.extensions,

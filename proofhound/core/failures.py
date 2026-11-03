@@ -21,6 +21,8 @@ class FailureCategory(str, Enum):
     RATELIMIT = "ratelimit"  # 限流
     LOCKOUT = "lockout"  # 账号锁定（硬阻塞）
     NETWORK = "network"  # 网络异常
+    TOOL_MISSING = "tool_missing"  # 工具缺失 / 不可执行（exit 126/127）
+    TOOL_BROKEN = "tool_broken"  # 工具自身报错（含"exit 0 但打印致命错误"）
     UNKNOWN = "unknown"
 
 
@@ -82,15 +84,96 @@ RULES: list[FailureRule] = [
             r"network\s+unreachable",
         ),
     ),
+    # ---- M31-e：工具缺失 / 工具自身报错 -------------------------------------
+    # 严格说这两类是"工具没跑起来"而不是"目标在拒绝我们"，与上面五类不同层。
+    # 早先它们一律落到 unknown，于是 task_blocked 的理由文案把锅甩给规划器
+    # （"你无权自行给出 rate_rps/concurrency/max_requests"），与真实原因无关。
+    FailureRule(
+        FailureCategory.TOOL_MISSING,
+        _patterns(
+            r"command not found",
+            r"executable file not found",
+            r"no such file or directory: '[^']*\.(?:py|exe)'",
+        ),
+    ),
+    FailureRule(
+        FailureCategory.TOOL_BROKEN,
+        _patterns(
+            r"traceback \(most recent call last\)",
+            r"modulenotfounderror",
+            r"importerror:",
+            r"cannot establish the proxy connection",
+            r"error with the (?:system )?proxy",
+            r"invalid proxy url",
+        ),
+    ),
 ]
 
 
-def classify(output: str) -> FailureCategory:
-    """对执行输出采样分类失败信号；无命中返回 ``unknown``。"""
+#: 退出码即类别（M31-e）：126/127 是 shell 对"工具不在 / 不可执行"的固定
+#: 回答，比任何文案都权威，故优先于文本规则。
+EXIT_CODE_CATEGORIES: dict[int, FailureCategory] = {
+    126: FailureCategory.TOOL_MISSING,
+    127: FailureCategory.TOOL_MISSING,
+}
+
+
+def classify(
+    output: str, *, exit_code: int | None = None, assume_failed: bool = False
+) -> FailureCategory:
+    """对执行输出采样分类失败信号；无命中返回 ``unknown``。
+
+    - ``exit_code`` 为 126/127 ⇒ 直接 ``tool_missing``（最权威的判据）；
+    - 否则按 :data:`RULES` 顺次匹配（文案能给出更具体的原因）；
+    - 文案无命中时：调用方**已知这次执行失败**（``assume_failed``，或退出码非 0）
+      不再回落到 ``unknown``，而是 ``tool_broken``——"工具跑挂了"比"不知道为什么"
+      更可信，也避免把工具自身的错误说成规划缺陷（M31-e）。
+    """
+    if exit_code in EXIT_CODE_CATEGORIES:
+        return EXIT_CODE_CATEGORIES[exit_code]
     for rule in RULES:
         if rule.matches(output):
             return rule.category
+    if assume_failed or (exit_code is not None and exit_code != 0):
+        return FailureCategory.TOOL_BROKEN
     return FailureCategory.UNKNOWN
+
+
+# ---- 假成功签名（M31-e）----------------------------------------------------
+#: "退出码 0 却打印了致命错误"的工具签名。
+#:
+#: 实测（eng-20261102T093506Z-aac47e3a）：dirsearch 打印
+#: ``Cannot establish the proxy connection`` 后**仍以 0 退出**，编排器据此记
+#: ``signals_recorded count=0`` + ``phases: web-dirsearch=done`` +
+#: ``degraded=False``——一次 26 秒"跑完"、实际一个目录爆破请求都没发出的假成功。
+#: 退出码不可信的工具在这里登记，命中即按失败处理（走失败预算，不记成功）。
+#:
+#: 只登记"命中即代表整轮没跑起来"的**精确**签名：单条路径的偶发失败在正常扫描里
+#: 也会出现（例如 ``Cannot connect to:`` 的一次重试），不能当致命错误处理。
+FALSE_SUCCESS_SIGNATURES: dict[str, tuple[re.Pattern, ...]] = {
+    "dirsearch": _patterns(
+        r"cannot establish the proxy connection",
+        r"error with the (?:system )?proxy",
+        r"invalid proxy url",
+        r"ssl certificate verification failed",
+    ),
+}
+
+#: 与工具无关的假成功签名：进程还在，但工具自己崩了。
+_GENERIC_FALSE_SUCCESS: tuple[re.Pattern, ...] = _patterns(
+    r"traceback \(most recent call last\)",
+    r"modulenotfounderror",
+)
+
+
+def false_success_signature(tool: str, output: str) -> str | None:
+    """命中"退出码 0 但整轮失败"的签名时返回命中片段，否则 ``None``。"""
+    patterns = (*FALSE_SUCCESS_SIGNATURES.get(tool, ()), *_GENERIC_FALSE_SUCCESS)
+    for pattern in patterns:
+        match = pattern.search(output)
+        if match:
+            return match.group(0)[:120]
+    return None
 
 
 #: 每类失败的重试上限缺省值。M29 起提成常量：无人值守档按能力系数放大它

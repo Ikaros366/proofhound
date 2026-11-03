@@ -57,6 +57,127 @@
    `_parse_connect_target()`：去 scheme、砍路径/查询、再取 host:port，
    缺端口按 scheme 取默认值。**白名单判定不变**（越界端口仍然 403）。
 
+### 修复（M31-e：出口代理拒掉 origin-form CONNECT + dirsearch 的假成功）
+
+两条都是上一层（M31-d）修完后**新冒出来的形态**，来自
+`eng-20261102T093506Z-aac47e3a`。
+
+5. **`egress_denied host='' port=443 reason='目标为空'`（两次）**：dirsearch 这次发的
+   CONNECT 请求行里**根本没有主机名**。用真实 `EgressProxy` + 生产同款硬化容器 +
+   生产同款环境变量抓包，原文是：
+
+   ```
+   CONNECT /login/dynanomity_tectnetable HTTP/1.1
+   Host: 100.80.4.50:8443
+   Accept: */*
+   ```
+
+   机理：httpx 的 `TunnelHTTPConnection` 在构造 CONNECT 时会把**原请求的
+   `extensions["target"]`** 覆盖回请求行（该仓库把 httpcore 打过这个补丁），
+   而 dirsearch 塞进去的是 origin-form 路径 ⇒ 路径顶替了 authority。真正权威的
+   隧道目标还在 `Host:` 头里（恒为 `host:port`）。
+
+   **为什么旧复现脚本复现不出来**：`SandboxRunner` 会给容器设六个 proxy 环境变量
+   （`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 及小写），httpx 0.28.1 会据此注入更具体的
+   `https://` / `http://` mount，把 dirsearch 自己的 `all://` mount 挤掉（最具体优先）
+   ⇒ 走的才是这条 env-proxy 路径。不设环境变量的裸 `docker run` 复现不出来。
+
+   修：`_parse_connect_target()` 对 origin-form / 空目标一律返回空 host
+   （含 IPv6 字面量与 userinfo 的正确处理）；`_handle()` 再回落 `Host:` 头，
+   **仍然过 `_check()`** —— 白名单判定一个字没放宽。顺带把 plain 请求的
+   origin-form（`GET /path`）也接上同样的回落，并修正它的转发路径推导
+   （旧代码会从 `uri[3:]` 开始截，把 `/a/b` 截成 `b`）。
+
+   取证：`egress_denied` 新增 `request_line` 字段（脱 `userinfo`、截断 200 字符）。
+   这层缺陷此前只能靠"临时改代码 + 重启服务 + 等用户再跑一次"才看得见，现在一次
+   运行即可判读。
+
+6. **假成功：工具报错却 `exit 0`**。dirsearch 打印
+   `Cannot establish the proxy connection`（stdout 全文 39 字节）后**仍以 0 退出**，
+   编排器据此记 `signals_recorded count=0` + `phases: web-dirsearch=done` +
+   `degraded=False`，任务 26 秒"跑完"——比失败更危险。
+
+   修：`failures.false_success_signature()` 登记"退出码 0 但整轮没跑起来"的**精确**
+   签名（dirsearch 的代理/TLS 错误 + 与工具无关的 `Traceback`/`ModuleNotFoundError`）；
+   `_exec_run_tool` 命中即记审计 `false_success_detected`、**不记信号**、走失败预算。
+   刻意**不**登记 `Cannot connect to:` / `Request timeout:`——单条路径的偶发失败在
+   正常扫描里也会出现，不能当整轮致命。
+
+7. **失败分类补两类**：`tool_missing`（exit 126/127，shell 的固定回答，优先于文案）
+   与 `tool_broken`（exit≠0 且文案无命中，或命中假成功签名）。此前一律 `unknown`，
+   `task_blocked` 的理由文案会甩锅给"规划器无权自行给出 rate_rps / concurrency /
+   max_requests"，与真实原因无关。
+
+8. **dirsearch 恒产 `--sync`**（第 5 条同一机理的第二处后果）：异步后端下
+   `verify=False` 也随被丢弃的 transport 一起失效，实测自签靶一律
+   `SSL certificate verification failed`，**一个请求都发不出去**；`--proxy` 同样是
+   装饰品（把环境变量去掉后 dirsearch 直接直连失败，代理收到 0 条连接）。
+   同步后端把两者都落实在 `requests.Session` 上；`-t` / `--max-rate` 的授权语义不变。
+
+改动：
+
+- **`proofhound/tools/egress.py`**：新增 `_split_host_port()`（含 IPv6/userinfo）与
+  `_host_header()`；`_parse_connect_target()` 覆盖 authority / absolute-URI /
+  origin-form / 空目标四种形态；`_handle()` 与 `_handle_plain()` 在解析不出主机名时
+  回落 `Host:` 头（**仍过 `_check`**）；`_deny()` 记录 `request_line`。
+- **`proofhound/tools/build.py`**：`_build_dirsearch()` 恒产 `--sync`，注释里写死
+  httpx 0.28.1 的 env-proxy mount 会挤掉 `all://` mount 这一机理与实测后果。
+- **`proofhound/core/failures.py`**：新增 `TOOL_MISSING` / `TOOL_BROKEN` 两个类别、
+  `EXIT_CODE_CATEGORIES`（126/127）、`classify(..., exit_code=, assume_failed=)`、
+  `FALSE_SUCCESS_SIGNATURES` 与 `false_success_signature()`。
+- **`proofhound/core/orchestrator.py`**：`_exec_run_tool` 命中假成功签名即按失败处理；
+  `_sample_output()` 改成只读文件尾部（这条路径现在**每次工具调用**都会走，不再
+  把 6.7MB 的 katana 日志整份读进内存）。
+
+验收（`eng-20261102T094949Z-627e786b`，unattended，budget 50 rps / 10 并发 / 5000 请求）：
+
+- `phases: scan/web-dirsearch = done`，dirsearch stdout 有 **14 条真结果行**
+  （`404 - 19B`、`301 - 0B - .../admin/index.html`），**没有**
+  `Cannot establish the proxy connection`；
+- dirsearch 实跑 **102 秒**（`--max-time 100` 封顶生效），任务总耗时 140 秒；
+- `egress_denied` 4 条且**没有一条 `host=''`**；triage 产出 2 条候选，`degraded=False`；
+- 越界仍拒：把 scope 端口改成 8444 后同一目标依旧
+  `egress_denied`（`端口 8443 不在授权范围`，`request_line` 同时落盘）；
+- 另用裸 socket 复验 origin-form：`CONNECT /login/x` + 正确 `Host:` ⇒
+  `200 Connection Established`（回归 `tests/test_egress_connect_parse.py`）。
+
+**测试基建的一处真缺陷（M31-e 顺带修掉）**：`tests/test_egress_connect_parse.py`
+的 `upstream` fixture 在 `yield` 之后**直接** `srv.close()`，而它的 accept 线程此刻
+正阻塞在 `accept()` 里——关监听并不会唤醒那个调用。实测残留线程会去 `accept()`
+**后面用例**（`tests/test_installer.py` 的 `http_server`）的新连接，并用上游的固定
+应答 `200 + Content-Length: 0` 把人家答掉：
+
+```
+[DBG-accept] listener=? peer=('127.0.0.1', 59024) thread=Thread-1 (loop)   ← 早已 close 的 listener
+[DBG-200] b'HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n' thread=Thread-1 (loop)
+```
+
+于是 installer 下载到 0 字节、sha256 变成空串的摘要（`e3b0c442…`），紧接着那个用例
+的 `server.shutdown()` **永久挂死**（它要等一个已经不再 serve 的循环）。表现就是
+全量跑在 48% 处「失败一个然后卡死」。改为短超时 + 停止标志 + `join` 之后才
+`close`，全量恢复绿。
+
+已知遗留（**不在本次范围**，留作下一手）：`-o /tmp/ds_report.json` 的报告仍然拿不到。
+`tools.d/dirsearch/dirsearch` 这个 wrapper 并没有实现文档里写的"跑完 cat 回 stdout"
+（`installer._write_pip_wrapper` 只生成 `exec python3 ...`），而 tmpfs 随容器销毁 ⇒
+`signals_recorded: dirsearch count=0, skipped_lines=1`。本次验收靠 stdout 的真结果行
+（§7.1 允许的"扫描过程证据"）。要拿回 JSON 报告，需在 `_write_pip_wrapper` 里补 cat，
+或给 runner 加一个产物回读挂载。
+
+同时把 §5 的两个疑点查清了：
+
+- `egress_denied host='burpsuite' port=80` 已定位到**发起方是 katana**（隔离实验：
+  同参数单独跑 httpx **不发**、单独跑 katana **必发**）。原文是
+  `GET http://burpsuite/ HTTP/1.1` + `User-Agent: Go-http-client/1.1`，即
+  **普通 absolute-URI 转发请求**（不是 CONNECT），发生在工具启动时、
+  紧挨 `api.pdtm.sh` 的 pdtm 更新检查，用的是裸 Go client（不是爬虫的 UA）。
+  本项目没有任何配置指向它（`tools.d/` 的脚本/manifest 无该字面量、无同名环境变量；
+  dirsearch 的 `config.ini` 里那条是注释掉的，且 dirsearch 不是发起方）。
+  结论：上游工具自带行为，被白名单按"端口 80 不在授权范围"正确拦下，
+  **不影响主链路、无需处理**。
+- "同一 URL 重复发两次 CONNECT" = dirsearch 的 `max_retries` 缺省 1（即 2 次尝试），
+  不是重试逻辑异常。
+
 ## [0.6.0] - 2026-11-02
 
 ### 变更（许可证：Apache-2.0 → AGPL-3.0）

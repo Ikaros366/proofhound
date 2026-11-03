@@ -132,10 +132,27 @@ def test_dirsearch_argv_golden_conservative_default():
         "-t", "5", "--max-rate", "50",
         # M31：请求总量 5000 / 50 rps = 100s ⇒ 恒产的 --max-time
         "--max-time", "100",
+        # M31-e：恒产 --sync（异步后端会静默丢 --proxy 与 verify=False）
+        "--sync",
         "--wordlists", DIRSEARCH_BUILTIN_WORDLIST,
         "-e", EXT_DEFAULT,
         "-q", "--no-color", "-O", "json", "-o", "/tmp/ds_report.json",
     ]
+
+
+def test_dirsearch_forces_sync_backend():
+    """M31-e：恒产 ``--sync``。
+
+    回归：dirsearch 0.5.0 的异步后端把 transport 挂在
+    ``mounts={"all://": ...}``，而 httpx 0.28.1 会为 ``HTTPS_PROXY`` 环境变量
+    注入更具体的 ``https://``/``http://`` mount（最具体优先）⇒ 我们的 mount
+    从未被选中，``--proxy`` 与 ``verify=False`` 双双失效（实测：自签靶一律
+    ``SSL certificate verification failed``，一个请求都发不出）。
+    """
+    s = _scope()
+    argv = build_command("dirsearch", {"target": TARGET},
+                         request_budget=s.resolved_request_budget())
+    assert "--sync" in argv
 
 
 def test_dirsearch_never_emits_recursive_or_follow_redirects():
