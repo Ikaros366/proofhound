@@ -114,6 +114,9 @@ def _engagement_detail(manager: EngagementManager, eng: Engagement) -> dict:
             "paused_from": eng.paused_from.value if eng.paused_from else None,
             # M27：逐 skill 阶段终态 + 失败原因（控制台据此把对应阶段标红）
             "phases": eng.phases,
+            # M31-g：终态时间。控制台用它把「已耗时」**停住**；未到终态为 None，
+            # 前端继续按实时时钟走。
+            "finished_at": eng.finished_at,
         }
     )
     return detail

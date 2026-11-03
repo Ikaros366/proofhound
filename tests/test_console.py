@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import time
 from datetime import datetime, timezone
@@ -370,3 +371,76 @@ def test_evidence_file_bare_cr_anchor_consistent(client, workspace):
     assert resp.status_code == 200
     assert "\r" not in resp.text
     assert resp.text.split("\n")[2] == "gamma"
+
+
+# ---- M31-g：「已耗时」在终态后必须停住 ----
+
+
+def test_detail_exposes_finished_at_once_terminal(client):
+    """终态后详情必须给出 ``finished_at``（控制台据此停表）。
+
+    旧实现详情里只有 ``created_at``，前端只能恒用 ``Date.now()`` 当终点 ⇒ 任务
+    done 之后「已耗时」还在一直涨，一个早已跑完的任务看起来永远在跑。
+    """
+    eng_id, _ = _run_to_done_with_confirmed(client)
+
+    first = client.get(f"/api/engagements/{eng_id}").json()
+    assert first["state"] == "done"
+    assert first["finished_at"], first
+    # 终态时间是**事实**，不是"现在"：再轮询一次必须一模一样（否则前端还会涨）
+    time.sleep(0.05)
+    second = client.get(f"/api/engagements/{eng_id}").json()
+    assert second["finished_at"] == first["finished_at"]
+    assert second["finished_at"] >= second["created_at"]
+
+
+def test_detail_finished_at_is_none_before_terminal(client):
+    """未到终态必须是 None —— 前端据此继续走实时时钟，而不是一上来就停表。"""
+    eng_id = _create(client)
+    detail = client.get(f"/api/engagements/{eng_id}").json()
+    assert detail["state"] == "created"
+    assert detail["finished_at"] is None
+
+
+def test_legacy_engagement_finished_at_backfilled_from_engagement_json(
+    workspace, fake_factory
+):
+    """升级前跑完的任务也要停表：api.json 没有 finished_at 时回落读 engagement.json。
+
+    M31-g 之前 ``finished_at`` 只写进 ``engagement.json``。若只认 api.json，用户手里
+    那些早已 done 的任务在控制台上还会继续涨——等于"升级了但没修好"。
+    """
+    app = create_app(workspace, phases_factory=fake_factory, confirm_timeout=30.0)
+    with TestClient(app) as first_client:
+        eng_id, _ = _run_to_done_with_confirmed(first_client)
+
+    eng_dir = workspace / "engagements" / eng_id
+    api_json = eng_dir / "api.json"
+    meta = json.loads(api_json.read_text(encoding="utf-8"))
+    assert meta.pop("finished_at", None)  # 前提：本轮确实写过（旧数据没有这一键）
+    api_json.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+    from_report = json.loads(
+        (eng_dir / "engagement.json").read_text(encoding="utf-8")
+    )["finished_at"]
+
+    # 重开一个 app = 服务重启后 manager._load_all 从 api.json 重建记录
+    restarted = create_app(workspace, phases_factory=fake_factory, confirm_timeout=30.0)
+    with TestClient(restarted) as second_client:
+        detail = second_client.get(f"/api/engagements/{eng_id}").json()
+
+    assert detail["state"] == "done"
+    assert detail["finished_at"] == from_report
+
+
+def test_static_js_elapsed_clock_stops_on_terminal():
+    """前端调用形态守卫：``fmtElapsed`` 必须收到 ``detail.finished_at`` 当终点。
+
+    只钉住调用形态（与 ``test_static_js_no_innerhtml`` 同一纪律）。反面形态是
+    ``fmtElapsed(detail.created_at)`` —— 那一版恒用 ``Date.now()``。
+    """
+    js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert js.count("fmtElapsed(detail.created_at, detail.finished_at)") == 2
+    assert "function fmtElapsed(iso, endIso)" in js
+    # 终点取 endIso 有值时的那个时刻，而不是无条件 now()
+    assert "endIso ? new Date(endIso).getTime() : Date.now()" in js

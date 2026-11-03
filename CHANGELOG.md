@@ -225,6 +225,33 @@ exit "$rc"
   （`--max-time 100`）；`egress_denied` 仍为那 4 条无害的（pdtm 遥测 + katana 的
   `GET http://burpsuite/`），无 `host=''`。
 
+### 修复（M31-g：任务完成后控制台的「已耗时」还在一直涨）
+
+控制台的「已耗时」是 `fmtElapsed(detail.created_at)`——终点恒取 `Date.now()`，于是
+engagement 走到 `done` / `failed` 之后计时**仍在增加**：一个早已跑完的任务看起来
+永远在跑。
+
+后端其实早就有终态时刻（`EngagementRunner._finish_meta` 自 M16 起一直在往
+`engagement.json` 写 `finished_at`），但**详情接口没有暴露**，前端只能自己拿当前
+时间凑。
+
+改动：
+
+- **`proofhound/api/runner.py`**：`finished_at` 进 `api.json`（`_persist`）并新增
+  `Engagement.set_finished_at()`；`_finish_meta` 写报告元信息的同时也落 api.json。
+  **老数据兼容**：api.json 里没有这个键时（M31-g 之前跑完的任务），终态回落读
+  `engagement.json`——否则升级后旧任务在控制台上照样继续涨。
+- **`proofhound/api/server.py`**：`GET /api/engagements/{id}` 暴露 `finished_at`；
+  未到终态为 `null`，前端据此继续走实时时钟。
+- **`proofhound/api/static/app.js`**：`fmtElapsed(start, end)`——`endIso` 有值就用它
+  当终点（**停表**），否则用当前时间。
+- **测试**：`tests/test_console.py` +4（终态后 `finished_at` 存在且两次轮询完全一致、
+  终态前为 `null`、老数据回落、前端调用形态守卫）。
+
+验证：现有 5 个已完成任务（含 M31-e / M31-f 那两轮）重启后 `finished_at` 立即有值，
+多次轮询不变；`/static/app.js` 已带新实现（普通刷新即可，静态资源带
+`etag` / `last-modified`，浏览器会重新校验）。
+
 ## [0.6.0] - 2026-11-02
 
 ### 变更（许可证：Apache-2.0 → AGPL-3.0）

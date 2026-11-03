@@ -265,6 +265,15 @@ class Engagement:
         self.derived_scope: dict | None = meta.get("derived_scope")
         self.budget: int | None = meta.get("budget")
         self.created_at: str = meta["created_at"]
+        # M31-g：终态时间（done/failed 收尾时写入；未收尾为 None）。控制台据此把
+        # 「已耗时」停住——旧实现前端恒用 Date.now()，任务做完后计时还在一直涨。
+        # 老数据只有 engagement.json 有（本键进 api.json 是 M31-g 才开始的），
+        # 终态时回落读它，否则升级后旧任务在控制台上还会继续涨。
+        self._finished_at: str | None = meta.get("finished_at")
+        if self._finished_at is None and meta.get("state") in {
+            state.value for state in _TERMINAL
+        }:
+            self._finished_at = self._finished_at_from_report_meta()
         self.with_session: bool = bool(meta.get("with_session"))
         # M8c：第二身份会话（reference/victim）是否配置（值永不进响应体）
         self.with_reference_session: bool = bool(meta.get("with_reference_session"))
@@ -342,6 +351,32 @@ class Engagement:
             self._phases = list(records)
             self._persist()
 
+    @property
+    def finished_at(self) -> str | None:
+        """终态时间（ISO8601 UTC）；未到终态为 None。"""
+        with self._lock:
+            return self._finished_at
+
+    def set_finished_at(self, ts: str) -> None:
+        """记录终态时间并落盘 api.json（控制台据此冻结「已耗时」）。"""
+        with self._lock:
+            self._finished_at = ts
+            self._persist()
+
+    def _finished_at_from_report_meta(self) -> str | None:
+        """从 ``engagement.json`` 读 finished_at（老数据兼容；读不到返回 None）。
+
+        ``_finish_meta`` 自 M16 起就一直在写这个键，只是 M31-g 之前没进 api.json。
+        """
+        try:
+            data = json.loads(
+                (self.dir / "engagement.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            return None
+        value = data.get("finished_at")
+        return value if isinstance(value, str) and value else None
+
     # ---- 协作式暂停 ----
 
     @property
@@ -408,6 +443,8 @@ class Engagement:
             "tls_verify": self.tls_verify,
             # M27：阶段终态随元数据持久化（详情/列表接口读它，控制台据此标红）
             "phases": self._phases,
+            # M31-g：终态时间（详情接口读它，控制台据此把「已耗时」停住）
+            "finished_at": self._finished_at,
         }
         if self.derived_scope is not None:
             # M9a：派生范围必须随之持久化——否则每次状态迁移写回都会把它抹掉，
@@ -807,7 +844,11 @@ class EngagementRunner:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             meta = {}
-        meta["finished_at"] = _utc_now()
+        finished_at = _utc_now()
+        meta["finished_at"] = finished_at
+        # M31-g：同一时刻也进 api.json。此前只有 engagement.json 有，详情接口不暴露，
+        # 前端只能恒用 Date.now() ⇒ 任务 done 之后「已耗时」还在一直涨。
+        self.rt.engagement.set_finished_at(finished_at)
         # M27：阶段终态同时进 api.json——详情接口与控制台读它，而不是只看 state
         self.rt.engagement.set_phases(self._phases)
         meta_path.write_text(

@@ -594,7 +594,7 @@ function renderDetail(view, engId) {
       renderProgress(detail, counts);
     }
     if (st.progressEls && st.progressEls.elapsed) {
-      st.progressEls.elapsed.textContent = `已耗时 ${fmtElapsed(detail.created_at)}`;
+      st.progressEls.elapsed.textContent = `已耗时 ${fmtElapsed(detail.created_at, detail.finished_at)}`;
     }
   }
 
@@ -696,7 +696,7 @@ function renderDetail(view, engId) {
 
     const metrics = el('div', 'run-metrics');
     const headline = el('div', 'run-headline');
-    const elapsed = el('span', 'run-elapsed', `已耗时 ${fmtElapsed(detail.created_at)}`);
+    const elapsed = el('span', 'run-elapsed', `已耗时 ${fmtElapsed(detail.created_at, detail.finished_at)}`);
     headline.appendChild(elapsed);
     headline.appendChild(el('span', 'run-sep', '·'));
     headline.appendChild(el('span', 'run-state', STATE_LABEL[detail.state] || detail.state));
@@ -736,10 +736,14 @@ function renderDetail(view, engId) {
     return '运行中 —— 暂停在阶段边界生效（不硬中断在途阶段）。';
   }
 
-  function fmtElapsed(iso) {
+  // 已耗时：`endIso` 有值就用它当终点（任务已终态 ⇒ 计时停住），否则用当前时间
+  // 走实时时钟。旧实现恒用 Date.now()，于是 done 之后「已耗时」还在一直涨。
+  function fmtElapsed(iso, endIso) {
     const start = new Date(iso).getTime();
     if (Number.isNaN(start)) return '—';
-    const seconds = Math.max(0, Math.floor((Date.now() - start) / 1000));
+    const endRaw = endIso ? new Date(endIso).getTime() : Date.now();
+    const end = Number.isNaN(endRaw) ? Date.now() : endRaw;
+    const seconds = Math.max(0, Math.floor((end - start) / 1000));
     const h = Math.floor(seconds / 3600);
     const m = Math.floor((seconds % 3600) / 60);
     const s = seconds % 60;
