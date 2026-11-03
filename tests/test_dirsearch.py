@@ -342,3 +342,38 @@ def test_scope_sees_only_the_target_not_wordlist_or_output_paths():
     assert decision.allowed, decision.violations
     assert [(t.host, t.port) for t in decision.targets] == [("127.0.0.1", 8080)]
     assert decision.file_targets == []
+
+
+# --------------------------------------- 报告落点与 wrapper 回显路径（M31-f）
+
+
+def test_dirsearch_report_path_matches_wrapper_echo():
+    """回归：``-o`` 的落点必须等于安装侧 wrapper 回显的那个路径。
+
+    上一版的真实缺陷：构造器写 ``/tmp/ds_report.json``，而 **pip 配方**生成的
+    ``tools.d/dirsearch/dirsearch`` 只有一句 ``exec python3 ...``，根本不 cat。
+    于是报告随 tmpfs 蒸发，``parsers/dirsearch_json.py`` 永远拿不到 JSON ⇒
+    ``signals_recorded: dirsearch count=0``、dirsearch 一条发现都进不了 triage。
+    """
+    from proofhound.tools.build import DIRSEARCH_REPORT_PATH
+    from proofhound.tools.installer import WRAPPER_ECHO_ARTIFACT
+
+    assert DIRSEARCH_REPORT_PATH == WRAPPER_ECHO_ARTIFACT
+    s = _scope()
+    argv = build_command("dirsearch", {"target": TARGET},
+                         request_budget=s.resolved_request_budget())
+    assert argv[argv.index("-o") + 1] == DIRSEARCH_REPORT_PATH
+
+
+def test_offline_preset_wrapper_echoes_same_artifact():
+    """离线预置脚本的 wrapper 模板也必须回显同一个路径（两条配方同源）。"""
+    import importlib.util
+    from pathlib import Path
+
+    from proofhound.tools.installer import WRAPPER_ECHO_ARTIFACT
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "make_dirsearch_preset.py"
+    spec = importlib.util.spec_from_file_location("_mk_preset", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert f"cat {WRAPPER_ECHO_ARTIFACT}" in module.WRAPPER

@@ -157,12 +157,8 @@
 全量跑在 48% 处「失败一个然后卡死」。改为短超时 + 停止标志 + `join` 之后才
 `close`，全量恢复绿。
 
-已知遗留（**不在本次范围**，留作下一手）：`-o /tmp/ds_report.json` 的报告仍然拿不到。
-`tools.d/dirsearch/dirsearch` 这个 wrapper 并没有实现文档里写的"跑完 cat 回 stdout"
-（`installer._write_pip_wrapper` 只生成 `exec python3 ...`），而 tmpfs 随容器销毁 ⇒
-`signals_recorded: dirsearch count=0, skipped_lines=1`。本次验收靠 stdout 的真结果行
-（§7.1 允许的"扫描过程证据"）。要拿回 JSON 报告，需在 `_write_pip_wrapper` 里补 cat，
-或给 runner 加一个产物回读挂载。
+**当时还留了一处**：`signals_recorded: dirsearch count=0, skipped_lines=1`——
+JSON 报告仍然拿不到（见下面的 M31-f）。
 
 同时把 §5 的两个疑点查清了：
 
@@ -177,6 +173,57 @@
   **不影响主链路、无需处理**。
 - "同一 URL 重复发两次 CONNECT" = dirsearch 的 `max_retries` 缺省 1（即 2 次尝试），
   不是重试逻辑异常。
+
+### 修复（M31-f：dirsearch 的 JSON 报告拿不到 —— 两条安装配方各说各话）
+
+M31-e 的验收里 `web-dirsearch` 已经 `done`、stdout 有 14 条真结果行，但
+`signals_recorded: dirsearch count=0, skipped_lines=1`——扫出来的结果**一条都没进
+triage**。原因是 `-o /tmp/ds_report.json` 写进容器 tmpfs、**随容器销毁**，而沙箱只取
+容器 stdout/stderr，必须由 wrapper 把报告 cat 回 stdout
+（`parsers/dirsearch_json.py` 吃的就是 stdout 里那一段 JSON）。
+
+**为什么只有一半坏**：`scripts/make_dirsearch_preset.py` 生成的**离线预置** wrapper
+一直带着回显——
+
+```sh
+rc=0
+python3 "$HERE/lib/bin/dirsearch" "$@" || rc=$?
+if [ -f /tmp/ds_report.json ]; then cat /tmp/ds_report.json; fi
+exit "$rc"
+```
+
+而 `installer._write_pip_wrapper` 生成的 **pip 配方** wrapper 只有一句
+`exec python3 ...`。本机走的是 pip 配方（预置目录不在），于是报告蒸发。
+
+改动：
+
+- **`proofhound/tools/installer.py`**：新增 `WRAPPER_ECHO_ARTIFACT`
+  （`/tmp/ds_report.json`，唯一的落点常量）；`_write_pip_wrapper` 生成的 wrapper 改为
+  「先取退出码 → cat 产出 → `exit $rc`」，并且**不再 `exec`**（exec 会把 shell 换掉，
+  没机会回显；退出码仍原样透传，`exit 127` 这类"工具缺失"签名不会被吞）。
+- **`proofhound/tools/build.py`**：`-o` 改用 `DIRSEARCH_REPORT_PATH`
+  （取值即 `WRAPPER_ECHO_ARTIFACT`）；`scripts/make_dirsearch_preset.py` 的模板也
+  引用同一常量。**三处同源**，漂移由测试钉住。
+- **测试**：`tests/test_installer.py` +3（退出码透传、产出追加在工具输出之后、
+  无产出时不凭空输出）；`tests/test_dirsearch.py` +2（`-o` == wrapper 回显路径、
+  离线预置模板同源）。
+- 本机重新生成了 `tools.d/{dirsearch,sqlmap}` 的 wrapper（`tools.d/*` 是 gitignore 的
+  运行时状态，代码侧已修好，重装/重建即得）。
+
+验收（`eng-20261103T030841Z-b013d083`，同 §7 口径：unattended，50 rps / 10 并发 /
+5000 请求）：
+
+- `signals_recorded: dirsearch` 由 `count=0, skipped_lines=1` 变成
+  **`count=14, skipped_lines=0`**，14 条全是 `web-probe`，带
+  `contentLength` / `contentType` / `elapsed` / `redirect` 与
+  `evidence_ref=<stdout>#L17`（JSON 报告块首行）；
+- `triage_completed`：`signals=16, mapped=14, created=13, merged=1`，
+  `created_by_type={"web-exposure": 12, "error-disclosure": 1}` ——
+  dirsearch 扫出来的 `/adm/`、`/admincp/`、`/api/swagger/` 等 301 路径真正变成了
+  `web-exposure` 候选（上一轮 triage 只有 2 条候选）；
+- 任务仍 `state=done`、`degraded=False`、`web-dirsearch=done`，dirsearch 跑 101 秒
+  （`--max-time 100`）；`egress_denied` 仍为那 4 条无害的（pdtm 遥测 + katana 的
+  `GET http://burpsuite/`），无 `host=''`。
 
 ## [0.6.0] - 2026-11-02
 

@@ -49,6 +49,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+from proofhound.tools.installer import WRAPPER_ECHO_ARTIFACT  # noqa: E402
 from proofhound.tools.manifest import load_manifest  # noqa: E402
 
 MANIFEST = REPO / "proofhound" / "tools" / "manifests" / "dirsearch.yaml"
@@ -75,9 +76,9 @@ export PYTHONPATH="$HERE/lib${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONDONTWRITEBYTECODE=1
 rc=0
 python3 "$HERE/lib/bin/dirsearch" "$@" || rc=$?
-if [ -f /tmp/ds_report.json ]; then cat /tmp/ds_report.json; fi
+if [ -f @@ARTIFACT@@ ]; then cat @@ARTIFACT@@; fi
 exit "$rc"
-"""
+""".replace("@@ARTIFACT@@", WRAPPER_ECHO_ARTIFACT)
 
 
 def _download(url: str, dest: Path, attempts: int = 3) -> None:

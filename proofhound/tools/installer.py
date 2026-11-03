@@ -30,6 +30,16 @@ from urllib.parse import urlparse
 
 from .manifest import InstallRecipe, ToolManifest
 
+#: pip 安装的 CLI 工具把「产出」（如 dirsearch 的 JSON 报告）写进容器 ``/tmp``——
+#: rootfs 只读，``/tmp`` 是 tmpfs，**随容器销毁**。沙箱只取容器的 stdout/stderr，
+#: 所以 wrapper 不把它 cat 回来，就等于这次执行什么都没产出：红线 3 的证据拿不到，
+#: ``parsers/dirsearch_json.py`` 也拿不到 JSON 报告（``signals_recorded: count=0``）。
+#:
+#: 本常量是**两条安装配方共同的落点**：``_write_pip_wrapper`` 把它写进 pip wrapper，
+#: ``scripts/make_dirsearch_preset.py`` 把它写进离线预置 wrapper，``build.py`` 把它
+#: 当作 ``-o`` 的取值。三处必须一致——``tests/test_dirsearch.py`` 有测试钉住。
+WRAPPER_ECHO_ARTIFACT = "/tmp/ds_report.json"
+
 # 默认允许的下载源（可在构造时覆盖，如测试中指向 127.0.0.1）
 DEFAULT_ALLOWED_HOSTS = ("github.com", "objects.githubusercontent.com")
 
@@ -359,7 +369,13 @@ class ToolInstaller:
     def _write_pip_wrapper(self, manifest: ToolManifest, lib_dir: Path) -> None:
         """生成 ``tools.d/<name>/<name>`` wrapper：优先 console script
         （``lib/bin/<name>``），否则直跑 ``lib/<name>/<name>.py``；显式
-        python3 + PYTHONPATH，宿主与容器（python 镜像）均可执行。"""
+        python3 + PYTHONPATH，宿主与容器（python 镜像）均可执行。
+
+        M31-f：工具退出后把 :data:`WRAPPER_ECHO_ARTIFACT` 指向的产出 cat 到 stdout，
+        再以**工具原本的退出码**退出。此前这里只有一句 ``exec python3 ...``，于是
+        dirsearch 的报告随 tmpfs 蒸发，``signals_recorded`` 恒为 0——而离线预置
+        wrapper（``scripts/make_dirsearch_preset.py``）一直是带 cat 的，两条配方
+        就此各说各话。**不用 ``exec``**：exec 会把 shell 替换掉，没机会回显产出。"""
         console = Path("bin") / manifest.name
         module = Path(manifest.name) / f"{manifest.name}.py"
         if (lib_dir / console).is_file():
@@ -376,7 +392,12 @@ class ToolInstaller:
             "#!/bin/sh\n"
             'HERE="$(cd "$(dirname "$0")" && pwd)"\n'
             f'PYTHONPATH="$HERE/lib${{PYTHONPATH:+:$PYTHONPATH}}" '
-            f'exec python3 {entry} "$@"\n',
+            f'python3 {entry} "$@"\n'
+            # 先取退出码，再回显产出：工具失败时也要把它的 stdout 留着，且退出码
+            # 必须原样透传（否则 exit 127 之类的"工具缺失"签名会被 wrapper 吞掉）。
+            "rc=$?\n"
+            f"if [ -f {WRAPPER_ECHO_ARTIFACT} ]; then cat {WRAPPER_ECHO_ARTIFACT}; fi\n"
+            'exit "$rc"\n',
             encoding="utf-8",
         )
         self._make_executable(wrapper)

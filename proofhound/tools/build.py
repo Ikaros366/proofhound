@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from proofhound.compliance.scope import RequestBudget
 from proofhound.compliance.session import SessionConfig
+from proofhound.tools.installer import WRAPPER_ECHO_ARTIFACT
 
 
 class UnknownToolError(ValueError):
@@ -265,6 +266,12 @@ SANDBOX_TIMEOUT_CAP = 300
 #: ``/opt/tools/dicc.txt does not exist`` 退出 1，被失败预算判 blocked。
 DIRSEARCH_BUILTIN_WORDLIST = "/opt/tools/dirsearch/lib/dirsearch/db/dicc.txt"
 
+#: dirsearch 的 JSON 报告落点（M31-f）。**必须**等于安装侧 wrapper 回显的那个
+#: 路径（:data:`proofhound.tools.installer.WRAPPER_ECHO_ARTIFACT`），否则报告随
+#: tmpfs 蒸发：解析器要求"报告在 stdout 里"，拿不到就恒为 ``signals count=0``。
+#: 上一版正是构造器写 ``/tmp/ds_report.json``、而 pip wrapper 根本不 cat。
+DIRSEARCH_REPORT_PATH = WRAPPER_ECHO_ARTIFACT
+
 
 class DirsearchParams(BaseModel):
     """dirsearch 字典爆路径参数（M16-b，L1 主动发现类）。
@@ -280,9 +287,10 @@ class DirsearchParams(BaseModel):
       异步后端在本项目固定的 httpx 0.28.1 下会静默丢掉 ``--proxy`` 与
       ``verify=False``，自签靶一个请求都发不出去）；
     - ``-q``（安静：进度条不进证据）、``--no-color``（证据里不留 ANSI 转义）；
-    - ``-O json`` + ``-o /tmp/ds_report.json``——报告写进容器唯一可写处（tmpfs），
-      wrapper 负责 ``cat`` 回 stdout（**rootfs 只读 + tmpfs 随容器销毁，不 cat 则
-      报告蒸发**，红线 3 的证据就拿不到）；
+    - ``-O json`` + ``-o <DIRSEARCH_REPORT_PATH>``——报告写进容器唯一可写处
+      （tmpfs），由安装侧 wrapper 负责 ``cat`` 回 stdout（**rootfs 只读 + tmpfs 随
+      容器销毁，不 cat 则报告蒸发**，红线 3 的证据就拿不到）；路径与 wrapper 的
+      回显路径同源，见 :data:`DIRSEARCH_REPORT_PATH`；
     - ``-t <concurrency>`` / ``--max-rate <rate_rps>``——**授权语义的落点**；
     - ``--max-time <秒>``——**恒产**：取 ``max_requests / rate_rps`` 与时间窗
       （×0.7）的较小者。它是请求总量上限的落点（dirsearch 没有
@@ -462,7 +470,7 @@ def _build_dirsearch(
         "-e", p.extensions,
         "-q", "--no-color",
         "-O", "json",
-        "-o", "/tmp/ds_report.json",
+        "-o", DIRSEARCH_REPORT_PATH,
     ]
     # 恒在项缺席声明（写死在下方注释，不产旗标）：
     #   -r/--recursive        递归爆破成倍放大请求量 —— 永不产
