@@ -61,6 +61,7 @@ from proofhound.verify.ssti import (
     SSTI_CONFIRMED_METHOD,
     SSTI_EVALUATION_EVIDENCE_KIND,
 )
+from proofhound.verify.unauth_anon import UNAUTH_ANON_METHOD
 from proofhound.verify.unauth_control import (
     UNAUTH_CONFIRMED_METHOD,
     UNAUTH_EQUIVALENCE_EVIDENCE_KIND,
@@ -154,8 +155,11 @@ VULN_REGISTRY: dict[str, VulnSpec] = {
         behavioral_kinds=frozenset({BEHAVIORAL_EVIDENCE_KIND}),
         verify_skill="verify-ssrf",
         in_model_whitelist=True,
-        # M16 的验证要求「带会话 baseline」，故缺会话时整类不可验证
-        requires_session=True,
+        # M34：**不再要求预置会话**。M16 当时写的是"验证要求带会话 baseline"，
+        # 但那是实现细节不是判据前提——SSRF 的确认手段是"我们的 listener 收到
+        # 回调"，与"你是谁"无关；匿名可达的端点照样能测。缺会话时 baseline 走
+        # 匿名（`_run_baseline`），被 401/403/3xx 挡回才记 `verify_needs_credentials`。
+        requires_session=False,
         note=(
             "M15 只放开模型候选（规则表刻意零候选），M16 补验证器；"
             "确认靠宿主 listener 收到回调"
@@ -171,14 +175,20 @@ VULN_REGISTRY: dict[str, VulnSpec] = {
         #
         # **刻意不接受** AI 判定器的语义结论作证据（M16-c 裁定：形态 B 若把 AI 结论
         # 当证据就等于打开"AI 说敏感即确认"的降级路径，撞铁律 2 与 README 边界）。
-        methods=frozenset({UNAUTH_CONFIRMED_METHOD}),
+        # M35：两条互不替代的确认手段——
+        # ① `unauth-equivalence-confirmed`：匿名视图 ≡ 已认证视图（有凭据时更强）；
+        # ② `unauth-anon-data-confirmed`：黑盒断言（匿名 2xx + 无效凭据对照逐字节
+        #    相同 + ≥2 个敏感字段取值）。黑盒 engagement 里只有②可用。
+        methods=frozenset({UNAUTH_CONFIRMED_METHOD, UNAUTH_ANON_METHOD}),
         behavioral_kinds=frozenset({UNAUTH_EQUIVALENCE_EVIDENCE_KIND}),
         verify_skill="verify-unauth",
         # M16-c 裁定：由**确定性规则表**从 web-probe 派生，窄形态无需语义判断，
         # 故刻意**不进**模型白名单（且进了也是死路——web-probe 信号不进模型通道）。
         in_model_whitelist=False,
-        # 等价性判定要拿「已认证视图」当基准，没有它就没有可比对象
-        requires_session=True,
+        # M35：**不再要求预置会话**。有会话走等价性判据（更强），没会话走黑盒
+        # 断言（匿名敏感数据 + 无效凭据对照）。M16-c 当初置 True 是因为当时只有
+        # 等价性一条通道，黑盒下该类型整类不可达。
+        requires_session=False,
         note="M17-b 接上生产者与生产栈槽位（限制 58/59 关闭）",
     ),
     "cmdi": VulnSpec(

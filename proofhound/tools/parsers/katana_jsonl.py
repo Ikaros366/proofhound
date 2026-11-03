@@ -39,11 +39,22 @@ M8a（POST 表单发现）：除分支 B 外，从 ``response.body`` 识别 POST
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+from dataclasses import replace
 from html.parser import HTMLParser
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import quote, urlencode, urljoin, urlparse
 
 from proofhound.findings.signal import Signal
+from proofhound.jsimport.crawl import JsDocument
+from proofhound.jsimport.extract import extract_endpoints
+from proofhound.jsimport.match import (
+    DATA_PREFIXES,
+    DATA_SEGMENTS,
+    exclusion_reason,
+    segments_of,
+)
 
 # GET 表单提交时不参与的 input 类型（其余带 name 即收，宁宽勿漏——
 # 下游 triage 启发式键名与 scope 校验做过滤）
@@ -179,6 +190,223 @@ def _form_page_field_names(page_url: str, forms: list[dict]) -> list[str]:
     return names
 
 
+
+#: JS 正文字面量抽取后**不产候选**的路径前缀（静态资源面由 dirsearch 负责）
+_JS_ENDPOINT_SKIP_TEMPLATE = "{param}"
+
+#: 版本段（``/api/v1``）：与 :mod:`proofhound.jsimport.match` 同一套词表
+_JS_VERSION_SEGMENT = re.compile(r"v[0-9]+")
+
+#: 单段路径的合法字符（M33 实测收紧）：JS 里大量以 ``/`` 开头的字符串其实是
+#: **正则字面量或代码片段**（``/,end:``、``/})]},l={className:``、``/\\*``），
+#: 拼上 ``/api/v1`` 之后它们全都"像接口"，会把候选池灌成噪声（实测 50 条垃圾）。
+#: 只接受词形段（字母数字与 ``._~-``），最多 6 段。
+_JS_PATH_SEGMENT = re.compile(r"[A-Za-z0-9._~-]{1,64}")
+_MAX_API_SEGMENTS = 6
+
+
+def _is_clean_api_path(path_template: str) -> bool:
+    """路径是否像"人写出来的接口路径"（不是正则/代码片段）。"""
+    segments = [part for part in path_template.split("/") if part]
+    if not segments or len(segments) > _MAX_API_SEGMENTS:
+        return False
+    return all(_JS_PATH_SEGMENT.fullmatch(part) for part in segments)
+
+
+def _looks_like_api_path(path_template: str) -> bool:
+    """路径本身必须带**数据线索**，否则不产 api-endpoint（M33 实测收敛）。
+
+    只用 :mod:`~proofhound.jsimport.match` 的同一套词表（``DATA_PREFIXES`` /
+    ``DATA_SEGMENTS``），不另立标准。两条实测必须挡住的形态：
+
+    - ``/api/v1`` —— 这是 ``baseURL`` 常量本身（接口的**基址**，不是端点）；
+    - ``/settings/providers/new`` —— 纯 SPA 路由。它带着 query 键，故能通过
+      ``exclusion_reason`` 的"有 query 就算数据接口"这条口子；但匿名与已认证
+      请求它都会拿到同一个空壳，进 ``unauth-exposure`` 会被判成**误确认**。
+      SPA 路由归发现侧的页面面，不归接口面。
+    """
+    segments = segments_of(path_template)
+    if not segments:
+        return False
+    if segments[0] not in DATA_PREFIXES:
+        # 裸的 ``/users`` / ``/settings/providers/new`` 与 SPA 页面路由同名同形，
+        # 匿名与已认证都会拿到同一个空壳 ⇒ 进 unauth-exposure 会被判成**误确认**。
+        # 故只认带数据前缀的路径；没有前缀的 REST 风格接口本轮不产（已知代价）。
+        return False
+    rest = list(segments[1:])
+    if rest and _JS_VERSION_SEGMENT.fullmatch(rest[0]):
+        rest = rest[1:]
+    if not rest:
+        return False  # "/api/v1" 剥掉前缀与版本后为空 ⇒ 只是基址
+    # 剩余段全是纯版本号（``/api/v1/v4``）⇒ 那是 semver 碎片被拼上基址，不是接口
+    return not all(_JS_VERSION_SEGMENT.fullmatch(segment) for segment in rest)
+
+
+def _candidate_paths(path_template: str, bases: list[str]) -> list[str]:
+    """一个 JS 字面量可能对应的真实地址（M33：两条语义都算）。
+
+    - 原样：字面量本身就是完整路径（``"/api/v1/info"``、``"/users/"``）；
+    - 基址拼接：``baseURL: "/api/v1"`` + 字面量 ``"/info"`` ⇒ ``/api/v1/info``
+      （axios 等框架的真实行为）。**这是假设**，故只在字面量以 ``/`` 开头、
+      且尚未带基址时才补一条，调用方在 Signal.note 上标 ``+base`` 以示区别。
+    """
+    paths = [path_template]
+    # 只对**单段**字面量做基址拼接：``get("/info")`` 这类是接口调用，而
+    # ``/settings/providers/new``、``/assets/rest``、``/dev/null`` 基本都是页面
+    # 或资源路由——把它们拼成 ``/api/v1/...`` 只会造出 404 噪声（实测 20 条
+    # unauth 候选里大半是这类）。单段里的纯版本号（``/v4``）同样排除。
+    segments = [part for part in path_template.split("/") if part]
+    if len(segments) != 1 or _JS_VERSION_SEGMENT.fullmatch(segments[0]):
+        return paths
+    for base in bases:
+        if not path_template.startswith("/"):
+            continue
+        if path_template == base or path_template.startswith(base + "/"):
+            continue  # 已带基址，不再重复拼
+        candidate = base + path_template
+        if candidate not in paths:
+            paths.append(candidate)
+    return paths
+
+
+def _js_endpoint_signals(
+    endpoint: str,
+    body: str,
+    *,
+    evidence_path: str,
+    lineno: int,
+    skill: str,
+    source_tool: str,
+    seen: set[tuple[str, str]],
+    bases: list[str],
+) -> list[Signal]:
+    """M33：JS 正文里写死的接口路径 → ``api-endpoint``（+ 带 query 的 ``param-endpoint``）。
+
+    为什么在这里做：``katana -jc`` 的抽取是**部分的**（限制 53 实测：同一份 bundle
+    里 ``/api/profile`` 抽到、``/api/orders/1001`` 没抽到），而 ``jsimport`` 自己从
+    ``response.body`` 抽的那套（M24-a）一直只有手工 CLI 入口、不进生产候选池。
+    本函数把 M24-a 的抽取器接成**发现层生产者**，不新增第二套正则。
+
+    收敛口径（与 M24-a 同一把尺子，不另立标准）：
+
+    - 只认 :func:`~proofhound.jsimport.match.exclusion_reason` 判为「像数据接口」的
+      路径——状态变更词、公开端点（login/logout/config…）、没有数据线索的纯 SPA
+      路由一律不产。**SPA 页面路由不能进 unauth-exposure**：匿名与已认证都会拿到
+      同一个空壳，"等价"会被误判成未授权暴露。
+    - **路径模板**（``/users/{param}``）不产：没有观测实例就没法合成可信 URL。
+    - 带 query 键的模板另产一条 ``param-endpoint``：把 JS 里写死的查询参数接进既有
+      的 sqli/xss/idor 提示表（M24-a 抽到了却一直没人消费的那部分）。
+
+    抽取失败一律返回空（best-effort 增强，绝不弄坏解析主链路）。
+    """
+    parsed = urlparse(endpoint)
+    if not parsed.path.lower().endswith((".js", ".mjs")):
+        return []  # 只对 JS 正文做抽取（JSON/HTML 不是接口清单来源）
+    document = JsDocument(
+        sha256=hashlib.sha256(body.encode("utf-8", "replace")).hexdigest(),
+        body=body,
+        urls=(endpoint,),
+        order=lineno,
+        content_type="",
+    )
+    try:
+        templates, _stats = extract_endpoints(document)
+    except Exception:  # noqa: BLE001 - 抽取是增强，不是主链路
+        return []
+    out: list[Signal] = []
+    for template in templates:
+        if _JS_ENDPOINT_SKIP_TEMPLATE in template.path_template:
+            continue
+        for path_template in _candidate_paths(template.path_template, bases):
+            # 顺序重要：**先**拼基址，再按拼完的路径判"像不像接口"。否则
+            # ``get("/info")`` 会在拼成 ``/api/v1/info`` **之前**被判
+            # ``not_data_endpoint`` 丢掉（实测 0 候选的根因）。
+            if not _is_clean_api_path(path_template):
+                continue
+            if not _looks_like_api_path(path_template):
+                continue
+            if exclusion_reason(replace(template, path_template=path_template)) is not None:
+                continue
+            asset = f"{template.origin}{path_template}"
+            key = ("api-endpoint", asset)
+            if key not in seen:
+                seen.add(key)
+                note = f"js:{template.js_url}"
+                if path_template != template.path_template:
+                    note += "+base"
+                out.append(
+                    Signal(
+                        asset=asset,
+                        kind="api-endpoint",
+                        source_tool=source_tool,
+                        skill=skill,
+                        evidence_ref=f"{evidence_path}#L{lineno}",
+                        note=note,
+                    )
+                )
+            if template.query_keys:
+                query = "&".join(f"{quote(key, safe='')}=1" for key in template.query_keys)
+                url = f"{asset}?{query}"
+                param_key = ("param-endpoint", url)
+                if param_key not in seen:
+                    seen.add(param_key)
+                    out.append(
+                        Signal(
+                            asset=url,
+                            kind="param-endpoint",
+                            source_tool=source_tool,
+                            skill=skill,
+                            evidence_ref=f"{evidence_path}#L{lineno}",
+                            note="js-query-keys",
+                        )
+                    )
+    return out
+
+
+
+#: 跨文件 baseURL 收集上限（3 条足够；多基址只说明站点有多套客户端）
+_MAX_BASES = 3
+
+
+def _collect_explicit_bases(text: str) -> list[str]:
+    """预扫描：本批 JS 正文里出现过的 ``baseURL``/``API_BASE`` 常量（M33）。
+
+    为什么需要跨文件：这份目标里 ``baseURL: "/api/v1"`` 写在 api 客户端那个
+    bundle，而 ``get("/info")`` 的调用点在另一个 bundle——单文件抽取拿不到基址，
+    ``/info`` 只能按"JS 文件所在目录"归并成 ``/assets/info``（假端点）。
+    """
+    from proofhound.jsimport.extract import explicit_bases
+
+    bases: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        request = data.get("request")
+        response = data.get("response")
+        if not isinstance(request, dict) or not isinstance(response, dict):
+            continue
+        endpoint = request.get("endpoint")
+        body = response.get("body")
+        if not isinstance(endpoint, str) or not isinstance(body, str) or not body:
+            continue
+        if not urlparse(endpoint).path.lower().endswith((".js", ".mjs")):
+            continue
+        for base in explicit_bases(body.encode("utf-8", "replace")):
+            path = base.rstrip("/")
+            if path and path != "/" and path not in bases:
+                bases.append(path)
+                if len(bases) >= _MAX_BASES:
+                    return bases
+    return bases
+
+
 def parse_katana_jsonl(
     text: str,
     *,
@@ -190,6 +418,8 @@ def parse_katana_jsonl(
     signals: list[Signal] = []
     seen: set[tuple[str, str]] = set()  # (kind, asset) 跨行去重（首见锚点）
     skipped = 0
+    # M33：跨文件收集显式 baseURL（api 客户端的基址常写在另一个 bundle 里）
+    bases = _collect_explicit_bases(text)
     for lineno, raw in enumerate(text.splitlines(), start=1):
         line = raw.strip()
         if not line:
@@ -255,6 +485,20 @@ def parse_katana_jsonl(
                     skill=skill,
                     evidence_ref=f"{evidence_path}#L{lineno}",
                     form_fields=form_fields,
+                )
+            )
+        # M33：JS 正文里写死的接口路径（M24-a 的抽取器，接进生产候选）
+        if isinstance(body, str) and body:
+            signals.extend(
+                _js_endpoint_signals(
+                    endpoint,
+                    body,
+                    evidence_path=evidence_path,
+                    lineno=lineno,
+                    skill=skill,
+                    source_tool=source_tool,
+                    seen=seen,
+                    bases=bases,
                 )
             )
     return signals, skipped

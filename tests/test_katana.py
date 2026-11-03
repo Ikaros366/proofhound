@@ -18,10 +18,12 @@ MANIFESTS_DIR = (
 def test_katana_argv_golden():
     # M16-a 披露：恒在项新增 "-jc"（JS 文件内端点解析/爬行）。断言意图不变
     # ——逐字面量锁死默认 argv；-jsl 是**可选**项（缺省关），故不出现在这里。
+    # M33 披露：``-d`` 缺省 2 → 3（SPA 三层：页面 → JS → JS 里的接口；
+    # 实测 128 个唯一 URL 里 11 条业务路由被 ``max depth reached`` 整层丢掉）。
     argv = build_command("katana", {"target": "http://127.0.0.1:8080"})
     assert argv == [
         "katana", "-u", "http://127.0.0.1:8080",
-        "-d", "2", "-c", "5",
+        "-d", "3", "-c", "5",
         "-jc",
         "-jsonl", "-silent", "-nc", "-fs", "rdn",
         "-cos", "(?i)(logout|logoff|signout|signoff|phpids)",

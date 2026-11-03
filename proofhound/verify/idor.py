@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
@@ -77,13 +78,32 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def fetch(url: str, session, *, timeout: float = DEFAULT_TIMEOUT) -> IdorResponse:
+def _tls_context(verify: bool) -> "ssl.SSLContext":
+    """TLS 上下文：``verify=False`` 时不校验证书（只由 scope 显式声明触发）。
+
+    与 :func:`proofhound.verify.raw_http._tls_context` 同形（M28 先例）：口子不是
+    环境变量、不是全局开关，只能由操作员逐 scope 声明 ``tls_verify: insecure``。
+    """
+    context = ssl.create_default_context()
+    if not verify:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+    return context
+
+
+def fetch(
+    url: str, session, *, timeout: float = DEFAULT_TIMEOUT, verify_tls: bool = True
+) -> IdorResponse:
     """以给定会话请求 URL（GET，不跟随重定向），返回结构化响应。
 
     ``session`` 为 :class:`~proofhound.compliance.session.SessionConfig`
     （主会话或 reference 会话，调用方选择）；凭据由代码注入请求头，LLM
     零接触。网络/超时异常不抛出，置 ``IdorResponse.error``（编排层转
     blocked，覆盖不全不驳回）。
+
+    ``verify_tls=False`` 只用于**自签/内部 CA 靶**（scope 显式声明
+    ``tls_verify: insecure``）：否则 HTTPS 自签靶在这里恒 ``CERTIFICATE_VERIFY_FAILED``，
+    而沙箱里的 CLI 工具（httpx 等）却能正常打通——同一个靶"扫得到、验不了"。
     """
     headers = {}
     cookie = session.cookie_header()
@@ -92,7 +112,9 @@ def fetch(url: str, session, *, timeout: float = DEFAULT_TIMEOUT) -> IdorRespons
     for key, value in session.headers.items():
         headers[key] = value
     request = urllib.request.Request(url, headers=headers, method="GET")
-    opener = urllib.request.build_opener(_NoRedirect())
+    opener = urllib.request.build_opener(
+        _NoRedirect(), urllib.request.HTTPSHandler(context=_tls_context(verify_tls))
+    )
     try:
         with opener.open(request, timeout=timeout) as resp:
             return IdorResponse(

@@ -190,14 +190,19 @@ class KatanaParams(BaseModel):
     ``?id=EXPR``），两者都过不了下游键名启发式，故不构成理由。
     需要更激进的 JS 解析时显式开 ``jsluice=True``。
 
-    刻意**不暴露** ``-kf``/``-known-files``：官方要求 depth ≥ 3 才生效，
-    而本构造器 depth 缺省 2、硬上限 5——给一个"开了也可能静默不生效"的
-    参数容易误导；且它抓的是 robots.txt/sitemap.xml 这类已知文件，属
-    字典/已知路径面（M16-b），不属本轮 JS 发现面。
+    刻意**不暴露** ``-kf``/``-known-files``：它抓的是 robots.txt/sitemap.xml
+    这类已知文件，属字典/已知路径面（M16-b），不属 JS 发现面。
+
+    **M33：``depth`` 缺省 2 → 3。** SPA 的发现链路是「页面(1) → JS 资源(2) →
+    JS 里抽出的接口(3)」，``-d 2`` 把第三层整层丢掉。实测
+    ``eng-20261103T070135Z-6c0988e8``（128 个唯一 URL）：1115 行输出里 **1081 行**
+    ``max depth reached``，11 条真实业务路由（``/users/`` ``/settings/providers``
+    ``/swagger/index.html`` …）**一条都没被真正请求**。硬上限仍是 5。
     """
 
     target: str = Field(min_length=1)  # 单种子 URL
-    depth: int = Field(default=2, ge=1, le=5)
+    # M33：缺省 3（SPA 三层：页面 → JS → JS 里的接口），硬上限 5
+    depth: int = Field(default=3, ge=1, le=5)
     concurrency: int = Field(default=5, ge=1, le=10)
     rate_limit: int | None = Field(default=None, gt=0, le=150)  # -rl，缺省不限
     with_session: bool = False  # 注入预置会话（-H Cookie/自定义头）
@@ -497,6 +502,20 @@ _PARAMS_MODELS = {
 #: 的字面判断散在 ``build_command`` 里、而编排层完全没有对应判断（于是它从不传
 #: 预算 ⇒ 接通即报错）。收成一处登记后，加第二个"按字典发请求"的工具只需改这里。
 REQUEST_BUDGET_TOOLS: frozenset[str] = frozenset({"dirsearch"})
+
+#: **种子类工具**：``-u`` 是"从哪里开始扫"，不是"只打这一个地址"（M32）。
+#:
+#: - ``dirsearch``：``-u`` 被当**目录根**——带 ``/login`` 就在 ``/login/`` 下猜
+#:   路径（实测 43 条结果里 40 条是 ``/login/xxx/index.html`` 的 301，应用根
+#:   一个请求都没打）；
+#: - ``katana``：``-u`` 是**爬行起点**——从入口页起算深度，首页链接会被
+#:   ``max depth reached`` 吞掉（实测 1115 行里 1081 行）；M33 起缺省深度额外
+#:   提到 3（SPA 三层：页面 → JS → JS 里的接口）。
+#:
+#: 故这两个工具的 ``target`` 必须是**扫描根**（入口页见
+#: :func:`proofhound.compliance.scope.split_scan_seed` 的第二个返回值）。
+#: ``httpx`` **不在**此列：它是单点探活，探入口页正是它的用途。
+SEED_TOOLS: frozenset[str] = frozenset({"katana", "dirsearch"})
 
 
 def build_command(

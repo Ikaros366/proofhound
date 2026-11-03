@@ -40,7 +40,6 @@ from proofhound.jsimport.extract import (
     extract_endpoints,
 )
 from proofhound.jsimport.match import Candidate, ObservedIndex, classify, synthesize_url
-from proofhound.jsimport.probe import ImportConfig, ImportReport, run_jsimport
 
 __all__ = [
     "Candidate",
@@ -61,3 +60,21 @@ __all__ = [
     "run_jsimport",
     "synthesize_url",
 ]
+
+def __getattr__(name: str):
+    """PEP 562：重的 CLI 入口按需导入（M33）。
+
+    ``probe`` 会把 ``verify`` → ``core`` → ``skills`` 一整串拉起来，而
+    :mod:`proofhound.tools.parsers.katana_jsonl` 在编排器导入链的**早期**就要用
+    本包的 ``extract``（M33：把 JS 接口接成生产候选）。probe 随包导入会让这条轻
+    路径连带整棵应用树，导入顺序稍变即成环（实测
+    ``ModuleNotFoundError: proofhound.skills.registry``）。
+
+    故 ``ImportConfig`` / ``ImportReport`` / ``run_jsimport`` 三个名字改为惰性
+    ——``from proofhound.jsimport import run_jsimport`` 照旧可用，只是推迟到真用。
+    """
+    if name in ("ImportConfig", "ImportReport", "run_jsimport"):
+        from proofhound.jsimport import probe
+
+        return getattr(probe, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

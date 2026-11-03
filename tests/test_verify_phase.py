@@ -332,18 +332,39 @@ def test_baseline_failure_blocks_before_sqlmap(env):
     assert any(e["event"] == "verify_baseline_failed" for e in events)
 
 
-def test_missing_session_blocks(env):
-    """scope 未配置预置会话：fail-closed，Finding 停留原态。"""
+def test_anonymous_baseline_allows_blackbox_sqli(env):
+    """M34 黑盒降级：**没有会话也要测**——匿名可达就照常验。
+
+    旧行为是"无会话 ⇒ 直接 blocked"（等于把黑盒 engagement 的 sqli 全判死），
+    而 sqlmap 的注入判定与身份无关；会话只影响"能不能到达需要认证的端点"。
+    """
     _seed(env.store, env.audit)
     env.scope = Scope(networks=["127.0.0.0/8"], ports=[8080])  # 无 session
-    orch, runner, _ = _orch(env, {})
+    orch, runner, _ = _orch(
+        env,
+        {"httpx": [(_httpx_line(200), 0)], "sqlmap": [(_negative_stdout(), 0)]},
+    )
+    orch.run_verify_phase(skill_name="verify-sqli")
+
+    assert [tool for tool, _ in runner.calls] == ["httpx", "sqlmap"]
+    # 匿名 baseline 不得注入凭据
+    assert "-H" not in runner.calls[0][1]
+    events = env.audit.read_all()
+    assert any(e["event"] == "verify_baseline_anonymous" for e in events)
+
+
+def test_needs_credentials_when_target_requires_auth(env):
+    """黑盒下匿名被 401 挡回：记 ``verify_needs_credentials``，不当成"测过了"。"""
+    _seed(env.store, env.audit)
+    env.scope = Scope(networks=["127.0.0.0/8"], ports=[8080])  # 无 session
+    orch, runner, _ = _orch(env, {"httpx": [(_httpx_line(401), 0)]})
     processed = orch.run_verify_phase(skill_name="verify-sqli")
 
+    assert [tool for tool, _ in runner.calls] == ["httpx"]  # sqlmap 不该跑
     assert processed[0].state is FindingState.HYPOTHESIS
-    assert runner.calls == []
     events = env.audit.read_all()
-    blocked = [e for e in events if e["event"] == "verify_blocked"]
-    assert any("预置会话" in e["reason"] for e in blocked)
+    assert any(e["event"] == "verify_needs_credentials" for e in events)
+    assert not any(e["event"] == "verify_baseline_anonymous" for e in events)
 
 
 def test_sqlmap_tool_failure_keeps_hypothesis(env):

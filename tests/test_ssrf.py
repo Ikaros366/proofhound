@@ -482,15 +482,21 @@ def _orch(env, listener, *, follows_parameter=True, probe_error=False, router_re
 # ---------------------------------------------------------- blocked 前置
 
 
-def test_blocked_without_session(env, listener):
+def test_blackbox_confirms_without_session(env, listener):
+    """M34：黑盒（无预置会话）也能确认 SSRF——判据是"listener 收到回调"。
+
+    旧行为是"无会话 ⇒ 直接 blocked"，等于把黑盒 engagement 的 SSRF 全判死；
+    而回调确认与"你是哪个身份"毫无关系。现在 baseline 走匿名，探针照常发。
+    """
     env.scope = Scope(networks=["127.0.0.0/8"], ports=[8080])  # 无 session
     finding = _seed_ssrf(env.store, env.audit)
-    orch, _runner, router, _victim = _orch(env, listener)
+    orch, _runner, _router, _victim = _orch(env, listener)
     outcome = orch._verify_ssrf(finding, orch.registry.get("verify-ssrf"), env.store)
-    assert outcome == "blocked"
-    assert finding.state is FindingState.HYPOTHESIS  # 停留原态，不驳回
-    assert router.calls == []
-    assert any("预置会话" in (e.get("reason") or "") for e in env.audit.read_all())
+
+    assert outcome == "confirmed"
+    events = env.audit.read_all()
+    assert any(e["event"] == "verify_baseline_anonymous" for e in events)
+    assert not any("预置会话" in (e.get("reason") or "") for e in events)
 
 
 def test_blocked_without_param(env, listener):

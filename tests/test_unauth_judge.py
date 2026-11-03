@@ -311,8 +311,12 @@ def test_anonymous_network_error_is_blocked(env):
     assert env.store.load_all()[0].state is FindingState.HYPOTHESIS
 
 
-def test_missing_session_is_blocked_fail_closed(env):
-    """scope 无预置会话 ⇒ 无法构造已认证视图 ⇒ blocked。"""
+def test_missing_session_falls_back_to_blackbox(env):
+    """M35：无预置会话**不再**整类判死，改走黑盒断言（匿名 + 无效凭据对照）。
+
+    旧断言是"无会话 ⇒ blocked（reason 含『预置会话』）"，那等于把黑盒 engagement
+    的 unauth-exposure 全判死；现在该类型有第二条确认通道。
+    """
     _seed(env.store, env.audit)
     env.scope.session = None
     runner = SimpleNamespace(scope=env.scope)
@@ -323,9 +327,11 @@ def test_missing_session_is_blocked_fail_closed(env):
 
     orch.run_verify_phase(skill_name="verify-unauth")
 
-    assert env.store.load_all()[0].state is FindingState.HYPOTHESIS
+    attempts = [e for e in _events(env.audit, "unauth_probe_attempt")]
+    assert {e["role"] for e in attempts} == {"anonymous", "invalid-credential"}
+    assert _events(env.audit, "unauth_anon_judged"), "黑盒判定必须留下判定事件"
     blocked = _events(env.audit, "verify_blocked")
-    assert blocked and "预置会话" in blocked[-1]["reason"]
+    assert not any("预置会话" in (e.get("reason") or "") for e in blocked)
 
 
 def test_out_of_scope_asset_is_blocked(env):
@@ -356,9 +362,12 @@ def test_gate_has_unauth_entry_and_method_is_exclusive():
     """证据门注册了 unauth-exposure，且 method 与既有四类**互不染指**。"""
     from proofhound.verify.gate import GATE_MATRIX
 
+    from proofhound.verify.unauth_anon import UNAUTH_ANON_METHOD
+
     assert "unauth-exposure" in GATE_MATRIX
     req = GATE_MATRIX["unauth-exposure"]
-    assert req.methods == frozenset({UNAUTH_CONFIRMED_METHOD})
+    # M35：两条互不替代的确认手段（等价性 / 黑盒断言），仍与其余类型互不染指
+    assert req.methods == frozenset({UNAUTH_CONFIRMED_METHOD, UNAUTH_ANON_METHOD})
     assert req.behavioral_kinds == frozenset({UNAUTH_EQUIVALENCE_EVIDENCE_KIND})
     seen: dict[str, str] = {}
     for vuln_type, requirement in GATE_MATRIX.items():

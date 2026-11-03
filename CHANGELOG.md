@@ -6,6 +6,142 @@
 
 ## [未发布]
 
+### 新增（M35：`unauth-exposure` 的黑盒确认通道——没有凭据也能确认）
+
+M16-c 的判据是「匿名视图 ≡ 已认证视图」，黑盒 engagement（真实渗透的常态起点）里
+永远没有第二个视图 ⇒ 该类型恒不可达。实测那个 SPA + JSON API 目标：13 条候选在
+M34 之后仍是 `verify_type_unavailable`。
+
+新增**第二条确认手段**（与等价性并列，互不替代）：
+
+- **`proofhound/verify/unauth_anon.py`**（新模块，纯确定性零 LLM）：匿名 2xx ∧
+  响应是结构化 JSON ∧ **无效凭据对照逐字节相同**（同请求只多带一个
+  `Cookie: ph_invalid=<随机>`，证明端点忽略凭据，而不是把我们当已登录）∧
+  **≥2 个敏感字段取值**（硬编码词表 email/phone/token/password/id_card/…，
+  取值非空）⇒ 确认；零命中或被拒 ⇒ 驳回；其余 ⇒ blocked。
+- **`VULN_REGISTRY["unauth-exposure"]`**：`methods` 加入
+  `unauth-anon-data-confirmed`，`requires_session` → `False`（黑盒通道不需要会话）。
+- **`_verify_unauth`**：无会话时改走 `_verify_unauth_anon`（有会话仍走更强的等价性判据）。
+- **`verify/idor.py::fetch`** 增 `verify_tls`（M35b）：进程内取数此前不认
+  `scope.tls_verify=insecure`，HTTPS 自签靶上恒 `CERTIFICATE_VERIFY_FAILED`——
+  同一个靶"沙箱工具扫得到、进程内探针验不了"（M28 同类缺陷的第二个实例）。
+
+**实测（`eng-20261103T082629Z-0578ffba`，同一目标，仍无 Cookie）**：
+
+| 指标 | M34 后 | M35 后 |
+|---|---|---|
+| `verify-unauth` | processed=0 blocked=13 | **processed=13 rejected=13 blocked=0** |
+| 候选终态 | 13 条全部 Hypothesis | 13 条全部 Rejected（带判定 JSON） |
+
+逐条判定都留下了真实状态码：`/api/v1/info` → 200 且无效凭据对照**逐字节相同**，
+但敏感值为 0（guest 信息里 mail/name 全空）⇒ 驳回；其余 12 条 → 301/403
+（其中 301 的正是"M33 基址拼接"产生的 SPA 路由噪声，被这条判据自动收敛成驳回）。
+
+- **测试**：新增 `tests/test_unauth_anon.py` 10 个（纯函数 8 + 编排 2）；
+  `test_missing_session_is_blocked_fail_closed` 改为断言黑盒通道（披露式）；
+  `test_gate_has_unauth_entry_and_method_is_exclusive` 的 methods 集合随之更新。
+
+### 修复（M34：黑盒下"没有凭据"不再等于"不测"）
+
+起因是一个更根本的设计问题：`_run_baseline(self, finding, session: SessionConfig)`
+的**形参类型就要求必须有会话**，于是 `_verify_sqli` / `_verify_xss` / `_verify_ssrf`
+开头都是同一句 `if session is None: blocked`。**这等于把"有没有凭据"当成了"能不能测"**：
+真实渗透大量是黑盒起步，结果是 sqli/xss/ssrf 在黑盒 engagement 里一条都验不了
+（最刺眼的是 XSS——canary 探针与身份毫无关系，却被这道门挡死）。
+
+改动：
+
+- **`_run_baseline(finding, session: SessionConfig | None)`**：有会话带会话，**没有就
+  匿名**。匿名拿到 2xx 记 `verify_baseline_anonymous` 并照常验证；匿名被 401/403/3xx
+  挡回才记 **`verify_needs_credentials`**（"该点要求认证，本次黑盒未覆盖"）——
+  既不驳回，也不静默跳过。
+- **`_verify_sqli` / `_verify_xss` / `_verify_ssrf`**：去掉"无会话直接 blocked"；
+  探针照常发，sqlmap 只在有会话时注入 `--cookie`（黑盒不伪造凭据）。
+- **`VULN_REGISTRY["ssrf"].requires_session` → `False`**：判据是回调，不是身份。
+- **证据措辞随会话状态变化**：黑盒下复现步骤写"匿名（无凭据）GET …"、
+  baseline 写"匿名 baseline（端点无需认证即可达）"，不再谎称"以预置会话 GET"。
+
+**仍要求会话的只剩 `unauth-exposure`**（判据是"匿名视图 ≡ 已认证视图"，没有第二个
+视图就没有可比对象）——这一类的黑盒替代断言属另一件事（需裁决）。
+
+- **测试**：`test_missing_session_blocks`（断言旧行为）拆成两条新断言
+  （匿名可达→照常验 / 401→记 `verify_needs_credentials`）；`test_blocked_without_session`
+  改为 `test_blackbox_confirms_without_session`（无会话也能确认 SSRF）。
+- **实测**：无会话的 DVWA 目标上，sqli 现在会真的发匿名 baseline 并记
+  `verify_needs_credentials`（"打了，发现要登录"），而非整类判死。
+
+### 新增（M33：JS 接口接进发现层 + katana 深度 3）
+
+起因是一个真实任务（`eng-20261103T070135Z-6c0988e8`）**128 个唯一 URL、0 条漏洞
+候选**：目标是一个 SPA + `/api/v1/*` JSON API，而候选只认「URL 带 query 参数」与
+「HTML 表单」两种形态——真实面两种都不是。
+
+改动：
+
+- **`proofhound/tools/parsers/katana_jsonl.py`**：从 katana 抓回来的 **JS 正文**里
+  抽接口路径，产 `kind="api-endpoint"` 信号（复用 M24-a 的 `jsimport.extract`，不新增
+  第二套正则）。收敛口径：只认带数据前缀（`/api` `/rest` `/graphql`）的**具体路径**；
+  跳过路径模板、公开端点（login/logout/config…）、静态资源；带 query 键的另产一条
+  `param-endpoint`（接既有的 sqli/xss/idor 提示表）。跨文件收集 `baseURL` 常量后再拼
+  （SPA 把基址写在 api bundle、调用点写在另一个 bundle）——只对**单段**字面量拼，
+  多段基本是页面路由。
+- **`proofhound/core/orchestrator.py`**：`api-endpoint` → `unauth-exposure` 候选
+  （缺会话时仍派生，让 `verify_type_unavailable` 把"给个 Cookie"写进审计）。
+- **`proofhound/tools/build.py`**：katana `-d` 缺省 **2 → 3**（SPA 三层：页面 → JS →
+  JS 里的接口；实测 1115 行输出里 1081 行 `max depth reached`，11 条业务路由一条没抓）。
+- **`proofhound/jsimport/`**：① `extract_endpoints` 对畸形字面量容错（`http://[${host}]`
+  会让 `urlparse` 抛 `ValueError`，旧实现**整份 bundle 作废**——这是 0 候选的根因之一）；
+  ② `__init__` 的 `probe` 改成 PEP 562 惰性导入（否则 `tools/parsers` 与 `jsimport` 成环）。
+
+实测（`eng-20261103T072342Z-04e6e4a8`，同一目标，无会话）：
+
+| 指标 | M33 前 | M33 后 |
+|---|---|---|
+| katana 信号 | 1 | 42 |
+| triage 候选 | 2（全是状态码派生） | **16** |
+| 候选类型 | web-exposure / error-disclosure | + **unauth-exposure ×13**（含真实的 `/api/v1/info`） |
+| 跑完判定的类型 | 1（error-disclosure → rejected） | 1（同） |
+
+**没解决的**：13 条 `unauth-exposure` 全部停在 `verify_type_unavailable`
+（"scope 未配置预置会话"）——`verify-unauth` 要拿「已认证视图」当基准，没有 Cookie
+就无从比较。**下一步是给一个会话 Cookie，不是继续改发现层。**
+
+- **测试**：`tests/test_api_endpoint.py` 9 个 + `test_katana.py` 黄金断言披露式更新，
+  全量 1935 → **1944** 绿。
+
+### 修复（M32：target 的路径被当成扫描根，应用根一次都没扫到）
+
+真实任务 `eng-20261103T032027Z-87899ebd`（target `https://100.80.4.50:8443/login`）
+暴露：三个工具都把 `-u` 的路径当"起点即根"。
+
+- `dirsearch -u .../login` → 字典在 `/login/` 下展开：43 条结果里 **40 条**是
+  `/login/xxx/index.html` 的 301（SPA catch-all），**应用根一个请求都没打**；
+- `katana -u .../login -d 2` → 深度从入口页起算：1115 行输出里 **1081 行**
+  `max depth reached`；
+- `httpx` 不受影响（单点探活）。
+
+改动：
+
+- **`proofhound/compliance/scope.py`**：新增 `split_scan_seed(target)` —— 最后一层
+  路径段视为**入口页**、其父目录视为**扫描根**（`/login` → `/`、`/app/login` →
+  `/app/`、`/app/` 不动）；非 http(s)/无 netloc 原样透传；幂等。
+- **`proofhound/core/orchestrator.py`**：`run_scan_phase` 归一后建子任务
+  （`meta.target` = 扫描根、`meta.entry_path` = 入口页）并记 `seed_normalized`；
+  多个入口归一到同一根时合并子任务记 `seed_duplicate_merged`；入口页随规划状态下发
+  （**无归一时不加该键**，既有 prompt 载荷逐字节不变）。
+- **`proofhound/tools/build.py`**：新增 `SEED_TOOLS = {"katana", "dirsearch"}`
+  ——`-u` 语义是"从哪里开始扫"的工具；`httpx` 刻意不在列（探入口页正是它的用途）。
+- **执行边界兜底**：`_apply_seed_policy` 对种子类工具的 `params.target` 再跑一次同一个
+  纯函数（幂等），防规划器把入口页写回 `-u`，记 `seed_normalized_at_exec`。
+
+不改：scope 授权（路径本就不参与 scope 判定）、证据门、状态机铁律、各 verify 链路。
+
+**未做（明确记录）**：`katana -d 2` 的深度没动。SPA 的链路是「页面(1) → JS(2) →
+JS 里的端点(3)」，`-d 2` 仍会丢掉第三层——本次只修"起点"，深度是另一个带成本的开关，
+需单独测量后再改。
+
+- **测试**：`tests/test_scan_seed.py` 19 个（纯函数 13 + 编排 6），全量 1916 → **1935** 绿。
+
 ### 修复（控制台审计流：看起来只能看最近 150 条）
 
 控制台的审计流只请求 `/api/engagements/{id}/audit?tail=150`，标题也如实写着

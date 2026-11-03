@@ -48,7 +48,7 @@ from urllib.parse import parse_qsl, urlparse
 from pydantic import ValidationError
 
 from proofhound.compliance.audit import AuditLog
-from proofhound.compliance.scope import check_scope
+from proofhound.compliance.scope import check_scope, split_scan_seed
 from proofhound.compliance.session import SessionConfig, redact_bytes, secret_marker
 from proofhound.findings.dedup import compute_dedup_key
 from proofhound.findings.evidence import assemble_evidence_pack
@@ -90,6 +90,7 @@ from proofhound.llm.usage import BudgetExceededError
 from proofhound.skills.registry import SkillRegistry
 from proofhound.tools.build import (
     REQUEST_BUDGET_TOOLS,
+    SEED_TOOLS,
     UnknownToolError,
     build_command,
     known_tools,
@@ -236,6 +237,13 @@ from proofhound.verify.unauth_control import (
     judge_unauth,
     summary_to_json as unauth_summary_to_json,
 )
+from proofhound.verify.unauth_anon import (
+    ANON_BLOCKED,
+    ANON_CONFIRMED,
+    ANON_REJECTED,
+    UNAUTH_ANON_METHOD,
+    judge_anon_data,
+)
 from proofhound.verify.unauth_judge import (
     UnauthJudge,
     UnauthJudgeError,
@@ -377,9 +385,11 @@ _TRIAGE_SSRF_CAP = 10
 
 #: 需要「scope 配了可用预置会话」才能验证的 vuln_type —— **由
 #: `verify/gate.py::VULN_REGISTRY` 的 `requires_session` 派生**（M17-c）。
-#: 两类都是**等价性/基线比对**型判定，没有已认证视图就没有可比对象：
-#: - ``unauth-exposure``：匿名视图 vs 已认证视图（缺后者 ⇒ 无从比）；
-#: - ``ssrf``：带会话 baseline（缺会话 ⇒ `_verify_ssrf` 直接 blocked）。
+#: 判据本身**要拿第二个视图作比较**，没有已认证视图就没有可比对象：
+#: - ``unauth-exposure``：匿名视图 vs 已认证视图（缺后者 ⇒ 无从比）。
+#:
+#: M34：``ssrf`` 已从此表移出——它的判据是"listener 收到回调"，与身份无关，
+#: 缺会话时 baseline 走匿名（见 `_run_baseline`）。
 #: 在登记表里声明 `requires_session=True` ⇒ 该类型的候选在缺会话时**一次也不进
 #: 贵验证档**（配额仍留给真验证）。
 _VERIFY_PRECONDITIONS: frozenset[str] = frozenset(
@@ -687,6 +697,22 @@ def _triage_candidates(
                 )
             ]
         return []
+    if signal.kind == "api-endpoint":
+        # M33：JS 里抽出的接口路径 → `unauth-exposure` 候选（匿名视图 vs 已认证视图）。
+        # 与 web-probe 分支的差别：那里要 `session_available` 才派生（web-probe 已有
+        # `web-exposure` 兜底，无会话派生只是噪声）；这里**恒派生**——`api-endpoint`
+        # 只有这一条映射，缺会话时让既有前置门记 `verify_type_unavailable`，把
+        # "给我一个 Cookie"变成审计里可见的事实，而不是静默不产候选。
+        return [
+            _TriageCandidate(
+                vuln_type="unauth-exposure",
+                param=None,
+                severity="medium",
+                evidence_kind=STATUS_CODE_EVIDENCE_KIND,
+                source="api_endpoint",
+                asset=signal.asset,
+            )
+        ]
     return []
 
 
@@ -786,7 +812,12 @@ class Orchestrator:
         self._coverage_total = 0
         # M8c：verify-idor 的取数注入口子（测试给罐头 fetch；None 时用
         # verify/idor.py 的真实 stdlib fetch）
-        self._idor_fetch = idor_fetch if idor_fetch is not None else idor_fetch_default
+        # M35b：缺省取数按 scale 的 ``tls_verify`` 决定是否校验证书——自签靶上
+        # `idor.fetch` 会恒 `CERTIFICATE_VERIFY_FAILED`，而沙箱 CLI 工具能打通。
+        # 注入的替身（测试）仍保持 ``(url, session)`` 两参契约。
+        self._idor_fetch = (
+            idor_fetch if idor_fetch is not None else self._default_idor_fetch
+        )
         # M16：verify-ssrf 的两个注入口子——回调 listener（测试给假 listener）与
         # 宿主侧探测取数（测试给罐头 fetch）；None 时用 verify/ssrf.py 的真实实现。
         self._ssrf_listener_factory = ssrf_listener_factory
@@ -844,16 +875,45 @@ class Orchestrator:
             raise PermissionError(f"skill 未启用: {skill_name}")
 
         phase = TaskNode(name=f"phase:scan", kind="phase", audit=self.audit)
-        phase.transition(TaskStatus.RUNNING, reason=f"scan 阶段启动，{len(targets)} 个目标")
-        phase.children = [
-            TaskNode(
-                name=f"scan:{target}",
-                kind="subtask",
-                audit=self.audit,
-                meta={"target": target},
+        # M32：种子归一——target 常是一个**入口页**（``.../login``），而三个工具
+        # 都把 ``-u`` 当"起点即根"：dirsearch 在 ``/login/`` 下展开字典（实测 43 条
+        # 结果里 40 条是 ``/login/xxx/index.html`` 的 301，应用根一个请求没打），
+        # katana 从 ``/login`` 起算深度会把首页链接吞成 ``max depth reached``
+        # （1115 行输出里 1081 行）。故工具一律从**扫描根**起跑，入口页另存进
+        # 审计与规划状态——"站点有哪些页面/入口"由爬行从根自己发现。
+        children: list[TaskNode] = []
+        seen_roots: dict[str, str] = {}
+        for raw_target in targets:
+            scan_root, entry_path = split_scan_seed(raw_target)
+            if scan_root in seen_roots:
+                self.audit.record(
+                    "seed_duplicate_merged",
+                    target=raw_target,
+                    scan_root=scan_root,
+                    first_target=seen_roots[scan_root],
+                )
+                continue
+            seen_roots[scan_root] = raw_target
+            if entry_path is not None:
+                self.audit.record(
+                    "seed_normalized",
+                    target=raw_target,
+                    scan_root=scan_root,
+                    entry_path=entry_path,
+                    note="入口页保留在规划状态与审计里；工具从扫描根起跑",
+                )
+            children.append(
+                TaskNode(
+                    name=f"scan:{scan_root}",
+                    kind="subtask",
+                    audit=self.audit,
+                    meta={"target": scan_root, "entry_path": entry_path},
+                )
             )
-            for target in targets
-        ]
+        phase.children = children
+        phase.transition(
+            TaskStatus.RUNNING, reason=f"scan 阶段启动，{len(children)} 个目标"
+        )
         run_dag(
             phase.children,
             lambda node: self._run_subtask(node, skill),
@@ -1439,15 +1499,12 @@ class Orchestrator:
         未完成形态（Finding 停留原态，fail-closed）。
         """
         session = self._session()
-        if session is None:
-            self.audit.record(
-                "verify_blocked",
-                finding_id=finding.id,
-                reason="scope 未配置预置会话（session），无法进行带认证验证",
-            )
-            return "blocked"
+        # M34（黑盒降级）：无会话**不再直接 blocked**——匿名可达就照常验
+        # （sqlmap 的注入判定与身份无关）；匿名被 401/403/3xx 挡回时，
+        # `_run_baseline` 记 `verify_needs_credentials` 后停。
+        with_session = session is not None and bool(session.cookie_header())
 
-        # 1. 带会话 baseline（不跟随跳转：未认证会被 302 到登录页，2xx 才算数）
+        # 1. baseline（不跟随跳转：未认证会被 302 到登录页，2xx 才算数）
         baseline = self._run_baseline(finding, session)
         if baseline is None:
             return "blocked"  # 审计已在 _run_baseline 内记录
@@ -1459,7 +1516,7 @@ class Orchestrator:
         forms_mode = CRAWL_FORM_EVIDENCE_KIND in finding.evidence_kinds
         sqlmap_params: dict = {
             "url": finding.asset,
-            "with_session": True,
+            "with_session": with_session,  # M34：黑盒时不注入凭据
             "level": 1,
             "risk": 1,
         }
@@ -1520,15 +1577,19 @@ class Orchestrator:
         techniques = "；".join(
             f"{t.type}（{t.title}）" if t.title else t.type for t in report.techniques
         )
-        cookie_mark = secret_marker(session.cookie_header())
+        cookie_mark = self._session_marker(session)
+        session_label = (
+            f"以预置会话（Cookie {cookie_mark}）"
+            if session is not None
+            else "匿名（无凭据）"
+        )
+        cookie_flag = f" --cookie '{cookie_mark}'" if session is not None else ""
         sqlmap_step = (
-            (
-                f"沙箱内执行 sqlmap -u '{finding.asset}' --cookie '{cookie_mark}' "
-                f"--forms --level 1 --risk 1 --batch"
-            )
+            f"沙箱内执行 sqlmap -u '{finding.asset}'{cookie_flag} "
+            f"--forms --level 1 --risk 1 --batch"
             if forms_mode
             else (
-                f"沙箱内执行 sqlmap -u '{finding.asset}' --cookie '{cookie_mark}' "
+                f"沙箱内执行 sqlmap -u '{finding.asset}'{cookie_flag} "
                 f"-p {report.parameter} --level 1 --risk 1 --batch"
             )
         )
@@ -1536,7 +1597,7 @@ class Orchestrator:
             method="sqlmap-confirmed",
             evidence_refs=[baseline_ref, sqlmap_ref],
             baseline_diff=(
-                f"带会话 baseline {baseline_status}（认证有效，非登录跳转）；"
+                f"{self._baseline_label(session)} {baseline_status}；"
                 f"sqlmap 确认参数 {report.parameter}（{report.param_kind}）注入："
                 f"{techniques}；共 {report.requests_total or '未知'} 次 HTTP 请求"
             ),
@@ -1548,7 +1609,7 @@ class Orchestrator:
                 f"判定原文见 {result.stdout_path.name}"
             ),
             reproduction_steps=[
-                f"以预置会话（Cookie {cookie_mark}）GET {finding.asset} "
+                f"{session_label} GET {finding.asset} "
                 f"→ baseline {baseline_status}（认证有效）",
                 sqlmap_step,
                 f"sqlmap 判定注入点：Parameter {report.parameter} "
@@ -1908,13 +1969,9 @@ class Orchestrator:
         Finding 数据（红线 1），唯一 LLM 调用是收尾的 Verifier 终审。
         """
         session = self._session()
-        if session is None:
-            self.audit.record(
-                "verify_blocked",
-                finding_id=finding.id,
-                reason="scope 未配置预置会话（session），无法进行带认证验证",
-            )
-            return "blocked"
+        # M34（黑盒降级）：无会话**不再直接 blocked**——canary 探针与身份无关，
+        # 匿名加载页面照常验证；页面若要认证，匿名 baseline 会 401/403/3xx，
+        # 由 `_run_baseline` 记 `verify_needs_credentials` 后停。
         scope = getattr(self.runner, "scope", None)
         if scope is None:
             self.audit.record(
@@ -2013,7 +2070,12 @@ class Orchestrator:
             return "rejected"
 
         # 5. canary 命中：证据入包（behavioral + browser-confirmed + 四段式）
-        cookie_mark = secret_marker(session.cookie_header())
+        cookie_mark = self._session_marker(session)
+        session_label = (
+            f"以预置会话（Cookie {cookie_mark}）"
+            if session is not None
+            else "匿名（无凭据）"
+        )
         event_types = "、".join(event["type"] for event in hit.events)
         finding.verification = Verification(
             method="browser-confirmed",
@@ -2025,7 +2087,7 @@ class Orchestrator:
                 str(hit.requests_path),
             ],
             baseline_diff=(
-                f"带会话 baseline {baseline_status}（认证有效，非登录跳转）；"
+                f"{self._baseline_label(session)} {baseline_status}；"
                 "payload 经无头 Chromium（playwright，canary 探针）加载，"
                 f"捕获 {len(hit.events)} 个执行事件（{event_types}，token 匹配）"
             ),
@@ -2036,7 +2098,7 @@ class Orchestrator:
                 f"token {hit.token}）；事件原文见 {hit.canary_path.name}"
             ),
             reproduction_steps=[
-                f"以预置会话（Cookie {cookie_mark}）GET {finding.asset} "
+                f"{session_label} GET {finding.asset} "
                 f"→ baseline {baseline_status}（认证有效）",
                 "无头 Chromium（playwright chromium，canary 探针 "
                 f"add_init_script）加载 {hit.url}",
@@ -2130,13 +2192,8 @@ class Orchestrator:
         的 Verifier 终审。
         """
         session = self._session()
-        if session is None:
-            self.audit.record(
-                "verify_blocked",
-                finding_id=finding.id,
-                reason="scope 未配置预置会话（session），无法做带会话 baseline",
-            )
-            return "blocked"
+        # M34（黑盒降级）：**不再因缺会话直接 blocked**。判据是"listener 收到
+        # 回调"，与身份无关；`ssrf.fetch` 本就支持 ``session=None``（匿名）。
         scope = getattr(self.runner, "scope", None)
         if scope is None:
             self.audit.record(
@@ -2383,7 +2440,8 @@ class Orchestrator:
                     )
                     + "\n"
                 ).encode("utf-8"),
-                session.secret_values(),
+                # M34：黑盒（无会话）时没有可脱敏的凭据值
+                session.secret_values() if session is not None else [],
             )
         )
         self.audit.record(
@@ -2419,7 +2477,12 @@ class Orchestrator:
             return "rejected"
 
         # 8. confirmed：回调命中 → 证据入包（behavioral + 四段式）
-        cookie_mark = secret_marker(session.cookie_header())
+        cookie_mark = self._session_marker(session)
+        session_label = (
+            f"以预置会话（Cookie {cookie_mark}）"
+            if session is not None
+            else "匿名（无凭据）"
+        )
         sources = sorted(
             {r.get("source_ip", "") for r in judgment.hit_requests if r.get("source_ip")}
         )
@@ -2434,7 +2497,7 @@ class Orchestrator:
                 str(j_path),
             ],
             baseline_diff=(
-                f"带会话 baseline {baseline_status}（认证有效，非登录跳转）；"
+                f"{self._baseline_label(session)} {baseline_status}；"
                 f"回调 listener 绑定 {bound_host}:{bound_port}，收到 "
                 f"{len(judgment.hit_requests)} 次含本次探针 token 的请求"
             ),
@@ -2446,7 +2509,7 @@ class Orchestrator:
                 f"UA {agents or '未提供'}）；请求原文见 {callbacks_path.name}"
             ),
             reproduction_steps=[
-                f"以预置会话（Cookie {cookie_mark}）GET {finding.asset} "
+                f"{session_label} GET {finding.asset} "
                 f"→ baseline {baseline_status}（认证有效）",
                 f"在该 URL 的 {finding.param} 参数注入回调地址（变体 {judgment.hit_variant}）",
                 f"回调 listener（{bound_host}:{bound_port}）收到请求："
@@ -2793,12 +2856,9 @@ class Orchestrator:
         """
         session = self._session()
         if session is None or not session.cookie_header():
-            self.audit.record(
-                "verify_blocked",
-                finding_id=finding.id,
-                reason="scope 未配置预置会话，无法构造已认证视图（fail-closed）",
-            )
-            return "blocked"
+            # M35（黑盒）：没有"已认证视图"不再整类判死——改走黑盒断言
+            # （匿名拿到敏感数据 + 无效凭据对照逐字节相同），见 _verify_unauth_anon。
+            return self._verify_unauth_anon(finding, skill, store)
         scope = getattr(self.runner, "scope", None)
         if scope is None:
             self.audit.record(
@@ -3862,6 +3922,149 @@ class Orchestrator:
         evidence_paths.append(path)
         return outcome
 
+    def _verify_unauth_anon(
+        self, finding: Finding, skill, store: FindingStore
+    ) -> str:
+        """黑盒未授权判定的编排（M35）：**无凭据**时的 `unauth-exposure` 确认通道。
+
+        判据全在 :mod:`proofhound.verify.unauth_anon`（确定性、零 LLM）：
+        匿名 2xx ∧ 结构化数据 ∧ **无效凭据对照逐字节相同** ∧ ≥2 个敏感字段取值。
+
+        为什么要"无效凭据对照"：它排除两种更平凡的解释——"端点把我们的无效 Cookie
+        当成了某个已登录用户"、以及"每次响应都不同（随机内容）"。只有对照与匿名
+        响应**逐字节相同**，才能说"这个端点根本忽略凭据"。
+        """
+        scope = getattr(self.runner, "scope", None)
+        if scope is None:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="runner 未挂 scope，verify-unauth 缺 scope 防线（fail-closed）",
+            )
+            return "blocked"
+        url = finding.asset
+        decision = check_scope(scope, [url])  # 红线 5：请求任何 URL 前过 scope
+        if not decision.allowed:
+            self.audit.record(
+                "verify_scope_rejected",
+                finding_id=finding.id,
+                violations=decision.violations,
+            )
+            return "blocked"
+
+        # 1. 匿名请求（完全不发凭据）
+        resp_anon = self._idor_fetch(url, SessionConfig())
+        self.audit.record(
+            "unauth_probe_attempt",
+            finding_id=finding.id,
+            role="anonymous",
+            status=resp_anon.status,
+            error=resp_anon.error is not None,
+        )
+        anon_path = self._idor_write_response(finding.id, "anon-bb", resp_anon, [])
+
+        # 2. 无效凭据对照（只多一个随机 Cookie）
+        invalid = SessionConfig(cookies={"ph_invalid": ssrf_new_token()})
+        resp_control = self._idor_fetch(url, invalid)
+        self.audit.record(
+            "unauth_probe_attempt",
+            finding_id=finding.id,
+            role="invalid-credential",
+            status=resp_control.status,
+            error=resp_control.error is not None,
+        )
+        control_path = self._idor_write_response(
+            finding.id, "anon-ctl", resp_control, []
+        )
+
+        # 3. 确定性判定（唯一产证据的地方）
+        judgment = judge_anon_data(resp_anon, resp_control)
+        j_path = self.evidence_dir / f"unauth_{finding.id}_anon_judgment.json"
+        j_path.write_bytes(
+            redact_bytes(
+                (
+                    json.dumps(judgment.as_summary(), ensure_ascii=False, indent=2)
+                    + "\n"
+                ).encode("utf-8"),
+                [],
+            )
+        )
+        self.audit.record(
+            "unauth_anon_judged",
+            finding_id=finding.id,
+            verdict=judgment.verdict,
+            anon_status=judgment.anon_status,
+            control_status=judgment.control_status,
+            byte_identical=judgment.byte_identical,
+            sensitive_values=len(judgment.sensitive_hits),
+        )
+
+        # 3a. 测过且干净（或匿名被拒）→ 确定性驳回
+        if judgment.verdict == ANON_REJECTED:
+            finding.transition(
+                FindingState.REJECTED,
+                actor=skill.name,
+                reason=(
+                    "黑盒判定不成立："
+                    + "；".join(judgment.reasons)
+                    + f"（判定依据见 {j_path.name}）"
+                ),
+            )
+            store.append(finding)
+            assemble_evidence_pack(finding, evidence_base=self.evidence_dir)
+            return "rejected"
+
+        # 3b. 判不了 → 停 Hypothesis（既不驳回也不确认）
+        if judgment.verdict != ANON_CONFIRMED:
+            self.audit.record(
+                "verify_blocked",
+                finding_id=finding.id,
+                reason="；".join(judgment.reasons) + f"（判定依据见 {j_path.name}）",
+            )
+            return "blocked"
+
+        # 4. 确认：证据入包（四段式 + 具名证据标签）
+        fields = "、".join(sorted({h["field"] for h in judgment.sensitive_hits}))
+        finding.verification = Verification(
+            method=UNAUTH_ANON_METHOD,
+            evidence_refs=[str(anon_path), str(control_path), str(j_path)],
+            baseline_diff=(
+                f"匿名 {judgment.anon_status} 且无效凭据对照逐字节相同"
+                f"（该端点忽略凭据）；提取到 {len(judgment.sensitive_hits)} 个敏感值"
+            ),
+            claim="未认证客户端可直接读取该端点返回的敏感数据",
+            expected="无凭据请求应被拒（401/403），或至少不返回敏感字段",
+            actual=(
+                f"匿名 GET 返回 2xx 结构化数据，含 {fields} 等 "
+                f"{len(judgment.sensitive_hits)} 个敏感值；同请求附带无效凭据后"
+                "响应逐字节相同（凭据被忽略，不是被当成了已登录用户）"
+            ),
+            reproduction_steps=[
+                f"匿名（无任何凭据）GET {url} → {judgment.anon_status}",
+                f"附无效凭据（Cookie ph_invalid=<随机>）GET {url} → 响应与上一步逐字节相同",
+                f"响应中提取到敏感字段：{fields}（见 {j_path.name}）",
+            ],
+            verified_by=f"{skill.name}@{skill.manifest.version}",
+            verified_at=_utc_now(),
+        )
+        if UNAUTH_EQUIVALENCE_EVIDENCE_KIND not in finding.evidence_kinds:
+            finding.evidence_kinds.append(UNAUTH_EQUIVALENCE_EVIDENCE_KIND)
+        if BEHAVIORAL_EVIDENCE_KIND not in finding.evidence_kinds:
+            finding.evidence_kinds.append(BEHAVIORAL_EVIDENCE_KIND)
+        finding.transition(
+            FindingState.REPRODUCED,
+            actor=skill.name,
+            reason="黑盒未授权数据暴露成立（M35）",
+        )
+        store.append(finding)
+        return self._gate_and_review(finding, skill, store)
+
+    def _default_idor_fetch(self, url: str, session):
+        """缺省进程内取数：把 scope 的 ``tls_verify`` 翻成 ``verify_tls``（M35b）。"""
+        scope = getattr(self.runner, "scope", None)
+        verify_tls = True if scope is None else scope.tls_verify_enabled()
+        return idor_fetch_default(url, session, verify_tls=verify_tls)
+
     def _get_unauth_judge(self):
         """懒建敏感度判定器（测试经 ``unauth_judge_factory`` 注入替身）。
 
@@ -3876,7 +4079,7 @@ class Orchestrator:
                 self._unauth_judge = UnauthJudge(self.router, self.audit)
         return self._unauth_judge
 
-    def _get_browser(self, session: SessionConfig):
+    def _get_browser(self, session: SessionConfig | None):
         """懒建/复用浏览器验证器（M8b）；不可用抛 BrowserUnavailableError。
 
         测试经 ``browser_factory`` 注入 FakeBrowser；否则建真实
@@ -4128,16 +4331,22 @@ class Orchestrator:
         store.append(finding)  # coverage_refs 落进 append-only 快照
 
     def _run_baseline(
-        self, finding: Finding, session: SessionConfig
+        self, finding: Finding, session: SessionConfig | None
     ) -> tuple[str, int] | None:
-        """带会话 baseline：httpx 探目标 URL（不跟随跳转），返回
-        ``(evidence_ref, status_code)``；失败记审计并返回 None。"""
+        """可达性 baseline：**有会话带会话，无会话匿名**（M34 黑盒降级）。
+
+        会话只决定"能不能到达需要认证的端点"，**不决定"能不能测"**：匿名拿到
+        2xx 就说明该点本就公开可测（sqli/xss/ssrf 的探针与身份无关）；匿名拿到
+        401/403/3xx 才说明这个点**要求认证**，记 ``verify_needs_credentials``——
+        既不驳回，也不静默跳过，报告与审计里能看出"这处黑盒没覆盖"。
+        """
+        with_session = session is not None and bool(session.cookie_header())
         try:
             argv = build_command(
                 "httpx",
                 {
                     "target": finding.asset,
-                    "with_session": True,
+                    "with_session": with_session,
                     "follow_redirects": False,
                     "tech_detect": False,
                 },
@@ -4170,14 +4379,53 @@ class Orchestrator:
         signals, _ = parser(text, evidence_path=str(result.stdout_path), skill="verify")
         for signal in signals:
             if signal.status_code is not None and 200 <= signal.status_code < 300:
+                if not with_session:
+                    self.audit.record(
+                        "verify_baseline_anonymous",
+                        finding_id=finding.id,
+                        status=signal.status_code,
+                        note="无预置会话：匿名可达，探针与身份无关，照常验证（M34）",
+                    )
                 return signal.evidence_ref, signal.status_code
         statuses = [s.status_code for s in signals]
+        requires_auth = any(
+            code in (401, 403) or (code is not None and 300 <= code < 400)
+            for code in statuses
+        )
+        if not with_session and requires_auth:
+            # 黑盒下的"到此为止"：不是判据失败，是**这个点要凭据**。
+            # 与 `verify_type_unavailable`（整类前置不可满足）区分：这里是单点。
+            self.audit.record(
+                "verify_needs_credentials",
+                finding_id=finding.id,
+                statuses=statuses,
+                reason="匿名请求被拒（401/403/3xx）：该点要求认证，本次黑盒无凭据，未覆盖",
+            )
+            return None
         self.audit.record(
             "verify_baseline_failed",
             finding_id=finding.id,
-            reason=f"带会话请求未获 2xx（疑似会话失效或登录跳转）: {statuses}",
+            reason=(
+                f"{'带会话' if with_session else '匿名'}请求未获 2xx"
+                f"（疑似会话失效或登录跳转）: {statuses}"
+            ),
         )
         return None
+
+    @staticmethod
+    def _session_marker(session: SessionConfig | None) -> str:
+        """会话凭据的脱敏标记（sha256 前 8 位）；黑盒（无会话）返回 ``anonymous``。"""
+        if session is None:
+            return "anonymous"
+        cookie = session.cookie_header()
+        return secret_marker(cookie) if cookie else "anonymous"
+
+    @staticmethod
+    def _baseline_label(session: SessionConfig | None) -> str:
+        """baseline 的人读标签：有会话写明"认证有效"，黑盒写明"匿名可达"。"""
+        if session is None:
+            return "匿名 baseline（端点无需认证即可达）"
+        return "带会话 baseline（认证有效，非登录跳转）"
 
     def _session(self) -> SessionConfig | None:
         """当前 engagement 的预置会话（来自 scope 配置；无则 None）。"""
@@ -4204,6 +4452,10 @@ class Orchestrator:
                 "failure_counts": dict(node.failure_counts),
                 "signals": node.meta.get("signals", []),
             }
+            # M32：target 归一前的入口页随状态给规划器；**无归一时不加这个键**，
+            # 保证既有 prompt 载荷逐字节不变（旧测试零改动）。
+            if node.meta.get("entry_path"):
+                state["entry_path"] = node.meta["entry_path"]
             try:
                 plan = self.planner.plan(state, skill)
             except BudgetExceededError as exc:
@@ -4333,12 +4585,43 @@ class Orchestrator:
         )
         return params
 
+    def _apply_seed_policy(
+        self, node: TaskNode, action: PlanAction, params: dict
+    ) -> dict:
+        """M32：种子类工具的 target 在执行边界再归一一次（幂等兜底）。
+
+        状态边界（``run_scan_phase``）已把子任务 target 换成扫描根，规划器正常
+        会原样回填；但"正常会"不是保证——模型看到 ``entry_path`` 后完全可能把
+        ``-u`` 写回入口页，那样 dirsearch 又在子目录里猜路径、katana 又从入口页
+        起算深度，M32 修的缺陷会以"规划器不该那样写"的形式复发。
+
+        两条边界共用同一个纯函数（:func:`split_scan_seed`），不存在第二套判定；
+        对已是扫描根的输入它是恒等变换，故**不会**重复归一漂移。
+        """
+        if action.tool not in SEED_TOOLS or "target" not in params:
+            return params
+        raw = str(params["target"])
+        scan_root, entry_path = split_scan_seed(raw)
+        if entry_path is None:
+            return params
+        self.audit.record(
+            "seed_normalized_at_exec",
+            node_id=node.id,
+            tool=action.tool,
+            target=raw,
+            scan_root=scan_root,
+            entry_path=entry_path,
+            note="规划器把带路径的 target 写回了 params，执行前归一",
+        )
+        return {**params, "target": scan_root}
+
     def _exec_run_tool(self, node: TaskNode, action: PlanAction, skill) -> str:
         """执行 run_tool 动作，返回 ok/retry/failed/blocked。"""
         request_budget = self._resolve_request_budget(node, action.tool)
         if action.tool in REQUEST_BUDGET_TOOLS and request_budget is None:
             return "failed"  # 迁移与审计已在 _resolve_request_budget 内完成
         params = self._apply_session_policy(node, action)
+        params = self._apply_seed_policy(node, action, params)
         try:
             argv = build_command(
                 action.tool,

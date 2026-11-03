@@ -286,7 +286,15 @@ def extract_endpoints(
         if reason is not None:
             stats.filtered_static += 1
             continue
-        parsed = urlparse(_join_url(document.primary_url, base_url, normalized))
+        try:
+            parsed = urlparse(_join_url(document.primary_url, base_url, normalized))
+        except ValueError:
+            # M33 实测：正文里出现 ``http://[${host}]/...`` 这类字面量时，
+            # ``urlparse`` 会因为 ``{param}`` 落在方括号里抛 ``ValueError``，
+            # 旧实现让**整份 bundle 的抽取**全部作废（发现层静默 0 候选）。
+            # 畸形字面量按"不是路径"计，其余照常处理。
+            stats.filtered_not_path += 1
+            continue
         joined_origin = f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
         if parsed.scheme.lower() not in ("http", "https") or not parsed.netloc:
             stats.filtered_not_path += 1
@@ -348,3 +356,18 @@ __all__ = [
     "dedupe_endpoints",
     "extract_endpoints",
 ]
+
+
+def explicit_bases(body: bytes) -> list[str]:
+    """正文里出现的 ``baseURL``/``API_BASE`` 常量（M33：跨文件收集用）。
+
+    SPA 常把 ``baseURL: "/api/v1"`` 写在 **api 客户端那个 bundle** 里，而调用点
+    （``get("/info")``）在另一个 bundle——单文件抽取拿不到基址。故生产者做一次
+    **跨文件收集**：本批 JS 里出现过的常量都算候选基址（去重，调用方截断）。
+    """
+    out: list[str] = []
+    for match in _BASE_ASSIGN.finditer(body):
+        value = _unescape(match.group(2).decode("utf-8", errors="replace")).strip()
+        if value.startswith("/") and value not in out:
+            out.append(value)
+    return out

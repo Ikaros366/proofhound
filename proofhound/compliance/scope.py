@@ -53,7 +53,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -120,6 +120,50 @@ class RequestBudget(BaseModel):
 def default_request_budget() -> RequestBudget:
     """保守缺省预算（维护者裁定：不写 scope 也开箱即用，但记为 ``source="default"``）。"""
     return RequestBudget()
+
+
+#: 只有这两个 scheme 的 target 才谈得上"扫描根"（裸主机名原样透传）
+_SEED_SCHEMES = frozenset({"http", "https"})
+
+
+def split_scan_seed(target: str) -> tuple[str, str | None]:
+    """把 target 拆成「扫描根」与「入口页」（M32）。
+
+    用户给的 target 通常是**一个页面**（``https://h:8443/login``），但三个工具都
+    把 ``-u`` 当成"起点即根"：
+
+    - ``dirsearch`` 把 ``-u`` 的路径当**目录根** ⇒ 字典在 ``/login/`` 下展开；
+    - ``katana`` 从 ``-u`` 起算爬行深度，页面上跳到 ``/`` 的链接被
+      ``max depth reached`` 吞掉；
+    - ``httpx`` 不受影响（单点探活）。
+
+    实测（``eng-20261103T032027Z-87899ebd``，target ``https://100.80.4.50:8443/login``）：
+    dirsearch 的 43 条结果里 **40 条**是 ``/login/xxx/index.html`` 的 301（SPA
+    catch-all），**应用根一个请求都没打**；katana 1115 行输出里 **1081 行**是
+    ``max depth reached``。
+
+    故本函数把"最后一层路径段"视为**入口页**、其父目录视为**扫描根**：入口页
+    本身不丢（调用方负责把它记进审计与规划状态），但工具从根起跑——"站点有
+    哪些页面/入口"应当由爬行从根自己发现，而不是靠字典猜路径。
+
+    **不改授权**：路径不参与 scope 判定（scope 是域名/IP + 端口），归一只换
+    工具起点，**不扩大可碰范围**。
+
+    非 http(s) 或无 netloc 的输入（如裸主机名 ``127.0.0.1:8000``）原样返回
+    （第二个元素 ``None`` = 无需归一）；已是目录或根的输入（空路径、``/``、
+    以 ``/`` 结尾）同样原样返回。**幂等**：对扫描根再调用一次，两者都不再变化。
+    """
+    raw = target.strip()
+    parsed = urlsplit(raw)
+    if parsed.scheme.lower() not in _SEED_SCHEMES or not parsed.netloc:
+        return raw, None
+    path = parsed.path
+    if not path or path == "/" or path.endswith("/"):
+        return raw, None
+    parent = path.rsplit("/", 1)[0] + "/" if "/" in path else "/"
+    entry = f"{path}?{parsed.query}" if parsed.query else path
+    root = urlunsplit((parsed.scheme, parsed.netloc, parent, "", ""))
+    return root, entry
 
 
 @dataclass(frozen=True)

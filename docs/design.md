@@ -2445,6 +2445,159 @@ accept 线程正阻塞在 `accept()` 里。实测这个残留线程会去 `accep
    `false_success_detected`、`signals_recorded.skipped_lines` 这些字段都是"下次一次运行
    就能判读"的投入。
 
+## 7.31 M32 落地注记（2026-11-03：扫描种子归一）
+
+**问题不是"字典没扫到登录页"，而是三个工具都把 target 的路径当成根。** 实测
+`eng-20261103T032027Z-87899ebd`（target `https://100.80.4.50:8443/login`）：
+
+| 工具 | 实际行为 | 后果 |
+|---|---|---|
+| `dirsearch` | `-u` 的路径被当**目录根** | 43 条结果里 40 条是 `/login/xxx/index.html` 的 301，**应用根一个请求没打** |
+| `katana` | `-u` 是**爬行起点**，深度从它起算 | 1115 行输出里 **1081 行** `max depth reached`（首页 `/` 没抓到） |
+| `httpx` | 单点探活 | 无影响（探入口页正是它的用途） |
+
+**修法**：`split_scan_seed()` 把 target 拆成「扫描根 + 入口页」——最后一层路径段是
+入口页，父目录是根。工具一律从根起跑，"站点有哪些页面/入口"由爬行自己发现，而不是
+靠字典猜路径；入口页不丢，进 `meta.entry_path` 与规划状态。
+
+**两条边界，同一个纯函数**：
+
+1. **状态边界**（`run_scan_phase`）：子任务 `meta.target` = 扫描根，规划器看到的
+   就是根；记 `seed_normalized`（含原 target 与入口页）。多个入口归一到同一根时
+   合并子任务并记 `seed_duplicate_merged`（不静默丢）。
+2. **执行边界**（`_apply_seed_policy`）：`SEED_TOOLS = {katana, dirsearch}` 的
+   `params.target` 再跑一次（幂等），防规划器看到 `entry_path` 后把 `-u` 写回入口页
+   ——否则 M32 修的缺陷会以"规划器不该那样写"的形式复发；记 `seed_normalized_at_exec`。
+
+**刻意不做**：`httpx` 不归一（它是单点探活，探入口页是正当用途）；`katana -d 2`
+的深度不动（深度是另一个带成本的开关，SPA 的"页面→JS→JS 里的端点"三层链路仍会被
+第三层卡住，需单独测量）；scope 模型一个字没改（路径本就不参与 scope 判定，
+归一只换工具起点，不扩大可碰范围）。
+
+**残余（如实记录）**：① 归一后入口页不再被 `httpx` 自动探活（除非规划器显式去探，
+入口页已在状态里）；② 子目录应用只上抬一层，`https://h/app`（无尾斜杠的目录）会被
+当成页面/文件、根退到 `/`——这是"最后一层是页面"这一假设的代价；③ 对纯 SPA，
+"看见登录框"仍要靠 JS 渲染或 JS 字面量抽取，M32 只解决"起点错"。
+
+## 7.32 M33 落地注记（2026-11-03：JS 接口接进发现层 + katana 深度 3）
+
+**问题**：`eng-20261103T070135Z-6c0988e8` 跑完 **128 个唯一 URL、0 条漏洞候选**。
+不是爬虫看不见（它看见了），而是「URL → 候选」这一层只认两种形态：
+
+| 候选来源 | 触发条件 | 该目标 |
+|---|---|---|
+| `param-endpoint` | URL 带 query 键 | 只有 1 条 `/assets/?&`（参数名为空） |
+| `form_page` | HTML 里有 `<form>` + 有 name 字段 | 0（登录框是 React 渲染的） |
+
+而真实面是 `/api/v1/*` 的 JSON API：没有 `?`、没有表单，参数在 path 与 body 里。
+
+**修法（发现侧，零猜测优先）**：
+
+1. **深度 2 → 3**：SPA 链路是「页面(1) → JS(2) → JS 里的接口(3)」，`-d 2` 把第三层
+   整层丢掉（实测 1081 行 `max depth reached`）。
+2. **JS 正文 → `api-endpoint` 信号**：复用 M24-a 的 `jsimport.extract`（`-jc` 的抽取
+   是**部分的**，限制 53），产 `kind="api-endpoint"`；`api-endpoint` 在 triage 映射到
+   `unauth-exposure`。
+3. **两条实测出来的收敛规则**（都写在代码注释里，别删）：
+   - 只认**带数据前缀**（`/api` `/rest` `/graphql`）的具体路径。裸 `/users`、
+     `/settings/providers/new` 与 SPA 页面路由同名同形，匿名与已认证都拿到同一个空壳
+     ⇒ 进 `unauth-exposure` 会**误确认**；路径模板（`/users/{param}`）没有观测实例也不产。
+   - 基址拼接只对**单段**字面量做，且排除纯版本串（`/v4`）：`baseURL:"/api/v1"` 写在
+     api bundle、调用点写在另一个 bundle，不做跨文件收集就永远是 0 候选；但拼得太宽会
+     把 `/assets/rest`、`/dev/null`、`/settings/providers/new` 也拼成"接口"（实测 20 条
+     候选里大半是这类噪声）。
+
+**实测（`eng-20261103T072342Z-04e6e4a8`，同一目标，无会话）**：katana 信号 1 → **42**，
+triage 候选 2 → **16**，其中 `unauth-exposure` **13 条**（含 `/api/v1/info`——手工
+验证匿名 200 + JSON）。跑完判定的仍只有 `error-disclosure`（→ rejected）。
+
+**卡点转移（这就是本里程碑最重要的结论）**：13 条 `unauth-exposure` 全部停在
+`verify_type_unavailable`（"scope 未配置预置会话"）。`verify-unauth` 的判据是「匿名视图
+≡ 已认证视图」，没有 Cookie 就没有"已认证视图"可比。**下一道瓶颈是凭据，不是发现。**
+
+**一并修掉的两个真缺陷**（都是"发现层静默 0 候选"的根因）：
+
+- `extract_endpoints` 遇到 `http://[${host}]/...` 这类字面量时 `urlparse` 抛
+  `ValueError`，旧实现让**整份 bundle 的抽取作废**；现按"不是路径"计并继续。
+- `proofhound.jsimport.__init__` 的 `probe` 改成 PEP 562 惰性导入——否则
+  `tools/parsers` 在编排器导入链早期触发 `jsimport` → `probe` → `verify` → `core` →
+  `skills` 成环（实测 `ModuleNotFoundError: proofhound.skills.registry`）。
+
+## 7.33 M34 落地注记（2026-11-03：黑盒降级——无凭据 ≠ 不测）
+
+**问题**：`_run_baseline(self, finding, session: SessionConfig)` 的形参类型要求必须
+有会话，三个 handler（sqli/xss/ssrf）开头一律 `if session is None: blocked`。于是
+**黑盒 engagement（真实渗透的常态起点）里这三个类型一条都验不了**——最刺眼的是 XSS：
+canary 探针与身份毫无关系，却被"没有 Cookie"挡死。
+
+这是把**"能不能到达需要认证的端点"**（能力问题）与**"判据需不需要第二个视图"**
+（判据问题）混成了同一个前置条件。
+
+**修法**：
+
+| 类型 | 判据需要身份吗 | M34 后 |
+|---|---|---|
+| sqli / xss / ssrf | 不要（注入判定、canary 执行、回调到达） | 匿名 baseline 直接验 |
+| error-disclosure | 不要 | 一直可验（本轮未动） |
+| unauth-exposure | **要**（匿名视图 vs 已认证视图） | 仍要求会话（黑盒断言属另一件事） |
+| idor | **要**（双身份） | 仍要求两个会话 |
+
+**两个新审计事件**：`verify_baseline_anonymous`（匿名可达，照常验）、
+`verify_needs_credentials`（匿名被 401/403/3xx 挡回——"这个点要凭据，本次黑盒未覆盖"）。
+后者是**单点粒度**，与整类的 `verify_type_unavailable` 区分开。
+
+**证据诚实性**：黑盒下复现步骤写"匿名（无凭据）GET …"、baseline 写"匿名 baseline
+（端点无需认证即可达）"；有会话时与旧文本逐字一致。sqlmap 黑盒时不产 `--cookie`。
+
+**残余**：① `unauth-exposure` 仍会在黑盒下整类停在 Hypothesis（13 条候选实测）——
+要真正解锁需要"匿名拿到敏感数据"的**黑盒断言**（确定性敏感字段+记录数+无效凭据对照），
+需维护者裁决；② 报告层仍无"未覆盖清单"（哪些点因缺凭据没测），只有审计里能看；
+③ ssrf 探针的"交付证明"在黑盒下语义不变（它证明的是目标发了请求，与身份无关）。
+
+## 7.34 M35 落地注记（2026-11-03：`unauth-exposure` 的黑盒确认通道）
+
+**问题**：M16-c 的判据是「匿名视图 ≡ 已认证视图」。黑盒 engagement 没有已认证视图
+⇒ `requires_session=True` ⇒ 整类恒停在 Hypothesis（实测 13 条）。M34 解开了
+sqli/xss/ssrf 的黑盒锁，这一条没解开——因为它的判据**真的**要第二个视图。
+
+**修法**：再加一条**不依赖第二身份**的确认手段（不是放宽旧判据，是并列一条新的）：
+
+| 判据 | 需要凭据 | 何时用 |
+|---|---|---|
+| `unauth-equivalence-confirmed`（M16-c） | 要（已认证视图） | 有会话时 |
+| **`unauth-anon-data-confirmed`（M35）** | 不要 | 黑盒时 |
+
+黑盒判据四条，全确定性：
+
+1. 匿名 GET **2xx**；
+2. 响应是**结构化 JSON**；
+3. **无效凭据对照逐字节相同**：同一请求只多带 `Cookie: ph_invalid=<随机>`。相同
+   ⇒ 端点**忽略**凭据（排除"把无效 Cookie 当成某个已登录身份"与"每次响应都不同"
+   这两种更平凡的解释）；
+4. **≥2 个敏感字段取值**（硬编码词表，取值非空）。
+
+命中 ⇒ 确认；零命中/匿名被拒 ⇒ 驳回（"测过且干净"）；其余 ⇒ blocked（宁漏勿滥）。
+
+**关于"敏感度是不是语义判断"**：M16-c 拒绝的是**让 LLM 的语义结论当证据**。这里的
+敏感度来自**硬编码字段词表 + 非空取值**，可复现、可单测；T1 判定器
+（`verify/unauth_judge.py`）仍然只做报告分类、不产证据。
+
+**M35b（同一轮修掉的相邻缺陷）**：`verify/idor.py::fetch` 不认 `scope.tls_verify`，
+HTTPS 自签靶上恒 `CERTIFICATE_VERIFY_FAILED`——沙箱 CLI 工具能打通、进程内探针打不通
+（M28 同类缺陷的第二个实例）。现由编排器的缺省取数把 `tls_verify_enabled()` 翻成
+`verify_tls`，注入替身仍保持 `(url, session)` 两参契约。
+
+**实测**：`verify-unauth` 从 `processed=0 blocked=13` 变成
+**`processed=13 rejected=13 blocked=0`**；`/api/v1/info` 的判定 JSON 里
+`byte_identical=True` + `sensitive_values=0`（guest 信息全空）⇒ 驳回，
+其余 12 条按 301/403 驳回。**没有新增任何 Confirmed**——这是诚实的结果：这个目标的
+匿名面确实没有敏感数据。
+
+**残余**：① 判据只看 JSON，XML/CSV 不认；② 字段词表是英文小写精确匹配（中文站
+``手机号``/``邮箱`` 不认）；③ "≥2 个敏感值"是启发式阈值，单条记录的单个邮箱会被
+驳回（宁漏勿滥）；④ 301 的 SPA 路由噪声仍会消耗候选配额（虽然现在会被自动收敛成
+rejected）。
+
 ## 8. 开发路线图
 
 
