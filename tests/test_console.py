@@ -445,3 +445,46 @@ def test_static_js_elapsed_clock_stops_on_terminal():
     assert "function fmtElapsed(iso, endIso)" in js
     # 终点取 endIso 有值时的那个时刻，而不是无条件 now()
     assert "endIso ? new Date(endIso).getTime() : Date.now()" in js
+
+
+# ---- 审计流：默认只轮询最近 N 条，但必须能看全量 ----
+
+
+def test_audit_endpoint_tail_is_window_not_cap(client):
+    """`tail` 只裁剪**返回窗口**，`total` 始终是全量计数。
+
+    后端从来没有条数上限：不带 ``tail`` 就返回全部。控制台默认只轮询最近
+    ``AUDIT_TAIL`` 条（省流量），「查看全部」则用不带 tail 的请求取全量——
+    这条契约就是那个入口能成立的前提。
+    """
+    eng_id, _ = _run_to_done_with_confirmed(client)
+
+    full = client.get(f"/api/engagements/{eng_id}/audit").json()
+    assert full["total"] > 0
+    assert len(full["events"]) == full["total"]  # 不带 tail = 全量
+
+    tailed = client.get(
+        f"/api/engagements/{eng_id}/audit", params={"tail": 5}
+    ).json()
+    assert tailed["total"] == full["total"]  # 总数不因窗口而缩水
+    assert len(tailed["events"]) == 5
+    assert tailed["events"] == full["events"][-5:]  # 是"最后 5 条"
+
+
+def test_audit_endpoint_rejects_non_positive_tail(client):
+    eng_id, _ = _run_to_done_with_confirmed(client)
+    assert client.get(
+        f"/api/engagements/{eng_id}/audit", params={"tail": 0}
+    ).status_code == 422
+
+
+def test_static_js_audit_panel_has_full_history_entry():
+    """前端必须同时具备两种审计请求：轮询用 tail，按需用全量。
+
+    只钉调用形态（同 ``test_static_js_no_innerhtml`` 的纪律）。若只剩
+    ``audit?tail=...``，用户就被永久锁在"最近 N 条"里。
+    """
+    js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert "audit?tail=${AUDIT_TAIL}" in js   # 轮询：只拉最近 N 条
+    assert "/audit`)" in js                   # 按需：不带 tail 的全量
+    assert "auditShowAll" in js               # 两种模式的开关

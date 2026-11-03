@@ -422,6 +422,7 @@ function renderDetail(view, engId) {
     confsSig: null,
     findingsSig: null,
     auditTotal: -1,
+    auditShowAll: false,    // 审计流是否已切到"全量"（默认只轮询最近 AUDIT_TAIL 条）
     costCalls: -1,  // M11a：总调用数不变则跳过成本面板重绘
     loosen: null,           // {mode, operator, note} 放宽切换表单
     confInputs: {},         // cid -> {operator, note}（轮询重建时保留输入）
@@ -471,7 +472,7 @@ function renderDetail(view, engId) {
     updateFindings(findings.findings || []);
     updateProgress(detail);
     updateCost(cost);
-    updateAudit(audit);
+    await updateAudit(audit);
   }
 
   // -- 顶部状态条（签名不变则不重建，避免打断放宽切换表单）--
@@ -1152,14 +1153,43 @@ function renderDetail(view, engId) {
     return table;
   }
 
-  // -- 审计流（tail 轮询，total 不变则跳过重绘）--
-  function updateAudit(audit) {
+  // -- 审计流 --
+  // 轮询永远只拉最近 AUDIT_TAIL 条（省流量；audit.jsonl 动辄上千行，每 2.5s 拉全量
+  // 不划算）。用户点「查看全部」后才按需取一次**不带 tail** 的全量——后端本来就能
+  // 返回全部，之前只是前端没给入口，于是看起来"只能看最近 150 条"。
+  async function updateAudit(audit) {
     if (audit.total === st.auditTotal) return;
+    let payload = audit;
+    if (st.auditShowAll) {
+      payload = await api(`/api/engagements/${engId}/audit`);
+    }
     st.auditTotal = audit.total;
+    renderAudit(payload, !st.auditShowAll && audit.events.length < audit.total);
+  }
+
+  function renderAudit(payload, truncated) {
     auditPanel.replaceChildren();
-    auditPanel.appendChild(el('h3', null, `审计流（最近 ${audit.events.length} / 共 ${audit.total} 条）`));
+    const head = el('h3', null, truncated
+      ? `审计流（最近 ${payload.events.length} / 共 ${payload.total} 条）`
+      : `审计流（共 ${payload.total} 条）`);
+    if (truncated || st.auditShowAll) {
+      const toggle = el('button', 'linkish', st.auditShowAll ? '只看最近' : '查看全部');
+      toggle.addEventListener('click', async () => {
+        st.auditShowAll = !st.auditShowAll;
+        st.auditTotal = -1;  // 强制重绘（total 没变也要重取）
+        toggle.disabled = true;
+        try {
+          await refresh();
+        } catch (err) {
+          errSlot.replaceChildren(errorBox(err));
+        }
+      });
+      head.appendChild(document.createTextNode(' · '));
+      head.appendChild(toggle);
+    }
+    auditPanel.appendChild(head);
     const stream = el('div', 'audit-stream');
-    audit.events.slice().reverse().forEach((e) => {
+    payload.events.slice().reverse().forEach((e) => {
       const row = el('div', 'audit-row');
       row.appendChild(el('span', 'audit-time', fmtTime(e.ts)));
       row.appendChild(el('span', `audit-event ev-color-${e.event}`, e.event));

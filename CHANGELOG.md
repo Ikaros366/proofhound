@@ -4,6 +4,26 @@
 [Keep a Changelog 1.1.0](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [未发布]
+
+### 修复（控制台审计流：看起来只能看最近 150 条）
+
+控制台的审计流只请求 `/api/engagements/{id}/audit?tail=150`，标题也如实写着
+「最近 150 / 共 N 条」——**数据没丢**（`audit.jsonl` 始终是全量），但界面上没有看
+全量的入口，看起来就像被硬性截断。
+
+后端本来就不限条数：不带 `tail` 就返回全部，`total` 一直是全量计数（`tail=0` 由
+`Query(ge=1)` 挡成 422）。所以只补前端：
+
+- **`proofhound/api/static/app.js`**：审计流标题旁加「查看全部 / 只看最近」开关。
+  轮询仍然只拉最近 `AUDIT_TAIL`（150）条——`audit.jsonl` 动辄上千行，每 2.5s 拉全量
+  不划算；切到全量时才用**不带 tail** 的请求按需取一次（`total` 变化时重取）。
+- **测试**：`tests/test_console.py` +3（`tail` 只裁剪窗口而 `total` 不变、
+  `tail=0` → 422、前端两种请求形态齐备）。
+
+实测（`eng-20261103T030841Z-b013d083`，共 211 条）：不带 `tail` 返回 211 条；
+`tail=150` 返回 150 条且 `total` 仍是 211；`tail=5` 返回最后 5 条。
+
 ## [0.6.1] - 2026-11-03
 
 ### 修复（M31：dirsearch 在扫描链路里必然 exit 127 + 越界信号污染证据）
